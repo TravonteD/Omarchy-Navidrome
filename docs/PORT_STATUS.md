@@ -37,6 +37,18 @@ palette is not initialized outside a real shell session — an environment or
 shell API change since the 8 September validation run, worth a dedicated
 fix pass.
 
+## Package 1 — Navidrome API layer (in progress, 10 November 2026)
+
+- `Subsonic.js` landed: the pure request core — RFC 1321 MD5 over UTF-8
+  (validated against the spec's token example and reference vectors,
+  including multi-block and multibyte inputs), per-request salt generation
+  with an injectable source, sorted-stable query building with repeated
+  parameter keys, server-URL canonicalization (lowered host, trailing-slash
+  trimming, IPv6 brackets, scheme validation), `subsonic-response` parsing,
+  and typed Subsonic error-code categories (40 wrong credentials, 41/42
+  token auth rejected, 50 not authorized, 70 not found, plus generic
+  fallbacks). 13 new tests; suite at 201 passing.
+
 ## Remaining in package 0
 
 - second rename pass done for: uppercase env names (`OMARCHY_NAVIDROME_*`),
