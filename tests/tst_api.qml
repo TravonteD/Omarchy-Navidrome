@@ -1150,25 +1150,122 @@ TestCase {
     compare(Api.spotifyTypeLabel("playlist"), "Playlist")
   }
 
-  function test_backendLoadFields_mapsWebApiBodies() {
-    compare(JSON.stringify(Api.backendLoadFields({
-      context_uri: "spotify:album:abc",
-      offset: { position: 3 }
-    })), JSON.stringify({
-      play: true,
-      context_uri: "spotify:album:abc",
-      offset_index: 3
+  function test_backendLoadFieldsV2_mapsSubsonicSongs() {
+    // A fully-populated Subsonic row keeps its shape under the protocol.
+    // `duration` arrives in seconds and becomes duration_ms.
+    compare(JSON.stringify(Api.backendLoadFieldsV2([{
+      id: 42,
+      title: "Song",
+      artists: [{ id: "ar-1", name: "Artist" }],
+      album: "Album",
+      duration: 180,
+      coverArt: "cr-9",
+      track: 3
+    }])), JSON.stringify({
+      songs: [{
+        id: "42",
+        title: "Song",
+        artists: ["Artist"],
+        album: "Album",
+        duration_ms: 180000,
+        cover_art: "cr-9",
+        track: 3
+      }],
+      play: true
     }))
-    compare(JSON.stringify(Api.backendLoadFields({
-      uris: ["spotify:track:one", "spotify:track:two"],
-      position_ms: 1500
+    // Empty metadata fields are legal and simply omitted; only a usable id
+    // is required for the engine to stream the song.
+    compare(JSON.stringify(Api.backendLoadFieldsV2([{ id: "a2" }])),
+      JSON.stringify({ songs: [{ id: "a2" }], play: true }))
+  }
+
+  function test_backendLoadFieldsV2_appliesOptionsAndDefaults() {
+    var rows = [
+      { id: "s1", title: "First", duration: 200 },
+      { id: "s2", title: "Second", duration: 300 }
+    ]
+    compare(JSON.stringify(Api.backendLoadFieldsV2(rows, {
+      offset_index: 1,
+      position_ms: 1500,
+      play: false
     })), JSON.stringify({
-      play: true,
-      uris: ["spotify:track:one", "spotify:track:two"],
+      songs: [
+        { id: "s1", title: "First", duration_ms: 200000 },
+        { id: "s2", title: "Second", duration_ms: 300000 }
+      ],
+      play: false,
+      offset_index: 1,
       position_ms: 1500
     }))
-    compare(Api.backendLoadFields(null), null)
-    compare(Api.backendLoadFields({}), null)
+    // play defaults to true; a zero resume position and offset are omitted.
+    compare(JSON.stringify(Api.backendLoadFieldsV2(rows.slice(0, 1), {
+      position_ms: 0
+    })), JSON.stringify({
+      songs: [{ id: "s1", title: "First", duration_ms: 200000 }],
+      play: true
+    }))
+  }
+
+  function test_backendSongRefV2_degradesInterimRowsSafely() {
+    // Spotify-shaped interim rows map onto the nearest Subsonic field and
+    // the id falls back to the URI's base62 track id. A bare `duration`
+    // value at or above 10000 is already milliseconds.
+    compare(JSON.stringify(Api.backendSongRefV2({
+      uri: "spotify:track:6rqhFgbbKwnb9MLmUQDhG6",
+      name: "Song",
+      artist: "Artist",
+      album: "Album",
+      duration: 240000
+    })), JSON.stringify({
+      id: "6rqhFgbbKwnb9MLmUQDhG6",
+      title: "Song",
+      artists: ["Artist"],
+      album: "Album",
+      duration_ms: 240000
+    }))
+    // artists may be {name} objects or a single string; duplicates are
+    // dropped and idless rows are rejected.
+    compare(JSON.stringify(Api.backendSongRefV2({
+      id: "77",
+      artists: ["One", { name: "Two" }, "One", { name: "" }, null]
+    })), JSON.stringify({ id: "77", artists: ["One", "Two"] }))
+    compare(Api.backendSongRefV2({ title: "No identifier" }), null)
+    compare(Api.backendSongRefV2(null), null)
+  }
+
+  function test_backendLoadFieldsV2_rejectsUnusableRequests() {
+    compare(Api.backendLoadFieldsV2(null), null)
+    compare(Api.backendLoadFieldsV2([]), null)
+    compare(Api.backendLoadFieldsV2([{ title: "No identifier" }]), null)
+  }
+
+  function test_playbackLoadBodyV2_startsAtTheClickedRowAndWraps() {
+    var rows = [
+      { kind: "item", id: "a", title: "One" },
+      { kind: "item", id: "b", title: "Two" },
+      { kind: "context", title: "Ignored" },
+      { kind: "item", id: "c", title: "Three", duration: 210 }
+    ]
+    compare(JSON.stringify(Api.playbackLoadBodyV2(rows[1], rows, "")),
+      JSON.stringify({
+        songs: [
+          { id: "b", title: "Two" },
+          { id: "c", title: "Three", duration_ms: 210000 },
+          { id: "a", title: "One" }
+        ],
+        play: true
+      }))
+    // A resume offset in milliseconds rides along for the clicked song; a
+    // lone item without the list still loads; unusable requests return null.
+    var solo = { kind: "item", id: "solo", title: "Solo", resumeMs: 9000 }
+    compare(JSON.stringify(Api.playbackLoadBodyV2(solo, [solo], "", 9000)),
+      JSON.stringify({
+        songs: [{ id: "solo", title: "Solo" }],
+        play: true,
+        position_ms: 9000
+      }))
+    compare(Api.playbackLoadBodyV2(rows[2], rows, ""), null)
+    compare(Api.playbackLoadBodyV2(null, rows, ""), null)
   }
 
   function test_currentPlaybackDeviceWorksBeforeDeviceListLoads() {
@@ -1432,6 +1529,10 @@ TestCase {
       "Authorization: Bearer access-value",
       "refresh_token=refresh-value&code=authorization-value",
       "?code_verifier=verifier-value&client_secret=secret-value",
+      // Subsonic request credentials and a full getCoverArt art_url: the
+      // backend's art URL carries the auth token set and must never reach a
+      // log line.
+      "https://nav.example/rest/getCoverArt?id=cr-1&u=alice&t=token-value&s=salt-value",
       "{\"access_token\":\"json-token\",\"password\":\"nope\"}"
     ].join("\n")
     var safe = Api.redact(raw)
@@ -1441,9 +1542,13 @@ TestCase {
     verify(safe.indexOf("authorization-value") === -1)
     verify(safe.indexOf("verifier-value") === -1)
     verify(safe.indexOf("secret-value") === -1)
+    verify(safe.indexOf("token-value") === -1)
+    verify(safe.indexOf("salt-value") === -1)
+    verify(safe.indexOf("=alice") === -1)
     verify(safe.indexOf("json-token") === -1)
     verify(safe.indexOf("\"nope\"") === -1)
     verify(safe.indexOf("<redacted>") >= 0)
+    verify(safe.indexOf("rest/getCoverArt?id=cr-1&") >= 0)
   }
 
   function test_clockFormatting() {

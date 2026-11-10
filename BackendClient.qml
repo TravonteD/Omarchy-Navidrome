@@ -5,8 +5,10 @@ import Quickshell.Io
 import "Api.js" as Api
 
 // Private Unix-socket client for the plugin backend. Local load/control uses
-// this when the supervised process is running; MPRIS and the Web API remain
-// the fallback when the socket is absent or the spotifyd unit is active.
+// this when the supervised process is running; the Subsonic web API and MPRIS
+// remain the fallback when the socket is absent. Protocol v2 requests are
+// {"v":2,...}; before any load the Navidrome server must be configured once
+// per connection via configure_server.
 Item {
   id: root
 
@@ -25,6 +27,11 @@ Item {
   property int nextId: 1
   property var pending: ({})
   property int reconnectAttempt: 0
+  // Protocol v2: configure_server must be re-sent after every socket
+  // (re)connect — the engine keeps credentials in process memory only. The
+  // flag flips true once the backend acknowledges a configuration; the
+  // Service layer re-sends before resuming playback whenever it is false.
+  property bool serverConfigured: false
 
   readonly property string socketPath: {
     var runtime = Quickshell.env("XDG_RUNTIME_DIR")
@@ -53,7 +60,7 @@ Item {
       return 0
     }
     var id = nextId++
-    var payload = { v: 1, id: id, command: String(name || "") }
+    var payload = { v: 2, id: id, command: String(name || "") }
     Api.assign(payload, fields || {})
     var nextPending = ({})
     for (var existing in pending) nextPending[existing] = pending[existing]
@@ -64,8 +71,28 @@ Item {
     return id
   }
 
+  // Credentials are sent once per connection and never logged or echoed.
+  // Deliberately no console output in the success path: any log line holding
+  // url/username/password would leak them.
+  function configureServer(url, username, password, callback) {
+    return sendCommand("configure_server", {
+      url: String(url || ""),
+      username: String(username || ""),
+      password: String(password || "")
+    }, function(ok, result, error) {
+      serverConfigured = ok === true
+      if (typeof callback === "function") callback(ok, result, error)
+    })
+  }
+
+  // The body is a v2 load input: either plain UI rows with options
+  // ({ items: [...], offset_index, position_ms, play }) or already-built
+  // SongRef list ({ songs: [...] }, which the builder passes field by field).
   function loadPlayback(body, callback) {
-    var fields = Api.backendLoadFields(body)
+    var spec = body && typeof body === "object" ? body : null
+    var items = spec && Api.arrayValues(spec.items).length
+      ? spec.items : (spec ? spec.songs : null)
+    var fields = Api.backendLoadFieldsV2(items, spec)
     if (!fields) {
       if (typeof callback === "function")
         callback(false, null, "This Spotify item cannot be played")
@@ -108,6 +135,7 @@ Item {
     socketLoader.active = false
     lifecycle = ""
     sessionConnected = false
+    serverConfigured = false
     errorCode = ""
     errorMessage = ""
     lastState = null
@@ -127,7 +155,12 @@ Item {
         onRead: function(line) { root.handleLine(line) }
       }
       onConnectionStateChanged: {
-        if (connected) root.sendCommand("hello", null, null)
+        if (connected) {
+          // Credentials never survive a disconnect: the Service layer
+          // re-sends configure_server once the backend reports ready again.
+          root.serverConfigured = false
+          root.sendCommand("hello", null, null)
+        }
         else root.lifecycle = ""
       }
     }

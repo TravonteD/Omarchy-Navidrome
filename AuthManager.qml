@@ -66,6 +66,15 @@ Item {
   property int tokenRequestSerial: 0
   property bool logoutPendingClear: false
 
+  // Navidrome server credentials for the stream backend (protocol v2's
+  // configure_server). Package 2's setup flow populates these from settings
+  // and the keyring; until then every value stays empty so Service.qml skips
+  // backend configuration and the backend answers playback commands with its
+  // `missing_credentials` error. Never log the returned object.
+  property string navidromeUrl: ""
+  property string navidromeUsername: ""
+  property string navidromePassword: ""
+
   signal loginSucceeded()
   signal loggedOut()
   signal sessionUnavailable(string reason)
@@ -98,6 +107,18 @@ Item {
 
   function safeError(value) {
     return Api.redact(String(value || ""))
+  }
+
+  // Returns { url, username, password } for the configured Navidrome server.
+  // Empty strings mean "not set up yet": callers must treat the credential
+  // set as absent, never send empty values over configure_server, and never
+  // log the object.
+  function navidromeCredentials() {
+    return {
+      url: String(navidromeUrl || ""),
+      username: String(navidromeUsername || ""),
+      password: String(navidromePassword || "")
+    }
   }
 
   function tokenIsFresh() {

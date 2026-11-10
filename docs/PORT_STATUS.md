@@ -80,6 +80,38 @@ Continued on 10 November 2026:
 - `SpotifyApi.qml` and its consumers remain untouched by design: the removal
   pass waits for package 5's UI rewiring.
 
+## Stream transport on protocol v2 (10 November 2026)
+
+The Rust backend was rewritten as a Subsonic HTTP streaming engine (protocol
+v2). The QML side was wired to the new transport boundary without the UI
+remodel (that lands with the package 5 Subsonic data model):
+
+- `BackendClient.qml` sends `{"v":2,...}` requests, gained
+  `configureServer(url, username, password, callback)` (inputs never logged;
+  its acknowledgment is tracked by a `serverConfigured` flag that resets on
+  every socket reconnect), and its `loadPlayback` now sends complete `songs`
+  arrays (SongRef) instead of Spotify play bodies.
+- `Api.js` replaced `backendLoadFields` with `backendLoadFieldsV2(items,
+  options)` (pure Subsonic-row mapping with defensive defaults and a
+  seconds-vs-milliseconds duration heuristic) plus
+  `playbackLoadBodyV2`/`backendSongRefV2` for the interim Spotify-shaped call
+  sites; `Api.redact` now also scrubs Subsonic `u`/`t`/`s`/`salt`/`token`
+  query params (the backend's authed `getCoverArt` art_url set).
+- `AuthManager.qml` gained the `navidromeCredentials()` accessor (stub:
+  empty values until the setup flow fills the properties).
+- `Service.qml` calls `configureServer` at the ready transition (fires again
+  by design after reconnects), builds `pendingPlaybackLoad` per play request,
+  and sends `add_to_queue` as `{song: SongRef}`. All Spotify remote paths are
+  unchanged.
+- `docs/BACKEND_PROTOCOL.md` was rewritten for protocol v2 (commands, SongRef,
+  events, error codes, the art_url auth-params caveat, and the logging ban).
+
+Validation after the wiring: 242 QML tests pass (was 238), the 44 backend
+Rust tests still pass, and `qmllint` stays clean. Known transitional
+behavior: until package 5 delivers Subsonic song ids into the UI rows, local
+playback through the stream engine surfaces `missing_credentials` (no setup
+pass yet) and Spotify remote playback stays the fallback.
+
 ## Remaining in package 0
 
 - second rename pass done for: uppercase env names (`OMARCHY_NAVIDROME_*`),

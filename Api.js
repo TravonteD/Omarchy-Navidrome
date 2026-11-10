@@ -218,7 +218,10 @@ function safeApiUrl(path) {
 function redact(value) {
   var text = String(value || "")
   text = text.replace(/(authorization\s*:\s*bearer\s+)[^\s]+/ig, "$1<redacted>")
-  text = text.replace(/(^|[?&\s])((?:code|access_token|refresh_token|code_verifier|client_secret|password)=)[^&#\s]+/ig, "$1$2<redacted>")
+  // Subsonic request credentials ride in query params (u=, t= token hash,
+  // s= salt); getCoverArt art_url URLs carry the full token set, so log lines
+  // mentioning one are scrubbed too.
+  text = text.replace(/(^|[?&\s])((?:code|access_token|refresh_token|code_verifier|client_secret|password|u|t|s|salt|token)=)[^&#\s]+/ig, "$1$2<redacted>")
   text = text.replace(/("(?:access_token|refresh_token|code|code_verifier|client_secret|password)"\s*:\s*")[^"]+/ig, "$1<redacted>")
   return text
 }
@@ -576,32 +579,136 @@ function seekPosition(position, delta, length) {
   return maximum > 0 ? Math.min(maximum, next) : next
 }
 
-function backendLoadFields(body) {
-  var source = body || null
-  if (!source || typeof source !== "object") return null
-  var fields = { play: true }
-  var contextUri = String(source.context_uri || "")
-  if (contextUri) {
-    fields.context_uri = contextUri
-    var offset = source.offset || null
-    if (offset && offset.uri) fields.offset_uri = String(offset.uri)
-    if (offset && offset.position !== undefined && offset.position !== null) {
-      var index = Math.floor(Number(offset.position))
-      if (isFinite(index) && index >= 0) fields.offset_index = index
-    }
-  } else if (Array.isArray(source.uris) && source.uris.length) {
-    var uris = []
-    for (var i = 0; i < source.uris.length; i++) {
-      var uri = String(source.uris[i] || "")
-      if (uri) uris.push(uri)
-    }
-    if (!uris.length) return null
-    fields.uris = uris
-  } else {
-    return null
+// --------------------------------------------------------------------------
+// Protocol v2 load fields
+//
+// The backend's Subsonic streaming engine (protocol v2) takes complete song
+// references and streams by `id` alone, so all metadata on a SongRef is
+// optional: empty strings, an empty artists list, and 0 duration are all
+// legal and simply mean the UI has nothing better to show.
+//
+// Subsonic song durations are whole seconds; interim callers still hand over
+// Spotify-shaped rows whose durationMs/duration_ms are already milliseconds.
+// Trust the explicit millisecond fields first; a bare `duration` value below
+// 10000 is treated as seconds (a real song is never longer than that in ms
+// naming, and never that short in seconds), anything at or above it as
+// already-converted milliseconds.
+function backendSongDurationMsV2(item) {
+  var source = item || {}
+  var ms = Math.floor(Number(source.duration_ms) || 0)
+  if (ms > 0) return ms
+  ms = Math.floor(Number(source.durationMs) || 0)
+  if (ms > 0) return ms
+  var raw = Math.floor(Number(source.duration) || 0)
+  if (raw <= 0) return 0
+  return raw < 10000 ? raw * 1000 : raw
+}
+
+// Collect the Subsonic artists for a SongRef. Rows may carry `artists` as an
+// array of strings or {name} objects, or a single `artist`/`artistName`
+// string; everything degrades into the one flat string array the protocol
+// defines. Duplicates are dropped.
+function backendSongArtistsV2(item) {
+  var names = []
+  var source = arrayValues((item || {}).artists)
+  for (var i = 0; i < source.length; i++) {
+    var entry = source[i]
+    if (!entry) continue
+    var name = String(typeof entry === "object" ? entry.name : entry).trim()
+    if (name && names.indexOf(name) < 0) names.push(name)
   }
-  var positionMs = Math.floor(Number(source.position_ms) || 0)
-  if (positionMs > 0) fields.position_ms = positionMs
+  if (!names.length) {
+    var single = String((item && (item.artist || item.artistName)) || "").trim()
+    if (single) names.push(single)
+  }
+  return names
+}
+
+// Map one UI row to a protocol v2 SongRef. Subsonic fields are the primary
+// source; interim Spotify-shaped rows degrade to their closest field (uri ->
+// track id, name -> title, artist -> artists) so the transport boundary keeps
+// accepting today's lists until the Subsonic data model lands in package 5.
+// Rows without any usable id return null and are dropped by the caller.
+function backendSongRefV2(item) {
+  if (!item || typeof item !== "object") return null
+  var id = String(item.id === undefined || item.id === null ? "" : item.id).trim()
+  if (!id) id = spotifyTrackId(item.uri)
+  if (!id) return null
+  var song = { id: id }
+  var title = String(item.title !== undefined && item.title !== null
+    ? item.title : (item.name || "")).trim()
+  if (title) song.title = title
+  var artists = backendSongArtistsV2(item)
+  if (artists.length) song.artists = artists
+  var album = String(item.album || "").trim()
+  if (album) song.album = album
+  var duration = Math.max(0, Math.floor(backendSongDurationMsV2(item)))
+  if (duration > 0) song.duration_ms = duration
+  var cover = String(item.coverArt || item.cover_art || "").trim()
+  if (cover) song.cover_art = cover
+  var track = Math.floor(Number(item.track))
+  if (isFinite(track) && track > 0) song.track = track
+  return song
+}
+
+// Build the v2 `load` payload from a list of given items and options:
+//   items   — array (or QML sequence) of rows mapped by backendSongRefV2
+//   options — { offset_index, position_ms, play } (all optional)
+// Returns null when no row carries an id. `play` defaults to true; an
+// offset_index outside the songs list is clamped by the backend to 0.
+function backendLoadFieldsV2(items, options) {
+  var rows = arrayValues(items)
+  var songs = []
+  for (var i = 0; i < rows.length; i++) {
+    var song = backendSongRefV2(rows[i])
+    if (song) songs.push(song)
+  }
+  if (!songs.length) return null
+  var spec = options && typeof options === "object" ? options : ({})
+  var fields = { songs: songs, play: spec.play !== false }
+  var index = Math.floor(Number(spec.offset_index))
+  if (isFinite(index) && index >= 0) fields.offset_index = index
+  var position = Math.floor(Number(spec.position_ms))
+  if (position > 0) fields.position_ms = position
+  return fields
+}
+
+// Interim bridge (package 5 replaces it with Subsonic rows end to end): turn
+// a play request into a v2 load body. The visible list becomes the engine's
+// queue starting at the clicked row, mirroring playbackBody's wrap-around so
+// Next reaches the list's end the same way the Spotify play endpoint did.
+// Context offset rules come from playbackContextOffsetPosition; a resume
+// offset in milliseconds is honored for a row loaded mid-song.
+function playbackLoadBodyV2(item, sourceItems, contextUri, resumeMs) {
+  if (!item || typeof item !== "object") return null
+  // Playback must start somewhere: a clicked row with no usable id (a pure
+  // context header, for instance) cannot anchor the queue.
+  if (!backendSongRefV2(item)) return null
+  var rows = arrayValues(sourceItems)
+  if (!rows.length && item.kind === "item") rows = [item]
+  if (!rows.length) return null
+  var start = -1
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i] === item) {
+      start = i
+      break
+    }
+  }
+  if (start < 0) {
+    var offset = playbackContextOffsetPosition(item, rows, contextUri)
+    if (offset >= 0 && offset < rows.length) start = offset
+  }
+  if (start < 0) start = 0
+  var songs = []
+  for (var step = 0; step < rows.length && songs.length < PLAYBACK_URI_LIMIT;
+      step++) {
+    var song = backendSongRefV2(rows[(start + step) % rows.length])
+    if (song) songs.push(song)
+  }
+  if (!songs.length) return null
+  var fields = { songs: songs, play: true }
+  var position = Math.floor(Number(resumeMs) || 0)
+  if (position > 0) fields.position_ms = position
   return fields
 }
 

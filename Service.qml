@@ -443,6 +443,9 @@ Item {
   property double lastActivityAt: Date.now()
   property var pendingPlayback: null
   property var pendingPlaybackBody: null
+  // Protocol v2 load body derived from the same play request; the local
+  // socket path sends this instead of the Spotify-shaped playback body.
+  property var pendingPlaybackLoad: null
   property string pendingPlaybackMessage: ""
   property var pendingPlaybackRadio: null
   property int pendingPlaybackSerial: 0
@@ -2943,6 +2946,7 @@ Item {
   function clearPendingPlayback(keepActivation) {
     pendingPlayback = null
     pendingPlaybackBody = null
+    pendingPlaybackLoad = null
     pendingPlaybackMessage = ""
     pendingPlaybackRadio = null
     pendingPlaybackSerial = 0
@@ -3000,11 +3004,22 @@ Item {
   function sendLocalSocketPlayback(playbackSerial) {
     if (playbackSerial !== pendingPlaybackSerial || !pendingPlaybackBody) return
     var body = pendingPlaybackBody
+    var load = pendingPlaybackLoad
     var successMessage = pendingPlaybackMessage
     var radioPlaylist = pendingPlaybackRadio
     clearPendingPlayback()
     localSocketWaitTimer.stop()
-    backendClient.loadPlayback(body, function(ok, result, error) {
+    // Without a v2 load body there is nothing the stream engine can play;
+    // fall back to the remote Spotify API like an absent socket would.
+    if (!load) {
+      root.succeed(Api.localSocketFallbackMessage())
+      root.sendPendingPlayback(Api.playbackTargetDeviceId(
+        root.localDevice() || root.chooseDevice(), root.selectedDeviceExplicit))
+      return
+    }
+    // Credentials must precede load/add_to_queue on a fresh connection.
+    ensureBackendServerConfigured()
+    backendClient.loadPlayback(load, function(ok, result, error) {
       if (ok) {
         if (playbackSerial === root.radioSerial)
           root.radioContextSelected = !!radioPlaylist
@@ -3014,6 +3029,7 @@ Item {
         return
       }
       root.pendingPlaybackBody = body
+      root.pendingPlaybackLoad = load
       root.pendingPlaybackMessage = successMessage
       root.pendingPlaybackRadio = radioPlaylist
       root.pendingPlaybackSerial = playbackSerial
@@ -3031,6 +3047,11 @@ Item {
       fail("This Spotify item cannot be played")
       return
     }
+    // The stream engine queues complete songs, not Spotify contexts. Same
+    // ordering rules as the remote body: start at the clicked row and carry
+    // the visible list with it.
+    pendingPlaybackLoad = Api.playbackLoadBodyV2(item, sourceItems, contextUri,
+      item.resumeMs)
     pendingPlayback = item
     pendingPlaybackBody = body
     pendingPlaybackMessage = String(successMessage || "")
@@ -3050,6 +3071,24 @@ Item {
       return
     }
     dispatchPendingPlayback(playbackSerial)
+  }
+
+  // Protocol v2: configure_server must be sent once per backend connection
+  // before any load/add_to_queue. Runs whenever the backend becomes ready
+  // (including after a reconnect, whose credentials re-send hooks off the
+  // serverConfigured flag). Empty credentials mean setup has not landed yet;
+  // the backend then answers playback commands with `missing_credentials`.
+  // Inputs are deliberately never logged.
+  function ensureBackendServerConfigured() {
+    if (!backendClient.connected || backendClient.serverConfigured) return
+    if (backendClient.lifecycle !== "ready") return
+    var credentials = authManager.navidromeCredentials()
+    if (!credentials.url || !credentials.username || !credentials.password)
+      return
+    backendClient.configureServer(credentials.url, credentials.username,
+      credentials.password, function(ok, result, error) {
+        if (!ok) root.fail(error || "Could not configure the Navidrome server")
+      })
   }
 
   function probeForLocalDevice() {
@@ -3496,12 +3535,17 @@ Item {
   }
 
   function addToQueue(item) {
-    if (!item || ["track", "episode"].indexOf(item.type) < 0 || !item.uri) {
+    // Protocol v2 add_to_queue carries a SongRef; the remote path keeps the
+    // Web API shape.
+    if (!item || ["track", "episode"].indexOf(item.type) < 0
+        || !Api.backendSongRefV2(item)) {
       fail("Only tracks and episodes can be added to the queue")
       return
     }
     if (!useRemotePlayback && backendClient.ready) {
-      backendClient.sendCommand("add_to_queue", { uri: item.uri },
+      ensureBackendServerConfigured()
+      backendClient.sendCommand("add_to_queue",
+        { song: Api.backendSongRefV2(item) },
         function(ok, result, error) {
           if (ok) {
             root.succeed("Added to queue")
@@ -4171,6 +4215,9 @@ Item {
   BackendClient {
     id: backendClient
     wanted: daemonManager.running && !daemonManager.usingFallbackRuntime
+    // The initial state event flips lifecycle to "ready": the single point
+    // where a fresh connection (or a reconnect) gets configured.
+    onLifecycleChanged: root.ensureBackendServerConfigured()
     onErrorCodeChanged: if (errorCode === "audio_key_unavailable")
       root.fail(errorMessage || "Spotify could not play this track on this computer")
   }
