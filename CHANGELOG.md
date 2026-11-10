@@ -1,6 +1,16 @@
 # Changelog
 
-## 1.0.4 (unreleased)
+## 0.1.0 (unreleased port)
+
+Omarchy Navidrome starts as a port of the Omarchy Spotify plugin baseline
+below. Spotify-only capabilities are replaced with their Navidrome
+equivalents per [the port plan](docs/NAVIDROME_PORT_PLAN.md); entries here
+record Navidrome-relevant behavior only. The bullet list under this section
+describes the inherited baseline and is reduced as the port removes or
+replaces capabilities.
+
+## 1.0.4 (unreleased, Spotify baseline)
+
 
 - Start `Ctrl+F` and `/` searches across Spotify; press again to search the
   current area.

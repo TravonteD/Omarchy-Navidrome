@@ -3,7 +3,7 @@ set -euo pipefail
 
 source_root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 manifest="$source_root/backend/Cargo.toml"
-runtime_dir=${OMARCHY_SPOTIFY_RUNTIME_DIR:-"$HOME/.local/lib/omarchy-navidrome"}
+runtime_dir=${OMARCHY_NAVIDROME_RUNTIME_DIR:-"$HOME/.local/lib/omarchy-navidrome"}
 destination="$runtime_dir/omarchy-navidrome-backend"
 source_id_file="$runtime_dir/backend-source.sha256"
 binary_hash_file="$runtime_dir/backend-binary.sha256"
@@ -115,7 +115,7 @@ download_verified_release() {
   verified_release="$download_dir/$release_asset"
 }
 
-if [[ ${OMARCHY_SPOTIFY_BUILD_FROM_SOURCE:-0} != 1 ]]; then
+if [[ ${OMARCHY_NAVIDROME_BUILD_FROM_SOURCE:-0} != 1 ]]; then
   if download_verified_release; then
     install_backend "$verified_release" "attested-release:$verified_commit"
     printf 'Installed verified playback backend: %s\n' "$destination"

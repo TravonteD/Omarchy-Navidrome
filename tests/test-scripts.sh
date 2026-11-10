@@ -36,8 +36,9 @@ git -C "$release_source" config user.name "Omarchy Navidrome tests"
 git -C "$release_source" config user.email "tests@example.invalid"
 git -C "$release_source" add .
 git -C "$release_source" commit -qm "Release source"
-git -C "$release_source" tag -a v1.0.4 -m "Release v1.0.4"
-release_commit=$(git -C "$release_source" rev-parse 'refs/tags/v1.0.4^{commit}')
+release_version=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])' "$source_root/manifest.json")
+git -C "$release_source" tag -a "v$release_version" -m "Release v$release_version"
+release_commit=$(git -C "$release_source" rev-parse "refs/tags/v$release_version^{commit}")
 printf '%s\n' 'UI-only change after the release' >"$release_source/Panel.qml"
 git -C "$release_source" add Panel.qml
 git -C "$release_source" commit -qm "Change only the UI"
@@ -95,7 +96,7 @@ TEST_RELEASE_SUMS="$release_sums" \
 TEST_EXPECTED_DIGEST="$release_commit" \
 TEST_GH_LOG="$release_gh_log" \
 TEST_CARGO_LOG="$release_cargo_log" \
-OMARCHY_SPOTIFY_RUNTIME_DIR="$release_runtime" \
+OMARCHY_NAVIDROME_RUNTIME_DIR="$release_runtime" \
 CARGO_TARGET_DIR="$release_target" \
   "$release_source/scripts/build-backend.sh" >/dev/null
 cmp -s -- "$release_asset" "$release_runtime/omarchy-navidrome-backend"
@@ -114,7 +115,7 @@ TEST_RELEASE_SUMS="$release_sums" \
 TEST_EXPECTED_DIGEST="$release_commit" \
 TEST_GH_LOG="$release_gh_log" \
 TEST_CARGO_LOG="$release_cargo_log" \
-OMARCHY_SPOTIFY_RUNTIME_DIR="$release_runtime" \
+OMARCHY_NAVIDROME_RUNTIME_DIR="$release_runtime" \
 CARGO_TARGET_DIR="$release_target" \
   "$release_source/scripts/build-backend.sh" >/dev/null
 [[ ! -s $release_gh_log ]]
@@ -218,8 +219,8 @@ PATH="$mock_bin:$PATH" \
 XDG_CONFIG_HOME="$runtime_config" \
 XDG_CACHE_HOME="$runtime_cache" \
 XDG_STATE_HOME="$runtime_state" \
-OMARCHY_SPOTIFY_RUNTIME_DIR="$runtime_backend" \
-OMARCHY_SPOTIFY_SKIP_BACKEND_BUILD=1 \
+OMARCHY_NAVIDROME_RUNTIME_DIR="$runtime_backend" \
+OMARCHY_NAVIDROME_SKIP_BACKEND_BUILD=1 \
   "$source_root/scripts/setup.sh" --device-name "Test speakers" >/dev/null
 
 runtime_spotify_config="$runtime_config/omarchy-navidrome/spotifyd.conf"
@@ -236,7 +237,7 @@ PATH="$mock_bin:$PATH" \
 XDG_CONFIG_HOME="$runtime_config" \
 XDG_CACHE_HOME="$runtime_cache" \
 XDG_STATE_HOME="$runtime_state" \
-OMARCHY_SPOTIFY_RUNTIME_DIR="$runtime_backend" \
+OMARCHY_NAVIDROME_RUNTIME_DIR="$runtime_backend" \
   "$source_root/scripts/remove-runtime.sh" >/dev/null
 
 [[ ! -e $runtime_unit && ! -e $runtime_config/omarchy-navidrome ]]
@@ -249,8 +250,8 @@ PATH="$mock_bin:$PATH" \
 XDG_CONFIG_HOME="$runtime_config" \
 XDG_CACHE_HOME="$runtime_cache" \
 XDG_STATE_HOME="$runtime_state" \
-OMARCHY_SPOTIFY_RUNTIME_DIR="$runtime_backend" \
-OMARCHY_SPOTIFY_SKIP_BACKEND_BUILD=1 \
+OMARCHY_NAVIDROME_RUNTIME_DIR="$runtime_backend" \
+OMARCHY_NAVIDROME_SKIP_BACKEND_BUILD=1 \
   "$source_root/scripts/setup-playback.sh" >/dev/null
 [[ -f $runtime_spotify_config && -f $runtime_unit ]]
 grep -qx 'device_name = "Omarchy Navidrome"' "$runtime_spotify_config"
@@ -266,9 +267,9 @@ PATH="$mock_bin:$PATH" \
 XDG_CONFIG_HOME="$runtime_config" \
 XDG_CACHE_HOME="$runtime_cache" \
 XDG_STATE_HOME="$runtime_state" \
-OMARCHY_SPOTIFY_RUNTIME_DIR="$runtime_backend" \
+OMARCHY_NAVIDROME_RUNTIME_DIR="$runtime_backend" \
 CARGO_TARGET_DIR="$mock_target" \
-OMARCHY_SPOTIFY_BUILD_FROM_SOURCE=1 \
+OMARCHY_NAVIDROME_BUILD_FROM_SOURCE=1 \
   "$source_root/scripts/setup.sh" >/dev/null
 runtime_backend_unit="$runtime_config/systemd/user/omarchy-navidrome.service"
 [[ -x $runtime_backend/omarchy-navidrome-backend && -f $runtime_backend_unit ]]
@@ -287,7 +288,7 @@ chmod 755 "$runtime_backend/omarchy-navidrome-backend"
 printf '%s\n' 'stale unit' >"$runtime_backend_unit"
 selected_unit=$(PATH="$mock_bin:$PATH" \
   XDG_CONFIG_HOME="$runtime_config" \
-  OMARCHY_SPOTIFY_RUNTIME_DIR="$runtime_backend" \
+  OMARCHY_NAVIDROME_RUNTIME_DIR="$runtime_backend" \
   "$source_root/scripts/playback-runtime.sh" unit)
 [[ $selected_unit == omarchy-navidrome-spotifyd.service ]]
 
@@ -296,9 +297,9 @@ PATH="$mock_bin:$PATH" \
 XDG_CONFIG_HOME="$runtime_config" \
 XDG_CACHE_HOME="$runtime_cache" \
 XDG_STATE_HOME="$runtime_state" \
-OMARCHY_SPOTIFY_RUNTIME_DIR="$runtime_backend" \
+OMARCHY_NAVIDROME_RUNTIME_DIR="$runtime_backend" \
 CARGO_TARGET_DIR="$mock_target" \
-OMARCHY_SPOTIFY_BUILD_FROM_SOURCE=1 \
+OMARCHY_NAVIDROME_BUILD_FROM_SOURCE=1 \
 TEST_SERVICE_ACTIVE=1 \
 TEST_SYSTEMCTL_LOG="$systemctl_log" \
   "$source_root/scripts/setup.sh" >/dev/null
@@ -308,7 +309,7 @@ source_build_hash=$(sha256sum -- "$mock_target/release/omarchy-navidrome-backend
 cmp -s -- "$source_root/systemd/omarchy-navidrome.service" "$runtime_backend_unit"
 PATH="$mock_bin:$PATH" \
 XDG_CONFIG_HOME="$runtime_config" \
-OMARCHY_SPOTIFY_RUNTIME_DIR="$runtime_backend" \
+OMARCHY_NAVIDROME_RUNTIME_DIR="$runtime_backend" \
   "$source_root/scripts/playback-runtime.sh" check
 grep -qx -- '--user restart omarchy-navidrome.service' "$systemctl_log"
 
@@ -317,7 +318,7 @@ PATH="$mock_bin:$PATH" \
 XDG_CONFIG_HOME="$runtime_config" \
 XDG_CACHE_HOME="$runtime_cache" \
 XDG_STATE_HOME="$runtime_state" \
-OMARCHY_SPOTIFY_RUNTIME_DIR="$runtime_backend" \
+OMARCHY_NAVIDROME_RUNTIME_DIR="$runtime_backend" \
 TEST_SERVICE_ACTIVE=1 \
 TEST_SYSTEMCTL_LOG="$systemctl_log" \
   "$source_root/scripts/setup.sh" >/dev/null
@@ -337,7 +338,7 @@ XDG_CONFIG_HOME="$runtime_config" \
 XDG_CACHE_HOME="$runtime_cache" \
 XDG_STATE_HOME="$runtime_state" \
 XDG_RUNTIME_DIR="$runtime_session" \
-OMARCHY_SPOTIFY_RUNTIME_DIR="$runtime_backend" \
+OMARCHY_NAVIDROME_RUNTIME_DIR="$runtime_backend" \
 TEST_SECRET_LOG="$secret_log" \
 TEST_SYSTEMCTL_LOG="$systemctl_log" \
   "$source_root/scripts/remove-runtime.sh" --purge >/dev/null
@@ -379,7 +380,7 @@ printf '%s\n' stale >"$runtime_backend/omarchy-navidrome-backend"
   XDG_CACHE_HOME="$runtime_cache" \
   XDG_STATE_HOME="$runtime_state" \
   XDG_RUNTIME_DIR="$runtime_session" \
-  OMARCHY_SPOTIFY_RUNTIME_DIR="$runtime_backend" \
+  OMARCHY_NAVIDROME_RUNTIME_DIR="$runtime_backend" \
   TEST_SECRET_LOG="$secret_log" \
   TEST_SYSTEMCTL_LOG="$systemctl_log" \
   TEST_OMARCHY_LOG="$omarchy_log" \
@@ -399,7 +400,7 @@ XDG_CONFIG_HOME="$runtime_config" \
 XDG_CACHE_HOME="$runtime_cache" \
 XDG_STATE_HOME="$runtime_state" \
 XDG_RUNTIME_DIR="$runtime_session" \
-OMARCHY_SPOTIFY_RUNTIME_DIR="$runtime_backend" \
+OMARCHY_NAVIDROME_RUNTIME_DIR="$runtime_backend" \
 TEST_SECRET_LOG="$secret_log" \
 TEST_SYSTEMCTL_LOG="$systemctl_log" \
 TEST_OMARCHY_LOG="$omarchy_log" \
@@ -508,7 +509,7 @@ if grep -E '^[[:space:]]*uses:' \
   echo "release-backend.yml contains a mutable action reference" >&2
   exit 1
 fi
-jq -e '.version == "1.0.4"
+jq -e '.version == "0.1.0"
   and .barWidget.defaultSection == "left"
   and .barWidget.defaults.showMiniPlayer == "On"
   and (.barWidget.schema[] | select(.key == "showMiniPlayer").defaultValue) == "On"

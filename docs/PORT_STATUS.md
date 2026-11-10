@@ -39,8 +39,16 @@ fix pass.
 
 ## Remaining in package 0
 
-- second rename pass for user-facing strings and aliases (bar aliases,
-  README, `omasing` references) per plan acceptance.
+- second rename pass done for: uppercase env names (`OMARCHY_NAVIDROME_*`),
+  manifest descriptions/aliases (bar alias `spotify` → `navidrome`,
+  version reset to 0.1.0 aligning backend `Cargo.toml`, `Cargo.lock`, tests,
+  and a fresh `0.1.0 (unreleased port)` CHANGELOG section), interim README
+  (with the uninstall chapter the script tests require), and install-script
+  wording.
+- Left in place deliberately until their replacement ships: Spotify-only
+  file/component names still referenced by tests and flows that later packages
+  rewrite (`SpotifyApi.qml`, `SpotifyConnectManager.qml`,
+  `benchmark-spotify-desktop.sh` as a comparator, `spotifyd` fallback files).
 - Decide the fate of the pre-existing Quickshell smoke failure above: fix the
   harness stub or restore theme initialization so the gate is green.
 

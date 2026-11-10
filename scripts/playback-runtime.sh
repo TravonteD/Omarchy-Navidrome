@@ -8,7 +8,7 @@ if (( $# != 1 )); then
   exit 2
 fi
 
-runtime_dir=${OMARCHY_SPOTIFY_RUNTIME_DIR:-"$HOME/.local/lib/omarchy-navidrome"}
+runtime_dir=${OMARCHY_NAVIDROME_RUNTIME_DIR:-"$HOME/.local/lib/omarchy-navidrome"}
 backend_binary="$runtime_dir/omarchy-navidrome-backend"
 backend_source_id_file="$runtime_dir/backend-source.sha256"
 backend_binary_hash_file="$runtime_dir/backend-binary.sha256"

@@ -80,5 +80,5 @@ done
 }
 
 omarchy plugin enable quickshell.navidrome --section "$section"
-echo "Installed. Click the Spotify bar widget; if you are logged out,"
-echo "the client opens directly on its guided Spotify login screen."
+echo "Installed. Click the bar widget; if you are not connected,"
+echo "the client opens directly on its guided connection screen."

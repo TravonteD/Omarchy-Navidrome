@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "quickshell.navidrome",
   "name": "Omarchy Navidrome",
-  "version": "1.0.4",
-  "author": "QuickshellSpotify",
+  "version": "0.1.0",
+  "author": "QuickshellNavidrome",
   "license": "MIT",
-  "description": "Spotify in Quickshell with all the features you need\u2014using about 60 MB of memory versus roughly 950 MB for the official client.",
+  "description": "Navidrome in Quickshell\u2014your self-hosted library in the shell, without a browser tab.",
   "kinds": [
     "service",
     "bar-widget",
@@ -19,10 +19,10 @@
   },
   "barWidget": {
     "displayName": "Omarchy Navidrome",
-    "description": "Spotify in Quickshell with all the features you need\u2014using about 60 MB of memory versus roughly 950 MB for the official client.",
+    "description": "Navidrome in Quickshell\u2014your self-hosted library in the shell, without a browser tab.",
     "category": "Media",
     "aliases": [
-      "spotify",
+      "navidrome",
       "music",
       "player"
     ],
@@ -53,7 +53,7 @@
         "type": "string",
         "label": "This computer appears as",
         "defaultValue": "Omarchy Navidrome",
-        "description": "Shown in Devices immediately. Spotify Connect uses the new name the next time local playback starts."
+        "description": "Shown in Devices immediately. The local player uses the new name the next time local playback starts."
       },
       {
         "key": "idleShutdownMinutes",
@@ -74,7 +74,7 @@
           "Off"
         ],
         "defaultValue": "On",
-        "description": "When off, clicking the Spotify bar icon opens the full player directly."
+        "description": "When off, clicking the bar icon opens the full player directly."
       },
       {
         "key": "showVinylRecord",
@@ -152,7 +152,7 @@
           "Off"
         ],
         "defaultValue": "On",
-        "description": "When off, the bar returns to the Spotify icon while playback is paused. The session remains available to resume."
+        "description": "When off, the bar returns to the plain icon while playback is paused. The session remains available to resume."
       },
       {
         "key": "scrollBarText",
@@ -215,9 +215,9 @@
       {
         "key": "clientId",
         "type": "string",
-        "label": "Spotify Developer app client ID",
+        "label": "Legacy Spotify client ID (unused in the Navidrome port)",
         "defaultValue": "",
-        "description": "Optional personal Spotify Developer app client ID, with its own quota. Empty keeps the plugin's client. A valid 32-hex ID is required. Changing it clears the current session and requires authorization for your app."
+        "description": "Legacy setting from the Spotify plugin; unused for Navidrome. It is kept only so existing settings files load, and is removed during the settings cleanup."
       }
     ]
   }

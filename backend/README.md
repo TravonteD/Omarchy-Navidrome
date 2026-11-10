@@ -57,11 +57,11 @@ Build and verify from the repository root:
 cargo fmt --manifest-path backend/Cargo.toml --all -- --check
 cargo test --manifest-path backend/Cargo.toml --locked
 cargo clippy --manifest-path backend/Cargo.toml --locked --all-targets -- -D warnings
-OMARCHY_SPOTIFY_BUILD_FROM_SOURCE=1 ./scripts/build-backend.sh
+OMARCHY_NAVIDROME_BUILD_FROM_SOURCE=1 ./scripts/build-backend.sh
 ```
 
 By default, `scripts/build-backend.sh` first tries the exact-commit attested
-release. `OMARCHY_SPOTIFY_BUILD_FROM_SOURCE=1` forces an auditable local build
+release. `OMARCHY_NAVIDROME_BUILD_FROM_SOURCE=1` forces an auditable local build
 into `$XDG_CACHE_HOME/omarchy-navidrome/target` (override with
 `CARGO_TARGET_DIR`). Omarchy hot-reloads plugins on any write inside their
 directory, so building to a cache path outside the plugin prevents the shell's

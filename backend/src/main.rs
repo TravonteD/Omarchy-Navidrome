@@ -31,7 +31,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Action {
-    /// Validate configuration without connecting to Spotify.
+    /// Validate configuration without connecting to Navidrome.
     Check,
     /// Authorize local playback and store a private reusable credential.
     Authenticate {

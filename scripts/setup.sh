@@ -4,7 +4,7 @@ set -euo pipefail
 source_root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 install_spotifyd=0
 force_config=0
-skip_backend_build=${OMARCHY_SPOTIFY_SKIP_BACKEND_BUILD:-0}
+skip_backend_build=${OMARCHY_NAVIDROME_SKIP_BACKEND_BUILD:-0}
 device_name="Omarchy Navidrome"
 
 usage() {
@@ -74,7 +74,7 @@ unit_dir="$config_root/systemd/user"
 backend_unit_file="$unit_dir/omarchy-navidrome.service"
 fallback_unit_file="$unit_dir/omarchy-navidrome-spotifyd.service"
 
-backend_binary=${OMARCHY_SPOTIFY_RUNTIME_DIR:-"$HOME/.local/lib/omarchy-navidrome"}/omarchy-navidrome-backend
+backend_binary=${OMARCHY_NAVIDROME_RUNTIME_DIR:-"$HOME/.local/lib/omarchy-navidrome"}/omarchy-navidrome-backend
 runtime_dir=$(dirname -- "$backend_binary")
 backend_source_id_file="$runtime_dir/backend-source.sha256"
 backend_binary_hash_file="$runtime_dir/backend-binary.sha256"
