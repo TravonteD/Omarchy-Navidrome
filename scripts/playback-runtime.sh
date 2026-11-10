@@ -8,15 +8,15 @@ if (( $# != 1 )); then
   exit 2
 fi
 
-runtime_dir=${OMARCHY_SPOTIFY_RUNTIME_DIR:-"$HOME/.local/lib/omarchy-spotify"}
-backend_binary="$runtime_dir/omarchy-spotify-backend"
+runtime_dir=${OMARCHY_SPOTIFY_RUNTIME_DIR:-"$HOME/.local/lib/omarchy-navidrome"}
+backend_binary="$runtime_dir/omarchy-navidrome-backend"
 backend_source_id_file="$runtime_dir/backend-source.sha256"
 backend_binary_hash_file="$runtime_dir/backend-binary.sha256"
-backend_unit=omarchy-spotify.service
-fallback_unit=omarchy-spotifyd.service
+backend_unit=omarchy-navidrome.service
+fallback_unit=omarchy-navidrome-spotifyd.service
 config_root=${XDG_CONFIG_HOME:-"$HOME/.config"}
-installed_backend_unit="$config_root/systemd/user/omarchy-spotify.service"
-source_backend_unit="$source_root/systemd/omarchy-spotify.service"
+installed_backend_unit="$config_root/systemd/user/omarchy-navidrome.service"
+source_backend_unit="$source_root/systemd/omarchy-navidrome.service"
 state_root=${XDG_STATE_HOME:-"$HOME/.local/state"}
 cache_root=${XDG_CACHE_HOME:-"$HOME/.cache"}
 
@@ -58,8 +58,8 @@ case $action in
     ;;
   credentials)
     credential_paths=(
-      "$state_root/omarchy-spotify/oauth/credentials.json"
-      "$state_root/omarchy-spotify/zeroconf/credentials.json"
+      "$state_root/omarchy-navidrome/oauth/credentials.json"
+      "$state_root/omarchy-navidrome/zeroconf/credentials.json"
       "$cache_root/spotifyd/oauth/credentials.json"
       "$cache_root/spotifyd/zeroconf/credentials.json"
     )
@@ -73,7 +73,7 @@ case $action in
       echo "playback-runtime.sh: no installed playback runtime is available" >&2
       exit 1
     }
-    failure_path="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/omarchy-spotify/startup-error.json"
+    failure_path="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/omarchy-navidrome/startup-error.json"
     if [[ $action == start-explicit ]]; then
       rm -f -- "$failure_path"
       systemctl --user reset-failed "$unit" || true
@@ -99,7 +99,7 @@ case $action in
     if [[ $(systemctl --user show "$unit" -p Result --value) == start-limit-hit ]]; then
       echo restart_limit
     else
-      jq -r '.code // ""' "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/omarchy-spotify/startup-error.json" 2>/dev/null || true
+      jq -r '.code // ""' "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/omarchy-navidrome/startup-error.json" 2>/dev/null || true
     fi
     ;;
   unit)

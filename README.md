@@ -1,8 +1,8 @@
-# Omarchy Spotify
+# Omarchy Navidrome
 
 **Spotify in Quickshell—not Chromium.**
 
-Omarchy Spotify brings the Spotify experience you already know into a fast,
+Omarchy Navidrome brings the Spotify experience you already know into a fast,
 beautiful Omarchy plugin. It uses about **60 MB of RAM** instead of roughly
 **950 MB** for the Spotify desktop client, follows your active Omarchy theme,
 and keeps your music close with an integrated mini player.
@@ -13,7 +13,7 @@ for you, ready when you want them.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/stappmus/Omarchy-Spotify.git --enable
+omarchy plugin add https://github.com/stappmus/Omarchy-Navidrome.git --enable
 ```
 
 Requires Omarchy 4 and a personal Spotify Premium account.
@@ -82,7 +82,7 @@ current artist or album in the full player, and `O` expands the full player.
 Everything is where you expect it to be—just faster, lighter, and dressed in
 your Omarchy theme.
 
-![Vietnam War Music playlist in Omarchy Spotify](docs/screenshots/vietnam-war-playlist.png)
+![Vietnam War Music playlist in Omarchy Navidrome](docs/screenshots/vietnam-war-playlist.png)
 
 ### Everything from an artist, in one view
 
@@ -96,13 +96,13 @@ Top albums and EPs sit beside the artist's ten biggest songs, with their
 One click sends the current track to Omasing, where the lyrics are fetched and
 lined up with your playback position—ready to auto-scroll as you listen.
 
-![Omarchy Spotify beside Omasing lyrics for Under the Bridge](docs/screenshots/omasing-lyrics-under-the-bridge.png)
+![Omarchy Navidrome beside Omasing lyrics for Under the Bridge](docs/screenshots/omasing-lyrics-under-the-bridge.png)
 
 ### A mini player that belongs in your desktop
 
 The essentials are always one click away, without reopening the full app.
 
-![Omarchy Spotify mini player playing Under the Bridge](docs/screenshots/mini-player-under-the-bridge.png)
+![Omarchy Navidrome mini player playing Under the Bridge](docs/screenshots/mini-player-under-the-bridge.png)
 
 ## Set it up
 
@@ -111,24 +111,24 @@ To replace Omarchy's existing **Super+Shift+M · Music** binding, add this to
 
 ```lua
   hl.unbind("SUPER + SHIFT + M") -- previously: Music
-  o.bind("SUPER + SHIFT + M", "Omarchy Spotify",
-    "omarchy shell -q quickshell.spotify.player togglePlayer")
+  o.bind("SUPER + SHIFT + M", "Omarchy Navidrome",
+    "omarchy shell -q quickshell.navidrome.player togglePlayer")
 ```
 
 Run `hyprctl reload` and check `hyprctl configerrors` after saving. Until the
 binding is replaced, Omarchy's stock Music binding stays active and the
 Settings choice below has no effect on the shortcut.
 
-In Omarchy Spotify's Settings, choose whether that shortcut launches Omarchy's
+In Omarchy Navidrome's Settings, choose whether that shortcut launches Omarchy's
 Music app, toggles the full player, or toggles the mini-player. Separate
 bindings can call `toggleMiniPlayer` or `toggleFullPlayer` on the same
-`quickshell.spotify.player` target.
+`quickshell.navidrome.player` target.
 
 Raise or lower Spotify volume from a keybinding without opening the player:
 
 ```bash
-omarchy shell -q quickshell.spotify.player volumeUp
-omarchy shell -q quickshell.spotify.player volumeDown
+omarchy shell -q quickshell.navidrome.player volumeUp
+omarchy shell -q quickshell.navidrome.player volumeDown
 ```
 
 Each step is 5%, the same as Ctrl+Up / Ctrl+Down. This changes Spotify's own
@@ -169,7 +169,7 @@ The local Connect authorization remains separate.
 Run the bundled uninstaller from outside the plugin directory:
 
 ```bash
-cd "$HOME" && "$HOME/.config/omarchy/plugins/quickshell.spotify/scripts/uninstall.sh"
+cd "$HOME" && "$HOME/.config/omarchy/plugins/quickshell.navidrome/scripts/uninstall.sh"
 ```
 
 It disables and removes the plugin, stops and removes both user services,
@@ -180,11 +180,11 @@ configuration backups, and matching GNOME Keyring entries.
 If you prefer to inspect and paste the main steps individually:
 
 ```bash
-plugin_dir="$HOME/.config/omarchy/plugins/quickshell.spotify"
+plugin_dir="$HOME/.config/omarchy/plugins/quickshell.navidrome"
 cd "$HOME"
-omarchy plugin disable quickshell.spotify 2>/dev/null || true
+omarchy plugin disable quickshell.navidrome 2>/dev/null || true
 "$plugin_dir/scripts/remove-runtime.sh" --purge
-omarchy plugin remove quickshell.spotify --yes
+omarchy plugin remove quickshell.navidrome --yes
 omarchy restart shell
 ```
 
@@ -203,7 +203,7 @@ personal configuration. Check both the live config and, when applicable, its
 chezmoi source:
 
 ```bash
-rg -n 'quickshell\.spotify|Omarchy Spotify' \
+rg -n 'quickshell\.spotify|Omarchy Navidrome' \
   "$HOME/.config/hypr" "$HOME/.local/share/chezmoi" 2>/dev/null
 ```
 
@@ -225,13 +225,13 @@ used again.
   adjustable speed.
 - Choose up to 320 kbps for local playback.
 
-Your Spotify password is entered only on Spotify's own page. Omarchy Spotify
+Your Spotify password is entered only on Spotify's own page. Omarchy Navidrome
 stores your saved session in GNOME Keyring and clears it when you log out.
 
 Want the details? Read the [technical notes](docs/TECHNICAL.md) or see the
 [memory benchmark](docs/BENCHMARK.md).
 
-Omarchy Spotify is an independent project and is not affiliated with Spotify.
+Omarchy Navidrome is an independent project and is not affiliated with Spotify.
 Spotify is a trademark of Spotify AB.
 
 Licensed under the [MIT License](LICENSE).

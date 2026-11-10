@@ -10,10 +10,10 @@ import "Api.js" as Api
 BarWidget {
   id: root
 
-  moduleName: "quickshell.spotify"
+  moduleName: "quickshell.navidrome"
 
   readonly property var spotify: bar && bar.shell
-    ? bar.shell.serviceFor("quickshell.spotify") : null
+    ? bar.shell.serviceFor("quickshell.navidrome") : null
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color muted: Color.muted
   readonly property string surfaceKey: "spotify-popup-" + String(root)
@@ -254,14 +254,14 @@ BarWidget {
       // Remap an existing full player onto the workspace containing this bar.
       // Splitting hide and summon across event-loop turns lets Wayland finish
       // unmapping the old surface before the shell opens it here.
-      bar.shell.hide("quickshell.spotify")
+      bar.shell.hide("quickshell.navidrome")
       Qt.callLater(function() {
         if (root.bar && root.bar.shell)
-          root.bar.shell.summon("quickshell.spotify", encoded)
+          root.bar.shell.summon("quickshell.navidrome", encoded)
       })
     } else if (payload && typeof bar.shell.summon === "function")
-      bar.shell.summon("quickshell.spotify", encoded)
-    else bar.shell.toggle("quickshell.spotify", encoded)
+      bar.shell.summon("quickshell.navidrome", encoded)
+    else bar.shell.toggle("quickshell.navidrome", encoded)
   }
 
   function openCurrentArtist() {
@@ -562,7 +562,7 @@ BarWidget {
     tooltipText: root.spotify && root.spotify.hasMedia
       ? root.spotify.title + (root.spotify.artist ? " — " + root.spotify.artist : "")
       : (root.spotify && !root.spotify.accountConnected
-        ? "Set up Omarchy Spotify" : "Omarchy Spotify")
+        ? "Set up Omarchy Navidrome" : "Omarchy Navidrome")
     // Size from the painted glyph and label plus the real inner chrome.
     readonly property real fittedWidth: Math.ceil(barGlyph.width
       + barContent.spacing + barLabel.implicitWidth + scaledHorizontalMargin * 2)

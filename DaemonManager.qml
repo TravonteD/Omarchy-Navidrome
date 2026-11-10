@@ -15,9 +15,9 @@ Item {
   height: 0
 
   property string pluginDir: ""
-  property string deviceName: "Omarchy Spotify"
+  property string deviceName: "Omarchy Navidrome"
   property int bitrateKbps: 320
-  property string unitName: "omarchy-spotify.service"
+  property string unitName: "omarchy-navidrome.service"
   property bool authenticationCancelled: false
   property bool mprisPresent: false
 
@@ -295,7 +295,7 @@ Item {
       root.unitChecked = true
       if (unit) root.unitName = unit
       root.usingFallbackRuntime = exitCode === 0
-        && unit === "omarchy-spotifyd.service"
+        && unit === "omarchy-navidrome-spotifyd.service"
       if (exitCode === 0) root.requestConfiguration()
       root.installPlaybackBackendIfNeeded()
     }

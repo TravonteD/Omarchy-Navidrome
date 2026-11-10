@@ -5,7 +5,7 @@ source_root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 install_spotifyd=0
 force_config=0
 skip_backend_build=${OMARCHY_SPOTIFY_SKIP_BACKEND_BUILD:-0}
-device_name="Omarchy Spotify"
+device_name="Omarchy Navidrome"
 
 usage() {
   cat <<'EOF'
@@ -68,13 +68,13 @@ done
 }
 
 config_root=${XDG_CONFIG_HOME:-"$HOME/.config"}
-config_dir="$config_root/omarchy-spotify"
+config_dir="$config_root/omarchy-navidrome"
 config_file="$config_dir/spotifyd.conf"
 unit_dir="$config_root/systemd/user"
-backend_unit_file="$unit_dir/omarchy-spotify.service"
-fallback_unit_file="$unit_dir/omarchy-spotifyd.service"
+backend_unit_file="$unit_dir/omarchy-navidrome.service"
+fallback_unit_file="$unit_dir/omarchy-navidrome-spotifyd.service"
 
-backend_binary=${OMARCHY_SPOTIFY_RUNTIME_DIR:-"$HOME/.local/lib/omarchy-spotify"}/omarchy-spotify-backend
+backend_binary=${OMARCHY_SPOTIFY_RUNTIME_DIR:-"$HOME/.local/lib/omarchy-navidrome"}/omarchy-navidrome-backend
 runtime_dir=$(dirname -- "$backend_binary")
 backend_source_id_file="$runtime_dir/backend-source.sha256"
 backend_binary_hash_file="$runtime_dir/backend-binary.sha256"
@@ -97,7 +97,7 @@ backend_install_is_current() {
 }
 
 backend_was_active=0
-if systemctl --user is-active --quiet omarchy-spotify.service 2>/dev/null; then
+if systemctl --user is-active --quiet omarchy-navidrome.service 2>/dev/null; then
   backend_was_active=1
 fi
 
@@ -135,21 +135,21 @@ fi
 printf '%s\n' "$device_name" | "$source_root/scripts/configure-spotifyd.sh"
 if (( backend_ready )); then
   if [[ ! -f $backend_unit_file ]] \
-      || ! cmp -s -- "$source_root/systemd/omarchy-spotify.service" "$backend_unit_file"; then
+      || ! cmp -s -- "$source_root/systemd/omarchy-navidrome.service" "$backend_unit_file"; then
     unit_changed=1
   fi
-  install -m 644 -- "$source_root/systemd/omarchy-spotify.service" "$backend_unit_file"
+  install -m 644 -- "$source_root/systemd/omarchy-navidrome.service" "$backend_unit_file"
 fi
 if command -v spotifyd >/dev/null 2>&1 || [[ -f $fallback_unit_file ]]; then
-  install -m 644 -- "$source_root/systemd/omarchy-spotifyd.service" "$fallback_unit_file"
+  install -m 644 -- "$source_root/systemd/omarchy-navidrome-spotifyd.service" "$fallback_unit_file"
 fi
 systemctl --user daemon-reload
 
 if (( backend_ready && backend_was_active && (backend_changed || unit_changed) )); then
-  systemctl --user restart omarchy-spotify.service
+  systemctl --user restart omarchy-navidrome.service
 fi
 
-for unit_name in omarchy-spotify.service omarchy-spotifyd.service; do
+for unit_name in omarchy-navidrome.service omarchy-navidrome-spotifyd.service; do
   unit_state=$(systemctl --user is-enabled "$unit_name" 2>/dev/null || true)
   if [[ $unit_state == "enabled" || $unit_state == "enabled-runtime" ]]; then
     echo "Warning: $unit_name was already enabled at login." >&2

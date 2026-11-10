@@ -21,7 +21,7 @@ Item {
   property var pluginRegistry: null
 
   readonly property string pluginId: manifest && manifest.id
-    ? String(manifest.id) : "quickshell.spotify"
+    ? String(manifest.id) : "quickshell.navidrome"
   readonly property string pluginDir: manifest && manifest.__sourceDir
     ? String(manifest.__sourceDir) : ""
   readonly property string homeDirectory: Quickshell.env("HOME") || ""
@@ -30,11 +30,11 @@ Item {
     if (explicit) return explicit
     return homeDirectory ? homeDirectory + "/.local/state" : ".local/state"
   }
-  readonly property string stateDir: stateHome + "/omarchy-spotify"
+  readonly property string stateDir: stateHome + "/omarchy-navidrome"
   readonly property string sessionPath: stateDir + "/session.json"
 
   readonly property var defaultSettingValues: ({
-    deviceName: "Omarchy Spotify",
+    deviceName: "Omarchy Navidrome",
     idleShutdownMinutes: 15,
     showMiniPlayer: "On",
     showVinylRecord: "Off",
@@ -54,7 +54,7 @@ Item {
   })
   property var settings: Api.shallowCopy(defaultSettingValues)
 
-  readonly property string deviceName: String(settings.deviceName || "Omarchy Spotify").trim() || "Omarchy Spotify"
+  readonly property string deviceName: String(settings.deviceName || "Omarchy Navidrome").trim() || "Omarchy Navidrome"
   readonly property int idleShutdownMinutes: Math.max(0, Math.min(1440,
     Math.floor(Number(settings.idleShutdownMinutes) || 0)))
   readonly property bool showMiniPlayer: String(settings.showMiniPlayer || "On") !== "Off"
@@ -314,7 +314,7 @@ Item {
   property string selectedDeviceId: ""
   property bool selectedDeviceExplicit: false
   property string localDeviceId: ""
-  property string localRuntimeDeviceName: "Omarchy Spotify"
+  property string localRuntimeDeviceName: "Omarchy Navidrome"
   property alias searchQuery: searchController.searchQuery
   property alias searchGroups: searchController.searchGroups
   property alias searchError: searchController.searchError
@@ -502,7 +502,7 @@ Item {
       var key = keys[i]
       if (source[key] !== undefined) next[key] = source[key]
     }
-    next.deviceName = String(next.deviceName || "Omarchy Spotify").trim() || "Omarchy Spotify"
+    next.deviceName = String(next.deviceName || "Omarchy Navidrome").trim() || "Omarchy Navidrome"
     next.idleShutdownMinutes = Math.max(0, Math.min(1440,
       Math.floor(Number(next.idleShutdownMinutes) || 0)))
     next.showMiniPlayer = String(next.showMiniPlayer || "On") === "Off" ? "Off" : "On"
@@ -1813,7 +1813,7 @@ Item {
     spotifyApi.request("POST", "/me/playlists", null, {
       name: normalized.slice(0, 100),
       "public": false,
-      description: "Created with Omarchy Spotify"
+      description: "Created with Omarchy Navidrome"
     }, function(status, payload, error) {
       root.playlistActionBusy = false
       if (error) { root.fail(error); return }
@@ -1942,7 +1942,7 @@ Item {
       spotifyApi.request("POST", "/me/playlists", null, {
         name: String(playlist.name || "My playlist").slice(0, 100),
         "public": false,
-        description: "Your copy, created with Omarchy Spotify"
+        description: "Your copy, created with Omarchy Navidrome"
       }, function(status, payload, createError) {
         if (expected !== root.dataSerial) return
         if (createError) { root.finishPlaylistConversion(createError); return }
@@ -2771,7 +2771,7 @@ Item {
       ? surface[method]() : "unavailable"
   }
   IpcHandler {
-    target: "quickshell.spotify.player"
+    target: "quickshell.navidrome.player"
     function configuredPlayer(): string { return root.shortcutPlayer }
     function togglePlayer(): string { return root.invokePlayerShortcut("toggleConfiguredPlayerShortcut") }
     function toggleMiniPlayer(): string { return root.invokePlayerShortcut("toggleMiniPlayerShortcut") }
@@ -3090,7 +3090,7 @@ Item {
     if (!id) return
     localActivationRequested = false
     apiAction("PUT", "/me/player", null,
-      { device_ids: [id], play: false }, "Omarchy Spotify is ready",
+      { device_ids: [id], play: false }, "Omarchy Navidrome is ready",
       function(ok) {
         if (ok) {
           root.selectedDeviceId = id

@@ -51,10 +51,10 @@ impl RootInterface for MprisAdapter {
         Ok(false)
     }
     async fn identity(&self) -> fdo::Result<String> {
-        Ok("Omarchy Spotify (librespot)".into())
+        Ok("Omarchy Navidrome (librespot)".into())
     }
     async fn desktop_entry(&self) -> fdo::Result<String> {
-        Ok("omarchy-spotify".into())
+        Ok("omarchy-navidrome".into())
     }
     async fn supported_uri_schemes(&self) -> fdo::Result<Vec<String>> {
         Ok(vec!["spotify".into()])

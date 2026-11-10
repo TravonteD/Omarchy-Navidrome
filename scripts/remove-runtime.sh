@@ -15,15 +15,15 @@ config_root=${XDG_CONFIG_HOME:-"$HOME/.config"}
 cache_root=${XDG_CACHE_HOME:-"$HOME/.cache"}
 state_root=${XDG_STATE_HOME:-"$HOME/.local/state"}
 session_runtime_root=${XDG_RUNTIME_DIR:-/tmp}
-backend_unit_file="$config_root/systemd/user/omarchy-spotify.service"
-fallback_unit_file="$config_root/systemd/user/omarchy-spotifyd.service"
-config_dir="$config_root/omarchy-spotify"
+backend_unit_file="$config_root/systemd/user/omarchy-navidrome.service"
+fallback_unit_file="$config_root/systemd/user/omarchy-navidrome-spotifyd.service"
+config_dir="$config_root/omarchy-navidrome"
 cache_dir="$cache_root/spotifyd"
-build_cache_dir="$cache_root/omarchy-spotify"
-state_dir="$state_root/omarchy-spotify"
-session_runtime_dir="$session_runtime_root/omarchy-spotify"
-runtime_dir=${OMARCHY_SPOTIFY_RUNTIME_DIR:-"$HOME/.local/lib/omarchy-spotify"}
-backend_binary="$runtime_dir/omarchy-spotify-backend"
+build_cache_dir="$cache_root/omarchy-navidrome"
+state_dir="$state_root/omarchy-navidrome"
+session_runtime_dir="$session_runtime_root/omarchy-navidrome"
+runtime_dir=${OMARCHY_SPOTIFY_RUNTIME_DIR:-"$HOME/.local/lib/omarchy-navidrome"}
+backend_binary="$runtime_dir/omarchy-navidrome-backend"
 backend_source_id_file="$runtime_dir/backend-source.sha256"
 backend_binary_hash_file="$runtime_dir/backend-binary.sha256"
 backend_origin_file="$runtime_dir/backend-origin"
@@ -43,22 +43,22 @@ require_safe_path "state root" "$state_root"
 require_safe_path "session runtime root" "$session_runtime_root"
 require_safe_path "backend runtime" "$runtime_dir"
 runtime_dir_is_dedicated=0
-if [[ ${runtime_dir##*/} == omarchy-spotify ]]; then
+if [[ ${runtime_dir##*/} == omarchy-navidrome ]]; then
   runtime_dir_is_dedicated=1
 fi
 
-for unit_name in omarchy-spotify.service omarchy-spotifyd.service; do
+for unit_name in omarchy-navidrome.service omarchy-navidrome-spotifyd.service; do
   systemctl --user disable --now "$unit_name" >/dev/null 2>&1 || true
 done
 rm -f -- "$backend_unit_file" "$fallback_unit_file" "$backend_binary" \
   "$backend_source_id_file" "$backend_binary_hash_file" "$backend_origin_file"
 systemctl --user daemon-reload
-systemctl --user reset-failed omarchy-spotify.service omarchy-spotifyd.service \
+systemctl --user reset-failed omarchy-navidrome.service omarchy-navidrome-spotifyd.service \
   >/dev/null 2>&1 || true
 
 if [[ -d $config_dir ]]; then
   if (( purge )); then
-    [[ $config_dir == "$config_root/omarchy-spotify" ]] || exit 3
+    [[ $config_dir == "$config_root/omarchy-navidrome" ]] || exit 3
     rm -rf -- "$config_dir"
     echo "Removed spotifyd configuration."
   else
@@ -75,17 +75,17 @@ if (( purge )); then
     echo "Removed spotifyd cached credentials and audio."
   fi
   if [[ -d $build_cache_dir ]]; then
-    [[ $build_cache_dir == "$cache_root/omarchy-spotify" ]] || exit 3
+    [[ $build_cache_dir == "$cache_root/omarchy-navidrome" ]] || exit 3
     rm -rf -- "$build_cache_dir"
     echo "Removed backend build cache."
   fi
   if [[ -d $state_dir ]]; then
-    [[ $state_dir == "$state_root/omarchy-spotify" ]] || exit 3
+    [[ $state_dir == "$state_root/omarchy-navidrome" ]] || exit 3
     rm -rf -- "$state_dir"
     echo "Removed durable playback authorization and session state."
   fi
   if [[ -d $session_runtime_dir ]]; then
-    [[ $session_runtime_dir == "$session_runtime_root/omarchy-spotify" ]] || exit 3
+    [[ $session_runtime_dir == "$session_runtime_root/omarchy-navidrome" ]] || exit 3
     rm -rf -- "$session_runtime_dir"
     echo "Removed playback sockets and temporary receiver state."
   fi
@@ -99,7 +99,7 @@ if (( purge )); then
       echo "Kept unknown files in custom backend directory: $runtime_dir" >&2
     fi
   fi
-  for backup in "$config_root"/omarchy-spotify.bak.*; do
+  for backup in "$config_root"/omarchy-navidrome.bak.*; do
     [[ -e $backup ]] || continue
     rm -rf -- "$backup"
     echo "Removed old configuration backup: $backup"
@@ -108,7 +108,7 @@ if (( purge )); then
     for _ in {1..100}; do
       secret-tool clear service quickshell-spotify kind refresh-token >/dev/null 2>&1 || break
     done
-    echo "Cleared matching Omarchy Spotify keyring entries."
+    echo "Cleared matching Omarchy Navidrome keyring entries."
   fi
 else
   rmdir -- "$runtime_dir" 2>/dev/null || true

@@ -1,5 +1,5 @@
 [package]
-name = "omarchy-spotify-backend"
+name = "omarchy-navidrome-backend"
 version = "1.0.4"
 edition = "2024"
 rust-version = "1.87"

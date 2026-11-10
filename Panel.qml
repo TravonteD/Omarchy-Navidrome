@@ -58,7 +58,7 @@ Item {
   readonly property bool artworkVisible: !service || service.artworkEnabled
 
   property string draftClientId: ""
-  property string draftDeviceName: "Omarchy Spotify"
+  property string draftDeviceName: "Omarchy Navidrome"
   property string draftIdleMinutes: "15"
   property bool draftShowMiniPlayer: true
   property bool draftShowArtwork: true
@@ -95,7 +95,7 @@ Item {
   property string createPlaylistName: ""
 
   readonly property string pluginId: manifest && manifest.id
-    ? String(manifest.id) : "quickshell.spotify"
+    ? String(manifest.id) : "quickshell.navidrome"
   readonly property string lyricsRequestKey: "spotify-panel-lyrics"
   readonly property color foreground: Color.foreground
   readonly property color background: Color.background
@@ -217,7 +217,7 @@ Item {
   function saveSettings(showStatus) {
     if (!service) return
     var values = {
-      deviceName: String(draftDeviceName || "").trim() || "Omarchy Spotify",
+      deviceName: String(draftDeviceName || "").trim() || "Omarchy Navidrome",
       idleShutdownMinutes: Math.max(0, Math.min(1440,
         Math.floor(Number(draftIdleMinutes) || 0))),
       showMiniPlayer: draftShowMiniPlayer ? "On" : "Off",
@@ -317,7 +317,7 @@ Item {
   }
 
   function connectionErrorText() {
-    if (!service) return "Omarchy Spotify is unavailable"
+    if (!service) return "Omarchy Navidrome is unavailable"
     return service.lastError || service.auth.lastError || service.daemon.lastError
   }
 
@@ -3043,7 +3043,7 @@ Item {
   FloatingWindow {
     id: window
     visible: root.opened
-    title: "Omarchy Spotify"
+    title: "Omarchy Navidrome"
     color: root.background
     implicitWidth: 980
     implicitHeight: 720
@@ -6113,7 +6113,7 @@ Item {
             Text {
               width: parent.width
               horizontalAlignment: Text.AlignHCenter
-              text: "Omarchy Spotify"
+              text: "Omarchy Navidrome"
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.title
@@ -6300,7 +6300,7 @@ Item {
           Text {
             width: parent.width
             horizontalAlignment: Text.AlignHCenter
-            text: "Your password is entered only on Spotify's own page. Omarchy Spotify never sees it."
+            text: "Your password is entered only on Spotify's own page. Omarchy Navidrome never sees it."
             color: root.muted
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -6529,7 +6529,7 @@ Item {
                 TextField {
                   width: parent.width
                   foreground: root.foreground
-                  placeholderText: "Omarchy Spotify"
+                  placeholderText: "Omarchy Navidrome"
                   text: root.draftDeviceName
                   onTextEdited: root.draftDeviceName = text
                   onEditingFinished: root.persistDraftSettings()

@@ -28,7 +28,7 @@ Item {
 
   readonly property string socketPath: {
     var runtime = Quickshell.env("XDG_RUNTIME_DIR")
-    return String(runtime || "/tmp") + "/omarchy-spotify/backend.sock"
+    return String(runtime || "/tmp") + "/omarchy-navidrome/backend.sock"
   }
   readonly property bool ready: connected
     && (lifecycle === "ready" || lifecycle === "")

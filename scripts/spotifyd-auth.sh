@@ -6,13 +6,13 @@ set -eu
 umask 077
 
 config_root=${XDG_CONFIG_HOME:-"$HOME/.config"}
-backend="$HOME/.local/lib/omarchy-spotify/omarchy-spotify-backend"
+backend="$HOME/.local/lib/omarchy-navidrome/omarchy-navidrome-backend"
 if [ -x "$backend" ]; then
   exec "$backend" authenticate \
-    --config-path "$config_root/omarchy-spotify/spotifyd.conf" \
+    --config-path "$config_root/omarchy-navidrome/spotifyd.conf" \
     --oauth-port 8000
 fi
 
 exec /usr/bin/spotifyd authenticate \
-  --config-path "$config_root/omarchy-spotify/spotifyd.conf" \
+  --config-path "$config_root/omarchy-navidrome/spotifyd.conf" \
   --oauth-port 8000

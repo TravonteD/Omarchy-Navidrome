@@ -52,7 +52,7 @@ omarchy plugin validate "$source_root"
 "$source_root/scripts/setup.sh" "${setup_args[@]}"
 
 plugins_root="${XDG_CONFIG_HOME:-"$HOME/.config"}/omarchy/plugins"
-target="$plugins_root/quickshell.spotify"
+target="$plugins_root/quickshell.navidrome"
 install -d -m 700 -- "$plugins_root"
 
 if [[ -L $target && $(readlink -f -- "$target") == "$source_root" ]]; then
@@ -68,17 +68,17 @@ fi
 omarchy-shell shell rescanPlugins >/dev/null
 discovered=0
 for (( attempt = 0; attempt < 40; attempt++ )); do
-  if omarchy plugin list --json | jq -e 'any(.[]; .id == "quickshell.spotify")' >/dev/null; then
+  if omarchy plugin list --json | jq -e 'any(.[]; .id == "quickshell.navidrome")' >/dev/null; then
     discovered=1
     break
   fi
   sleep 0.05
 done
 (( discovered )) || {
-  echo "install-local.sh: Omarchy did not discover quickshell.spotify" >&2
+  echo "install-local.sh: Omarchy did not discover quickshell.navidrome" >&2
   exit 1
 }
 
-omarchy plugin enable quickshell.spotify --section "$section"
+omarchy plugin enable quickshell.navidrome --section "$section"
 echo "Installed. Click the Spotify bar widget; if you are logged out,"
 echo "the client opens directly on its guided Spotify login screen."
