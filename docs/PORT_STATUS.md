@@ -49,6 +49,37 @@ fix pass.
   token auth rejected, 50 not authorized, 70 not found, plus generic
   fallbacks). 13 new tests; suite at 201 passing.
 
+Continued on 10 November 2026:
+
+- `Subsonic.js` grew the verb/normalizer layer: defensive shared parsing
+  (bounded numbers, strict booleans, string-coerced IDs, id-less entry
+  dropping), normalized song/album/artist/playlist shapes, probe helpers
+  (`parseLicense`, `parseUser`, `describeProbeError` over the existing typed
+  categories), `search3` per-category windows, `albumList2` window params with
+  legacy list fallback, artist/album/top-songs/genres parsers, playlist CRUD
+  param builders (repeated keys for `updatePlaylist`), star/unstar/rating with
+  clamping, scrobble params, and `coverArtUrl` over `requestUrl`. 22 new test
+  functions with invented Navidrome-shaped fixtures.
+- `SubsonicApi.qml` landed: the QML transport replacing `SpotifyApi.qml`'s
+  role — job queue with bounded in-flight and mutating-verb serialization,
+  timeout sweep, abort handles, `cancelAll`, redacted diagnostics ring buffer
+  (endpoint names only, never query strings or `u`/`t`/`s` values), fresh salt
+  per request through `Subsonic.requestUrl`, typed error surfacing from
+  `parseResponse`, the mutating-verb uncertainty contract (any unconfirmed
+  write reports `uncertain`; local fail-fast failures do not), serial-guarded
+  `search3` cancellation, the sequential `probe` (ping → `getUser` →
+  `getLicense`, short-circuits on typed failures, cancellable), and local
+  fail-fast categories `invalidServerUrl`/`missingCredentials`. OAuth, token
+  refresh, and the 429 cooldown machinery are deliberately not ported.
+- New `tests/tst_subsonic_api.qml` covers salt freshness, typed failures,
+  stale-search and page races, single-shot timeout expiry with slot release,
+  uncertain writes, probe ordering/short-circuit/restart, diagnostics
+  redaction across the whole battery, `cancelAll`, and local fail-fast. 14
+  new test cases; suite at 238 passing. `SubsonicApi.qml` added to the
+  `qmllint` gate.
+- `SpotifyApi.qml` and its consumers remain untouched by design: the removal
+  pass waits for package 5's UI rewiring.
+
 ## Remaining in package 0
 
 - second rename pass done for: uppercase env names (`OMARCHY_NAVIDROME_*`),
@@ -66,7 +97,9 @@ fix pass.
 
 ## Next packages
 
-1. Navidrome API layer (`Api.js`/`SpotifyApi.qml` rewrite on Subsonic JSON).
+1. Navidrome API layer (`Api.js`/`SpotifyApi.qml` rewrite on Subsonic JSON) —
+   transport and verbs landed; the remaining piece is rewiring
+   `SearchController`/consumers onto it, which lands with package 5's UI pass.
 2. Setup, credentials, connectivity (URL/user/password, keyring).
 3. Stream engine (Rust `/rest/stream` player with symphonia + rodio).
 4. Queue, scrobble, resume persistence.
