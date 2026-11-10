@@ -9,7 +9,7 @@ use tokio::{
 
 use crate::{
     engine::{EngineSender, send_with_reply},
-    protocol::{PROTOCOL_VERSION, ProtocolError, Request, ServerMessage},
+    protocol::{ENGINE_NAME, PROTOCOL_VERSION, ProtocolError, Request, ServerMessage},
     state::StateStore,
 };
 
@@ -142,7 +142,7 @@ async fn handle_line<'a>(
         crate::protocol::Command::Hello => Ok(serde_json::json!({
             "protocol_version": PROTOCOL_VERSION,
             "backend_version": env!("CARGO_PKG_VERSION"),
-            "engine": "librespot"
+            "engine": ENGINE_NAME
         })),
         crate::protocol::Command::Ping => Ok(serde_json::json!({ "pong": true })),
         crate::protocol::Command::GetState => state

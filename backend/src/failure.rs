@@ -9,7 +9,16 @@ use std::{
 #[derive(Debug, Clone, Copy)]
 pub enum Failure {
     InvalidConfiguration,
+    /// Kept for the systemd exit-code contract (77 → RestartPrevent);
+    /// credential handling moved to runtime `missing_credentials` protocol
+    /// errors in the Subsonic engine, so this variant is currently only
+    /// produced by historical paths.
+    #[allow(dead_code)]
     MissingCredentials,
+    /// Kept for the systemd exit-code contract (75 → RestartPrevent); the
+    /// stream engine recovers from server loss in-process with bounded
+    /// retries, so this variant is currently never produced.
+    #[allow(dead_code)]
     ReconnectExhausted,
     Transient,
 }

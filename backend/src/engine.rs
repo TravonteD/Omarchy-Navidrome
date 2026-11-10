@@ -1,41 +1,39 @@
 use std::{
     collections::VecDeque,
-    path::Path,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc as std_mpsc,
+    },
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
-use librespot_connect::{ConnectConfig, LoadRequest, LoadRequestOptions, PlayingTrack, Spirc};
-use librespot_core::{
-    SpotifyUri,
-    authentication::Credentials,
-    cache::Cache,
-    config::{DeviceType, SessionConfig},
-    session::Session,
-};
-use librespot_metadata::audio::{AudioItem, UniqueFields};
-use librespot_playback::{
-    audio_backend,
-    config::{AudioFormat, PlayerConfig},
-    mixer::{self, MixerConfig},
-    player::{Player, PlayerEvent},
-};
-use sha1::{Digest, Sha1};
-use tokio::sync::{mpsc, oneshot, watch};
+use anyhow::{Context, Result, anyhow};
+use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     config::BackendConfig,
-    protocol::{Command, Lifecycle, PlaybackStatus, ProtocolError, RepeatMode, Track},
+    failure::Failure,
+    protocol::{
+        BackendState, Command, ENGINE_NAME, PlaybackStatus, ProtocolError, RepeatMode, SongRef,
+        Track,
+    },
     state::StateStore,
+    stream::{
+        self, AuthPair, DecodeOutcome, DownloadOutcome, PcmChunk, RandomSalt, SaltSource,
+        WorkerEvent, WorkerHandle,
+    },
 };
 
 const INITIAL_VOLUME: u16 = ((u16::MAX as u32 * 90) / 100) as u16;
 const ENGINE_QUEUE_CAPACITY: usize = 64;
-const RECONNECT_LIMIT: usize = 5;
-const RECONNECT_WINDOW: Duration = Duration::from_secs(10 * 60);
-const AUDIO_KEY_UNAVAILABLE_CODE: &str = "audio_key_unavailable";
-const AUDIO_KEY_UNAVAILABLE_MESSAGE: &str = "Spotify did not provide the audio key required to play this track on this computer. Try another Spotify Connect device.";
+/// Pipeline poll cadence while a track is loading or playing.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// Idle poll cadence when nothing is loaded.
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// MPRIS contract: one position update per second.
+const POSITION_TICK_MS: u64 = 1000;
 
 pub struct EngineRequest {
     pub command: Command,
@@ -46,7 +44,7 @@ pub type EngineSender = mpsc::Sender<EngineRequest>;
 
 pub struct EngineRuntime {
     pub commands: EngineSender,
-    shutdown: watch::Sender<bool>,
+    shutdown: Arc<AtomicBool>,
     done: oneshot::Receiver<Result<()>>,
 }
 
@@ -54,105 +52,124 @@ impl EngineRuntime {
     pub async fn wait_done(&mut self) -> Result<()> {
         (&mut self.done)
             .await
-            .context("playback engine supervisor stopped")?
+            .context("stream engine supervisor stopped")?
     }
 
     pub fn shutdown(&self) {
-        let _ = self.shutdown.send(true);
+        self.shutdown.store(true, Ordering::SeqCst);
     }
 }
 
+/// Events produced by the playback pipeline thread and applied into the
+/// shared state by an async task (diff-only, mirroring the previous
+/// librespot event application and its tests).
+#[derive(Clone, Debug)]
+pub enum PlaybackEvent {
+    /// A track became current. `begin` publishes the loading state (an
+    /// audible stop happens before the next sample); gapless hand-offs keep
+    /// the already-playing status continuous.
+    TrackStarted {
+        track: Track,
+        position_ms: u32,
+        begin: bool,
+    },
+    /// The first audible sample of the segment is playing.
+    PlaybackStarted {
+        position_ms: u32,
+    },
+    Paused {
+        position_ms: u32,
+    },
+    Stopped,
+    PositionTick {
+        position_ms: u32,
+    },
+    /// An accepted seek: exactly one per seek so MPRIS emits one `Seeked`.
+    Seeked {
+        position_ms: u32,
+    },
+    VolumeChanged {
+        volume: u16,
+    },
+    ShuffleChanged {
+        enabled: bool,
+    },
+    RepeatChanged {
+        mode: RepeatMode,
+    },
+    /// ConfigureServer applied in engine memory. Only the username crosses
+    /// this boundary; the password never leaves the pipeline.
+    ServerConfigured {
+        username: String,
+    },
+    /// Typed playback error (machine-readable code, credential-free text).
+    Error {
+        code: String,
+        message: String,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Startup
+// ---------------------------------------------------------------------------
+
 pub async fn start(config: BackendConfig, state: StateStore) -> Result<EngineRuntime> {
-    let runtime_cache = open_runtime_cache(&config)?;
-    let credentials = load_credentials(&config.credentials_root, &config.cache_root)?;
-
-    let mut session_config = SessionConfig {
-        device_id: hex::encode(Sha1::digest(config.device_name.as_bytes())),
-        ap_port: Some(443),
-        autoplay: Some(config.autoplay),
-        ..SessionConfig::default()
-    };
-    session_config.tmp_dir = std::env::temp_dir();
-
-    let mut player_config = PlayerConfig {
-        bitrate: config.bitrate,
-        position_update_interval: Some(Duration::from_secs(1)),
-        ..PlayerConfig::default()
-    };
-    player_config.gapless = true;
-
-    let sink_builder = audio_backend::find(Some("pulseaudio".to_string()))
-        .ok_or_else(|| anyhow!("pulseaudio backend was not compiled in"))?;
-    let mixer_builder = mixer::find(Some("softvol"))
-        .ok_or_else(|| anyhow!("soft volume mixer was not compiled in"))?;
-    let mixer = mixer_builder(MixerConfig::default()).context("failed to create soft mixer")?;
-    let session = Session::new(session_config.clone(), Some(runtime_cache.clone()));
-    let audio_device = config.audio_device.clone();
-    let player = Player::new(
-        player_config,
-        session.clone(),
-        mixer.get_soft_volume(),
-        move || sink_builder(audio_device.clone(), AudioFormat::S16),
+    let output = open_output(config.audio_device.as_deref()).map_err(|error| {
+        log::error!("{error:#}");
+        if config.audio_device.is_some() {
+            Failure::InvalidConfiguration
+        } else {
+            Failure::Transient
+        }
+    })?;
+    log::info!(
+        "audio output opened: {} Hz, {} channels",
+        output.rate,
+        output.channels
     );
-    let events = player.get_player_event_channel();
-
-    let connect_config = ConnectConfig {
-        name: config.device_name,
-        device_type: DeviceType::Computer,
-        initial_volume: INITIAL_VOLUME,
-        disable_volume: false,
-        volume_steps: 64,
-        ..ConnectConfig::default()
-    };
-    let (spirc, spirc_task) = Spirc::new(
-        connect_config.clone(),
-        session.clone(),
-        credentials.clone(),
-        Arc::clone(&player),
-        Arc::clone(&mixer),
-    )
-    .await
-    .context("failed to connect the librespot session")?;
-    let spirc = Arc::new(spirc);
 
     state.update(|current| {
-        current.lifecycle = Lifecycle::Ready;
+        current.lifecycle = crate::protocol::Lifecycle::Ready;
+        current.engine = ENGINE_NAME.to_string();
         current.volume = INITIAL_VOLUME;
         current.error_code.clear();
         current.error.clear();
         true
     });
 
-    let (commands, command_rx) = mpsc::channel(ENGINE_QUEUE_CAPACITY);
-    let (current_spirc_tx, current_spirc_rx) = watch::channel(Some(Arc::clone(&spirc)));
-    tokio::spawn(run_commands(
-        command_rx,
-        current_spirc_rx,
-        Arc::clone(&player),
-    ));
-    tokio::spawn(run_events(events, state.clone()));
+    let (commands, command_rx) = mpsc::channel::<EngineRequest>(ENGINE_QUEUE_CAPACITY);
+    let (control_tx, control_rx) = std_mpsc::channel::<ControlMessage>();
+    let (events, event_rx) = tokio::sync::mpsc::unbounded_channel::<PlaybackEvent>();
+    let (worker_tx, worker_rx) = std_mpsc::channel::<WorkerEvent>();
+    let shutdown = Arc::new(AtomicBool::new(false));
 
-    let (shutdown, shutdown_rx) = watch::channel(false);
+    tokio::spawn(run_commands(command_rx, control_tx.clone()));
+    tokio::spawn(run_events(event_rx, state.clone()));
+
+    let pipeline = Pipeline::new(
+        config.format,
+        config.max_bit_rate,
+        INITIAL_VOLUME,
+        output,
+        events.clone(),
+        worker_tx,
+    );
+
     let (done_tx, done) = oneshot::channel();
-    let spirc_task = tokio::spawn(spirc_task);
-    tokio::spawn(async move {
-        let result = supervise_sessions(
-            session_config,
-            runtime_cache,
-            connect_config,
-            credentials,
-            player,
-            mixer,
-            session,
-            spirc,
-            spirc_task,
-            current_spirc_tx,
-            state,
-            shutdown_rx,
-        )
-        .await;
-        let _ = done_tx.send(result);
-    });
+    let (pipeline_done_tx, pipeline_done_rx) = oneshot::channel();
+    let pipeline_shutdown = Arc::clone(&shutdown);
+    let pipeline_thread = std::thread::Builder::new()
+        .name("stream-pipeline".to_string())
+        .spawn(move || {
+            let result = pipeline.run(control_rx, worker_rx, pipeline_shutdown);
+            // The oneshot replaces thread::join(): joining from the async
+            // supervisor would block the single-threaded runtime forever.
+            let _ = pipeline_done_tx.send(result);
+        })
+        .map_err(|error| anyhow!("failed to spawn the stream pipeline thread: {error}"))?;
+    let _ = pipeline_thread;
+
+    tokio::spawn(supervise(pipeline_done_rx, done_tx));
 
     Ok(EngineRuntime {
         commands,
@@ -161,494 +178,68 @@ pub async fn start(config: BackendConfig, state: StateStore) -> Result<EngineRun
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn supervise_sessions(
-    session_config: SessionConfig,
-    runtime_cache: Cache,
-    connect_config: ConnectConfig,
-    credentials: Credentials,
-    player: Arc<Player>,
-    mixer: Arc<dyn mixer::Mixer>,
-    mut session: Session,
-    mut spirc: Arc<Spirc>,
-    mut spirc_task: tokio::task::JoinHandle<()>,
-    current_spirc: watch::Sender<Option<Arc<Spirc>>>,
-    state: StateStore,
-    mut shutdown: watch::Receiver<bool>,
-) -> Result<()> {
-    let mut reconnects = VecDeque::new();
-
-    loop {
-        tokio::select! {
-            result = &mut spirc_task => {
-                result.context("librespot session task failed")?;
-            }
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    let _ = spirc.shutdown();
-                    return Ok(());
-                }
-                continue;
-            }
-        }
-
-        current_spirc.send_replace(None);
-        state.update(|current| {
-            current.lifecycle = Lifecycle::Starting;
-            current.session_connected = false;
-            current.active_client.clear();
-            true
-        });
-
-        let now = Instant::now();
-        if !record_reconnect(&mut reconnects, now) {
-            return Err(crate::failure::Failure::ReconnectExhausted.into());
-        }
-        log::warn!("librespot session ended; reconnecting");
-
-        if !session.is_invalid() {
-            session.shutdown();
-        }
-        session = Session::new(session_config.clone(), Some(runtime_cache.clone()));
-        player.set_session(session.clone());
-        let reconnect = Spirc::new(
-            connect_config.clone(),
-            session.clone(),
-            credentials.clone(),
-            Arc::clone(&player),
-            Arc::clone(&mixer),
-        );
-        tokio::pin!(reconnect);
-        let (next_spirc, next_task) = tokio::select! {
-            result = &mut reconnect => {
-                result.context("failed to reconnect the librespot session")?
-            }
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    return Ok(());
-                }
-                continue;
-            }
-        };
-
-        spirc = Arc::new(next_spirc);
-        spirc_task = tokio::spawn(next_task);
-        current_spirc.send_replace(Some(Arc::clone(&spirc)));
-        state.update(|current| {
-            current.lifecycle = Lifecycle::Ready;
-            current.error_code.clear();
-            current.error.clear();
-            true
-        });
-        log::info!("reconnected the librespot session");
-    }
+/// Watches the pipeline thread's completion. An unexpected end (including a
+/// panic, which drops the sender) is a typed process failure so the systemd
+/// contract and the socket failure record keep working.
+async fn supervise(
+    done: oneshot::Receiver<Result<(), Failure>>,
+    done_tx: oneshot::Sender<Result<()>>,
+) {
+    let result = match done.await {
+        Ok(result) => result.map_err(anyhow::Error::from),
+        Err(_) => Err(anyhow!("stream pipeline thread ended unexpectedly")),
+    };
+    let _ = done_tx.send(result);
 }
 
-fn record_reconnect(attempts: &mut VecDeque<Instant>, now: Instant) -> bool {
-    while attempts
-        .front()
-        .is_some_and(|attempt| now.saturating_duration_since(*attempt) >= RECONNECT_WINDOW)
-    {
-        attempts.pop_front();
-    }
-    if attempts.len() >= RECONNECT_LIMIT {
-        return false;
-    }
-    attempts.push_back(now);
-    true
-}
-
-fn open_runtime_cache(config: &BackendConfig) -> Result<Cache> {
-    let credentials = config.credentials_root.join("zeroconf");
-    let audio_path = config.audio_cache.then_some(config.cache_root.as_path());
-    Cache::new(
-        Some(credentials.as_path()),
-        Some(config.cache_root.as_path()),
-        audio_path,
-        config.max_cache_size,
-    )
-    .context("failed to open the playback cache")
-}
-
-fn load_credentials(credentials_root: &Path, legacy_cache_root: &Path) -> Result<Credentials> {
-    let oauth_path = credentials_root.join("oauth");
-    let oauth_cache = Cache::new(Some(oauth_path.as_path()), None, None, None)
-        .context("failed to open the OAuth credential store")?;
-    if let Some(credentials) = oauth_cache.credentials() {
-        return Ok(credentials);
-    }
-
-    let connect_path = credentials_root.join("zeroconf");
-    let connect_cache = Cache::new(Some(connect_path.as_path()), None, None, None)
-        .context("failed to open the Connect credential store")?;
-    if let Some(credentials) = connect_cache.credentials() {
-        return Ok(credentials);
-    }
-
-    // Releases before 1.0.3 kept authorization below XDG_CACHE_HOME. Accept it
-    // once and copy it into durable XDG state so ordinary cache cleanup cannot
-    // silently remove this computer from Spotify Connect again.
-    for (name, durable_cache) in [("oauth", &oauth_cache), ("zeroconf", &connect_cache)] {
-        let legacy_path = legacy_cache_root.join(name);
-        let legacy_cache = Cache::new(Some(legacy_path.as_path()), None, None, None)
-            .context("failed to open the legacy playback credential cache")?;
-        if let Some(credentials) = legacy_cache.credentials() {
-            durable_cache.save_credentials(&credentials);
-            return Ok(credentials);
-        }
-    }
-
-    Err(crate::failure::Failure::MissingCredentials.into())
-}
+// ---------------------------------------------------------------------------
+// Async command forwarding (FIFO into the pipeline)
+// ---------------------------------------------------------------------------
 
 async fn run_commands(
     mut receiver: mpsc::Receiver<EngineRequest>,
-    current_spirc: watch::Receiver<Option<Arc<Spirc>>>,
-    player: Arc<Player>,
+    control: std_mpsc::Sender<ControlMessage>,
 ) {
     while let Some(request) = receiver.recv().await {
-        let result = match current_spirc.borrow().clone() {
-            Some(spirc) => execute(&spirc, &player, request.command)
-                .map(|()| serde_json::json!({}))
-                .map_err(|error| ProtocolError::new("engine_error", error.to_string())),
-            None => Err(ProtocolError::new(
-                "engine_reconnecting",
-                "playback is reconnecting to Spotify",
-            )),
-        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let delivered = control
+            .send(ControlMessage {
+                command: request.command,
+                reply: reply_tx,
+            })
+            .is_ok();
+        if !delivered {
+            if let Some(reply) = request.reply {
+                let _ = reply.send(Err(ProtocolError::new(
+                    "engine_unavailable",
+                    "playback engine is unavailable",
+                )));
+            }
+            continue;
+        }
         if let Some(reply) = request.reply {
+            let result = match reply_rx.await {
+                Ok(result) => result,
+                Err(_) => Err(ProtocolError::new(
+                    "engine_unavailable",
+                    "playback engine stopped before replying",
+                )),
+            };
             let _ = reply.send(result);
         }
     }
 }
 
-fn execute(spirc: &Spirc, player: &Player, command: Command) -> Result<()> {
-    dispatch_local_command(command, |command| {
-        execute_spirc_command(spirc, player, command)
-    })
-}
-
-fn dispatch_local_command(
-    command: Command,
-    mut send: impl FnMut(Command) -> Result<()>,
-) -> Result<()> {
-    // Socket and MPRIS controls share this FIFO. Enqueue ownership and the
-    // transport action together, so a delayed activation cannot overtake Pause.
-    if matches!(
-        &command,
-        Command::Play | Command::Toggle | Command::Next | Command::Previous
-    ) {
-        send(Command::Activate)?;
-    }
-    send(command)
-}
-
-fn execute_spirc_command(spirc: &Spirc, player: &Player, command: Command) -> Result<()> {
-    match command {
-        Command::Activate => spirc.activate()?,
-        Command::Play => spirc.play()?,
-        Command::Pause => spirc.pause()?,
-        Command::Toggle => spirc.play_pause()?,
-        Command::Stop => spirc.disconnect(false)?,
-        Command::Next => spirc.next()?,
-        Command::Previous => spirc.prev()?,
-        Command::Seek { position_ms } => spirc.set_position_ms(position_ms)?,
-        Command::SetVolume { volume } => spirc.set_volume(volume)?,
-        Command::SetShuffle { enabled } => spirc.shuffle(enabled)?,
-        Command::SetRepeat { mode } => set_repeat(spirc, mode)?,
-        Command::Load {
-            context_uri,
-            uris,
-            offset_uri,
-            offset_index,
-            position_ms,
-            play,
-        } => {
-            let playing_track = offset_uri
-                .map(PlayingTrack::Uri)
-                .or_else(|| offset_index.map(PlayingTrack::Index));
-            let options = LoadRequestOptions {
-                start_playing: play,
-                seek_to: position_ms,
-                playing_track,
-                ..LoadRequestOptions::default()
-            };
-            let request = if let Some(context_uri) = context_uri {
-                validate_spotify_uri(&context_uri)?;
-                LoadRequest::from_context_uri(context_uri, options)
-            } else if !uris.is_empty() {
-                for uri in &uris {
-                    validate_spotify_uri(uri)?;
-                }
-                LoadRequest::from_tracks(uris, options)
-            } else {
-                bail!("load requires context_uri or at least one uri");
-            };
-            // A local UI request is an explicit choice of this receiver. Acquire
-            // Connect ownership before queueing the context so callers do not
-            // need to wait for a Web API device transfer first.
-            spirc.activate()?;
-            spirc.load(request)?;
-        }
-        Command::AddToQueue { uri } => {
-            let uri = SpotifyUri::from_uri(&uri).context("invalid Spotify URI")?;
-            spirc.add_to_queue(uri)?;
-        }
-        Command::Hello | Command::Ping | Command::GetState => {
-            bail!("command is handled by the protocol server")
-        }
-    }
-
-    // Keep the player handle alive for the lifetime of the command task.
-    let _ = player;
-    Ok(())
-}
-
-fn validate_spotify_uri(value: &str) -> Result<()> {
-    SpotifyUri::from_uri(value)
-        .map(|_| ())
-        .with_context(|| format!("invalid Spotify URI {value:?}"))
-}
-
-fn set_repeat(spirc: &Spirc, mode: RepeatMode) -> Result<()> {
-    match mode {
-        RepeatMode::Off => {
-            spirc.repeat_track(false)?;
-            spirc.repeat(false)?;
-        }
-        RepeatMode::Context => {
-            spirc.repeat_track(false)?;
-            spirc.repeat(true)?;
-        }
-        RepeatMode::Track => {
-            spirc.repeat(false)?;
-            spirc.repeat_track(true)?;
-        }
-    }
-    Ok(())
-}
-
 async fn run_events(
-    mut events: tokio::sync::mpsc::UnboundedReceiver<PlayerEvent>,
+    mut events: tokio::sync::mpsc::UnboundedReceiver<PlaybackEvent>,
     state: StateStore,
 ) {
-    let mut play_request_id = None;
     while let Some(event) = events.recv().await {
-        if let PlayerEvent::PlayRequestIdChanged {
-            play_request_id: next,
-        } = &event
-        {
-            play_request_id = Some(*next);
-            continue;
-        }
-        if event_is_stale(play_request_id, &event) {
-            log::debug!("discarding stale player event for an earlier play request");
-            continue;
-        }
-        state.update(|current| apply_event(current, event));
+        state.update(|current| apply_event(current, &event));
     }
 }
 
-fn event_is_stale(play_request_id: Option<u64>, event: &PlayerEvent) -> bool {
-    play_request_id
-        .zip(event.get_play_request_id())
-        .is_some_and(|(current, event)| current != event)
-}
-
-fn replace_if_changed<T: PartialEq>(target: &mut T, value: T) -> bool {
-    if *target == value {
-        false
-    } else {
-        *target = value;
-        true
-    }
-}
-
-fn replace_error(
-    state: &mut crate::protocol::BackendState,
-    code: &str,
-    message: impl Into<String>,
-) -> bool {
-    let mut changed = replace_if_changed(&mut state.error_code, code.to_string());
-    changed |= replace_if_changed(&mut state.error, message.into());
-    changed
-}
-
-fn apply_event(state: &mut crate::protocol::BackendState, event: PlayerEvent) -> bool {
-    match event {
-        PlayerEvent::Stopped { .. } => {
-            let mut changed = replace_if_changed(&mut state.playback, PlaybackStatus::Stopped);
-            changed |= replace_if_changed(&mut state.position_ms, 0);
-            changed |= replace_if_changed(&mut state.track, None);
-            changed
-        }
-        PlayerEvent::Loading { position_ms, .. } => {
-            // Keep an already-playing replacement continuous to MPRIS clients.
-            // Initial loads still expose Loading until audio actually starts.
-            let playback_changed = state.playback == PlaybackStatus::Stopped
-                && replace_if_changed(&mut state.playback, PlaybackStatus::Loading);
-            let mut changed =
-                replace_if_changed(&mut state.position_ms, position_ms) || playback_changed;
-            changed |= replace_error(state, "", "");
-            changed
-        }
-        PlayerEvent::Playing { position_ms, .. } => {
-            let playback_changed = replace_if_changed(&mut state.playback, PlaybackStatus::Playing);
-            replace_if_changed(&mut state.position_ms, position_ms) || playback_changed
-        }
-        PlayerEvent::Paused { position_ms, .. } => {
-            let playback_changed = replace_if_changed(&mut state.playback, PlaybackStatus::Paused);
-            replace_if_changed(&mut state.position_ms, position_ms) || playback_changed
-        }
-        PlayerEvent::Unavailable { track_id, .. } => replace_error(
-            state,
-            "",
-            format!("track unavailable: {}", track_id.to_uri()),
-        ),
-        PlayerEvent::AudioKeyUnavailable { .. } => replace_error(
-            state,
-            AUDIO_KEY_UNAVAILABLE_CODE,
-            AUDIO_KEY_UNAVAILABLE_MESSAGE,
-        ),
-        PlayerEvent::VolumeChanged { volume } => replace_if_changed(&mut state.volume, volume),
-        PlayerEvent::PositionCorrection { position_ms, .. }
-        | PlayerEvent::PositionChanged { position_ms, .. } => {
-            replace_if_changed(&mut state.position_ms, position_ms)
-        }
-        PlayerEvent::Seeked { position_ms, .. } => {
-            replace_if_changed(&mut state.position_ms, position_ms);
-            state.seek_sequence = state.seek_sequence.wrapping_add(1);
-            true
-        }
-        PlayerEvent::TrackChanged { audio_item } => {
-            let mut changed =
-                replace_if_changed(&mut state.track, Some(track_from_audio_item(&audio_item)));
-            changed |= replace_error(state, "", "");
-            changed
-        }
-        PlayerEvent::SessionConnected { user_name, .. } => {
-            let connected = replace_if_changed(&mut state.session_connected, true);
-            replace_if_changed(&mut state.username, user_name) || connected
-        }
-        PlayerEvent::SessionDisconnected { .. } => {
-            let disconnected = replace_if_changed(&mut state.session_connected, false);
-            replace_if_changed(&mut state.active_client, String::new()) || disconnected
-        }
-        PlayerEvent::SessionClientChanged { client_name, .. } => {
-            replace_if_changed(&mut state.active_client, client_name)
-        }
-        PlayerEvent::ShuffleChanged { shuffle } => replace_if_changed(&mut state.shuffle, shuffle),
-        PlayerEvent::RepeatChanged { context, track } => {
-            let repeat = if track {
-                RepeatMode::Track
-            } else if context {
-                RepeatMode::Context
-            } else {
-                RepeatMode::Off
-            };
-            replace_if_changed(&mut state.repeat, repeat)
-        }
-        PlayerEvent::Preloading { .. }
-        | PlayerEvent::TimeToPreloadNextTrack { .. }
-        | PlayerEvent::EndOfTrack { .. }
-        | PlayerEvent::PlayRequestIdChanged { .. }
-        | PlayerEvent::AutoPlayChanged { .. }
-        | PlayerEvent::FilterExplicitContentChanged { .. }
-        | PlayerEvent::SetQueue { .. } => false,
-    }
-}
-
-fn track_from_audio_item(item: &AudioItem) -> Track {
-    let (artists, album, item_type) = match &item.unique_fields {
-        UniqueFields::Track { artists, album, .. } => (
-            artists.iter().map(|artist| artist.name.clone()).collect(),
-            album.clone(),
-            "track",
-        ),
-        UniqueFields::Episode { show_name, .. } => {
-            (vec![show_name.clone()], show_name.clone(), "episode")
-        }
-        UniqueFields::Local { artists, album, .. } => (
-            artists.iter().cloned().collect(),
-            album.clone().unwrap_or_default(),
-            "local",
-        ),
-    };
-
-    Track {
-        uri: item.uri.clone(),
-        title: item.name.clone(),
-        artists,
-        album,
-        art_url: item
-            .covers
-            .first()
-            .map(|cover| cover.url.clone())
-            .unwrap_or_default(),
-        duration_ms: item.duration_ms,
-        item_type: item_type.to_string(),
-    }
-}
-
-pub async fn authenticate(config: &BackendConfig, oauth_port: u16) -> Result<()> {
-    const OAUTH_SCOPES: &[&str] = &[
-        "app-remote-control",
-        "playlist-modify",
-        "playlist-modify-private",
-        "playlist-modify-public",
-        "playlist-read",
-        "playlist-read-collaborative",
-        "playlist-read-private",
-        "streaming",
-        "ugc-image-upload",
-        "user-follow-modify",
-        "user-follow-read",
-        "user-library-modify",
-        "user-library-read",
-        "user-modify",
-        "user-modify-playback-state",
-        "user-modify-private",
-        "user-personalized",
-        "user-read-birthdate",
-        "user-read-currently-playing",
-        "user-read-email",
-        "user-read-play-history",
-        "user-read-playback-position",
-        "user-read-playback-state",
-        "user-read-private",
-        "user-read-recently-played",
-        "user-top-read",
-    ];
-
-    let oauth_path = config.credentials_root.join("oauth");
-    let cache = Cache::new(Some(oauth_path.as_path()), None, None, None)
-        .context("failed to open the OAuth credential store")?;
-    let session_config = SessionConfig::default();
-    let client = librespot_oauth::OAuthClientBuilder::new(
-        &session_config.client_id,
-        &format!("http://127.0.0.1:{oauth_port}/login"),
-        OAUTH_SCOPES.to_vec(),
-    )
-    .with_custom_message(
-        "<h3 style=\"color: darkgreen\">Authentication successful. You can return to Omarchy Navidrome.</h3>",
-    )
-    .open_in_browser()
-    .build()
-    .context("failed to create the Spotify OAuth client")?;
-
-    let token = client
-        .get_access_token_async()
-        .await
-        .context("Spotify authorization did not complete")?;
-    let session = Session::new(session_config, Some(cache));
-    session
-        .connect(Credentials::with_access_token(token.access_token), true)
-        .await
-        .context("failed to save the Spotify playback session")?;
-    println!("Playback authentication succeeded.");
-    Ok(())
-}
-
+/// Fire-and-forget send used by MPRIS; bounded by the engine command queue.
 pub fn send_without_reply(commands: &EngineSender, command: Command) -> Result<(), ProtocolError> {
     match commands.try_send(EngineRequest {
         command,
@@ -666,6 +257,7 @@ pub fn send_without_reply(commands: &EngineSender, command: Command) -> Result<(
     }
 }
 
+/// Reply-carrying send used by the socket protocol server.
 pub async fn send_with_reply(
     commands: &EngineSender,
     command: Command,
@@ -686,62 +278,1212 @@ pub async fn send_with_reply(
     })?
 }
 
+// ---------------------------------------------------------------------------
+// State event application (diff-only)
+// ---------------------------------------------------------------------------
+
+fn replace_if_changed<T: PartialEq>(target: &mut T, value: T) -> bool {
+    if *target == value {
+        false
+    } else {
+        *target = value;
+        true
+    }
+}
+
+fn replace_error(state: &mut BackendState, code: &str, message: impl Into<String>) -> bool {
+    let mut changed = replace_if_changed(&mut state.error_code, code.to_string());
+    changed |= replace_if_changed(&mut state.error, message.into());
+    changed
+}
+
+fn apply_event(state: &mut BackendState, event: &PlaybackEvent) -> bool {
+    match event {
+        PlaybackEvent::TrackStarted {
+            track,
+            position_ms,
+            begin,
+        } => {
+            let mut changed = replace_if_changed(&mut state.track, Some(track.clone()));
+            changed |= replace_if_changed(&mut state.position_ms, *position_ms);
+            if *begin {
+                // An audible stop precedes this track's first sample, so the
+                // loading state is published before any audio plays.
+                changed |= replace_if_changed(&mut state.playback, PlaybackStatus::Loading);
+            }
+            changed |= replace_error(state, "", "");
+            changed
+        }
+        PlaybackEvent::PlaybackStarted { position_ms } => {
+            let playback_changed = replace_if_changed(&mut state.playback, PlaybackStatus::Playing);
+            replace_if_changed(&mut state.position_ms, *position_ms) || playback_changed
+        }
+        PlaybackEvent::Paused { position_ms } => {
+            let playback_changed = replace_if_changed(&mut state.playback, PlaybackStatus::Paused);
+            replace_if_changed(&mut state.position_ms, *position_ms) || playback_changed
+        }
+        PlaybackEvent::Stopped => {
+            let mut changed = replace_if_changed(&mut state.playback, PlaybackStatus::Stopped);
+            changed |= replace_if_changed(&mut state.position_ms, 0);
+            changed |= replace_if_changed(&mut state.track, None);
+            changed
+        }
+        PlaybackEvent::PositionTick { position_ms } => {
+            replace_if_changed(&mut state.position_ms, *position_ms)
+        }
+        PlaybackEvent::Seeked { position_ms } => {
+            replace_if_changed(&mut state.position_ms, *position_ms);
+            state.seek_sequence = state.seek_sequence.wrapping_add(1);
+            true
+        }
+        PlaybackEvent::VolumeChanged { volume } => replace_if_changed(&mut state.volume, *volume),
+        PlaybackEvent::ShuffleChanged { enabled } => {
+            replace_if_changed(&mut state.shuffle, *enabled)
+        }
+        PlaybackEvent::RepeatChanged { mode } => replace_if_changed(&mut state.repeat, *mode),
+        PlaybackEvent::ServerConfigured { username } => {
+            let connected = replace_if_changed(&mut state.session_connected, true);
+            replace_if_changed(&mut state.username, username.clone()) || connected
+        }
+        PlaybackEvent::Error { code, message } => replace_error(state, code, message.clone()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Output device
+// ---------------------------------------------------------------------------
+
+pub struct Output {
+    _sink: MixerDeviceSink,
+    player: Player,
+    channels: u16,
+    rate: u32,
+}
+
+fn open_output(audio_device: Option<&str>) -> Result<Output> {
+    let mut sink = match audio_device {
+        Some(name) => {
+            let device = find_output_device(name)
+                .ok_or_else(|| anyhow!("configured audio output device {name:?} was not found"))?;
+            DeviceSinkBuilder::from_device(device)?
+                .open_stream()
+                .map_err(|error| anyhow!("failed to open audio output: {error}"))
+        }
+        None => DeviceSinkBuilder::from_default_device()?
+            .open_stream()
+            .map_err(|error| anyhow!("failed to open the default audio output: {error}")),
+    }?;
+    sink.log_on_drop(false);
+    let config = sink.config();
+    let channels = config.channel_count().get();
+    let rate = config.sample_rate().get();
+    let player = Player::connect_new(sink.mixer());
+    // Start paused; the pipeline unpauses after the prebuffer threshold.
+    player.pause();
+    Ok(Output {
+        _sink: sink,
+        player,
+        channels,
+        rate,
+    })
+}
+
+fn find_output_device(name: &str) -> Option<rodio::Device> {
+    use rodio::cpal::traits::{DeviceTrait, HostTrait};
+    let host = rodio::cpal::default_host();
+    host.output_devices().ok()?.find(|device| {
+        device
+            .description()
+            .map(|description| description.name().eq_ignore_ascii_case(name))
+            .unwrap_or(false)
+    })
+}
+
+/// Linear volume mapping: 0..=65535 → 0.0..=1.0 sink gain.
+pub fn volume_to_f32(volume: u16) -> f32 {
+    f32::from(volume) / f32::from(u16::MAX)
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline thread
+// ---------------------------------------------------------------------------
+
+pub struct ControlMessage {
+    pub command: Command,
+    pub reply: oneshot::Sender<Result<serde_json::Value, ProtocolError>>,
+}
+
+/// Navidrome identity + credentials, held in engine memory only.
+struct ServerIdentity {
+    base_url: String,
+    auth: AuthPair,
+}
+
+/// The song whose audio is currently at the head of the player queue.
+struct FrontTrack {
+    worker: WorkerHandle,
+    song: SongRef,
+    track: Track,
+    /// Cumulative ms appended by earlier fronts of this segment.
+    segment_offset_ms: u64,
+    /// Song position where this worker's stream starts (seek/resume offset).
+    worker_offset_ms: u64,
+    /// ms appended to the player for this worker so far.
+    appended_ms: u64,
+    /// The decoder reported end of stream.
+    eof: bool,
+    /// The downloader died mid-stream; buffered audio still plays while a
+    /// bounded retry rebuilds the stream.
+    worker_failed: bool,
+    /// Queue index of the song this front is playing.
+    index: usize,
+}
+
+impl FrontTrack {
+    /// The front's audio can be considered finished once decoding ended or
+    /// the worker died.
+    fn drained(&self) -> bool {
+        self.eof || self.worker_failed
+    }
+}
+
+/// A preloaded next song (or a mid-stream retry replacement) whose decoded
+/// audio is already appended to the player queue behind the front.
+struct PendingTrack {
+    worker: WorkerHandle,
+    song: SongRef,
+    track: Track,
+    /// Song position where this worker's stream starts (0 for a preload,
+    /// the buffered end for a mid-stream retry continuation).
+    worker_offset_ms: u64,
+    appended_ms: u64,
+    eof: bool,
+    index: usize,
+}
+
+/// A scheduled bounded stream retry.
+struct RetryState {
+    at: Instant,
+}
+
+struct Pipeline {
+    events: tokio::sync::mpsc::UnboundedSender<PlaybackEvent>,
+    worker_tx: std_mpsc::Sender<WorkerEvent>,
+    output: Output,
+    server: Option<ServerIdentity>,
+    format: String,
+    max_bit_rate: u16,
+    salt: Box<dyn SaltSource>,
+    agent: ureq::Agent,
+    queue: VecDeque<SongRef>,
+    current: Option<usize>,
+    status: PlaybackStatus,
+    volume: u16,
+    shuffle: bool,
+    repeat: RepeatMode,
+    front: Option<FrontTrack>,
+    pending: Option<PendingTrack>,
+    retry: Option<RetryState>,
+    next_worker_seq: u64,
+    /// Consecutive mid-stream failures for the current track (bounded retry).
+    failures: u8,
+    /// Segment clock: position at the anchor moment + anchor while playing.
+    playhead_base_ms: u64,
+    anchor: Option<Instant>,
+    last_tick_second: u64,
+}
+
+impl Pipeline {
+    fn new(
+        format: String,
+        max_bit_rate: u16,
+        volume: u16,
+        output: Output,
+        events: tokio::sync::mpsc::UnboundedSender<PlaybackEvent>,
+        worker_tx: std_mpsc::Sender<WorkerEvent>,
+    ) -> Self {
+        Self {
+            events,
+            worker_tx,
+            output,
+            server: None,
+            format,
+            max_bit_rate,
+            salt: Box::new(RandomSalt),
+            agent: stream::stream_agent(),
+            queue: VecDeque::new(),
+            current: None,
+            status: PlaybackStatus::Stopped,
+            volume,
+            shuffle: false,
+            repeat: RepeatMode::Off,
+            front: None,
+            pending: None,
+            retry: None,
+            next_worker_seq: 0,
+            failures: 0,
+            playhead_base_ms: 0,
+            anchor: None,
+            last_tick_second: u64::MAX,
+        }
+    }
+
+    fn run(
+        mut self,
+        control_rx: std_mpsc::Receiver<ControlMessage>,
+        worker_rx: std_mpsc::Receiver<WorkerEvent>,
+        shutdown: Arc<AtomicBool>,
+    ) -> Result<(), Failure> {
+        self.output.player.set_volume(volume_to_f32(self.volume));
+        loop {
+            if shutdown.load(Ordering::SeqCst) {
+                self.teardown();
+                return Ok(());
+            }
+
+            while let Ok(event) = worker_rx.try_recv() {
+                self.handle_worker_event(event);
+            }
+
+            while let Ok(message) = control_rx.try_recv() {
+                let ControlMessage { command, reply } = message;
+                // Forward through the local-command discipline so arrival
+                // order (and therefore Pause ordering) is preserved.
+                let result = dispatch_local_command(command, |command| self.execute(command));
+                let _ = reply.send(result);
+            }
+
+            self.pump(Instant::now());
+
+            let interval = if self.front.is_some() {
+                POLL_INTERVAL
+            } else {
+                IDLE_POLL_INTERVAL
+            };
+            // A command may arrive while blocked here; it must be executed,
+            // not dropped.
+            match control_rx.recv_timeout(interval) {
+                Ok(message) => {
+                    let ControlMessage { command, reply } = message;
+                    let result = dispatch_local_command(command, |command| self.execute(command));
+                    let _ = reply.send(result);
+                }
+                Err(std_mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                    self.teardown();
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    fn teardown(&mut self) {
+        self.stop_workers();
+        self.output.player.clear();
+    }
+
+    // -- command execution --------------------------------------------------
+    //
+    // Commands execute sequentially in arrival order (the async side forwards
+    // them through one FIFO channel), so a queued Pause can never be overtaken
+    // by a Play/Toggle/Next/Previous that arrived behind it.
+
+    fn execute(&mut self, command: Command) -> Result<serde_json::Value, ProtocolError> {
+        match command {
+            Command::ConfigureServer {
+                url,
+                username,
+                password,
+            } => self.configure_server(url, username, password),
+            Command::Load {
+                songs,
+                offset_index,
+                position_ms,
+                play,
+            } => {
+                self.require_server()?;
+                if songs.is_empty() {
+                    return Err(ProtocolError::new(
+                        "invalid_request",
+                        "load requires at least one song",
+                    ));
+                }
+                let index = offset_index
+                    .map(|value| value as usize)
+                    .filter(|value| *value < songs.len())
+                    .unwrap_or(0);
+                self.begin_segment_with_queue(songs, index, position_ms, play);
+                Ok(serde_json::json!({}))
+            }
+            Command::AddToQueue { song } => {
+                self.require_server()?;
+                self.queue.push_back(song);
+                Ok(serde_json::json!({}))
+            }
+            Command::Play => {
+                match self.status {
+                    PlaybackStatus::Paused => self.resume(),
+                    PlaybackStatus::Stopped => self.start_current_or_stop(),
+                    PlaybackStatus::Loading | PlaybackStatus::Playing => {}
+                }
+                Ok(serde_json::json!({}))
+            }
+            Command::Pause => {
+                self.pause();
+                Ok(serde_json::json!({}))
+            }
+            Command::Toggle => {
+                match self.status {
+                    PlaybackStatus::Playing => self.pause(),
+                    PlaybackStatus::Paused => self.resume(),
+                    PlaybackStatus::Stopped => self.start_current_or_stop(),
+                    PlaybackStatus::Loading => {}
+                }
+                Ok(serde_json::json!({}))
+            }
+            Command::Stop => {
+                self.stop_playback();
+                Ok(serde_json::json!({}))
+            }
+            Command::Next => {
+                if let Some(index) = self.next_index() {
+                    self.jump_to(index);
+                } else {
+                    self.stop_playback();
+                }
+                Ok(serde_json::json!({}))
+            }
+            Command::Previous => {
+                let index = self.current.unwrap_or(0).saturating_sub(1);
+                self.jump_to(index);
+                Ok(serde_json::json!({}))
+            }
+            Command::Seek { position_ms } => {
+                if self.front.is_some() {
+                    self.seek(position_ms);
+                }
+                Ok(serde_json::json!({}))
+            }
+            Command::SetVolume { volume } => {
+                self.volume = volume;
+                self.output.player.set_volume(volume_to_f32(volume));
+                let _ = self.events.send(PlaybackEvent::VolumeChanged { volume });
+                Ok(serde_json::json!({}))
+            }
+            Command::SetShuffle { enabled } => {
+                self.shuffle = enabled;
+                if enabled {
+                    shuffle_tail(&mut self.queue, self.current);
+                }
+                let _ = self.events.send(PlaybackEvent::ShuffleChanged { enabled });
+                Ok(serde_json::json!({}))
+            }
+            Command::SetRepeat { mode } => {
+                self.repeat = mode;
+                let _ = self.events.send(PlaybackEvent::RepeatChanged { mode });
+                Ok(serde_json::json!({}))
+            }
+            Command::Hello | Command::Ping | Command::GetState => Err(ProtocolError::new(
+                "invalid_request",
+                "command is handled by the protocol server",
+            )),
+        }
+    }
+
+    fn configure_server(
+        &mut self,
+        url: String,
+        username: String,
+        password: String,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let base_url = url.trim().trim_end_matches('/').to_string();
+        if let Err(reason) = stream::validate_base_url(&base_url) {
+            // The reason is a static string; the URL itself is never echoed.
+            return Err(ProtocolError::new("invalid_configuration", reason));
+        }
+        let username = username.trim().to_string();
+        if username.is_empty() {
+            return Err(ProtocolError::new(
+                "invalid_configuration",
+                "username is empty",
+            ));
+        }
+        if password.is_empty() {
+            return Err(ProtocolError::new(
+                "invalid_configuration",
+                "password is empty",
+            ));
+        }
+        self.server = Some(ServerIdentity {
+            base_url,
+            auth: AuthPair::new(username.clone(), password),
+        });
+        // session_connected becomes true without a network probe; connectivity
+        // problems surface later as typed stream errors instead.
+        let _ = self
+            .events
+            .send(PlaybackEvent::ServerConfigured { username });
+        Ok(serde_json::json!({}))
+    }
+
+    fn require_server(&self) -> Result<(), ProtocolError> {
+        match self.server {
+            Some(_) => Ok(()),
+            None => Err(ProtocolError::new(
+                "missing_credentials",
+                "configure the Navidrome server before loading songs",
+            )),
+        }
+    }
+
+    // -- queue / track transitions -------------------------------------------
+
+    fn next_index(&self) -> Option<usize> {
+        advance_index(self.current.unwrap_or(0), self.queue.len(), self.repeat)
+    }
+
+    /// Replace the queue and start the song at `index`.
+    fn begin_segment_with_queue(
+        &mut self,
+        songs: Vec<SongRef>,
+        index: usize,
+        position_ms: u32,
+        play: bool,
+    ) {
+        self.stop_playback();
+        self.failures = 0;
+        self.queue = songs.into();
+        self.current = Some(index);
+        let song = self.queue[index].clone();
+        self.spawn_front(song, index, u64::from(position_ms) / 1000, true);
+        if play {
+            self.status = PlaybackStatus::Loading;
+        } else {
+            self.status = PlaybackStatus::Paused;
+            let position = self.song_position_ms(Instant::now());
+            let _ = self.events.send(PlaybackEvent::Paused {
+                position_ms: position,
+            });
+        }
+    }
+
+    /// Start playing the queue entry at `index` from its beginning.
+    fn jump_to(&mut self, index: usize) {
+        if index >= self.queue.len() {
+            self.stop_playback();
+            return;
+        }
+        self.stop_workers();
+        self.output.player.clear();
+        self.anchor = None;
+        self.playhead_base_ms = 0;
+        self.last_tick_second = u64::MAX;
+        self.current = Some(index);
+        let song = self.queue[index].clone();
+        self.spawn_front(song, index, 0, true);
+        self.status = PlaybackStatus::Loading;
+    }
+
+    fn start_current_or_stop(&mut self) {
+        match (self.current, self.queue.is_empty()) {
+            (Some(index), false) if index < self.queue.len() => {
+                if self.front.is_some() {
+                    self.resume();
+                } else {
+                    self.jump_to(index);
+                }
+            }
+            _ => self.stop_playback(),
+        }
+    }
+
+    fn resume(&mut self) {
+        if self.front.is_none() || self.status == PlaybackStatus::Playing {
+            return;
+        }
+        self.output.player.play();
+        self.anchor = Some(Instant::now());
+        self.status = PlaybackStatus::Playing;
+        let position = self.song_position_ms(Instant::now());
+        let _ = self.events.send(PlaybackEvent::PlaybackStarted {
+            position_ms: position,
+        });
+    }
+
+    fn pause(&mut self) {
+        if self.status != PlaybackStatus::Playing {
+            return;
+        }
+        let position = self.song_position_ms(Instant::now());
+        self.output.player.pause();
+        self.anchor = None;
+        self.playhead_base_ms = self.segment_position_ms(Instant::now());
+        self.status = PlaybackStatus::Paused;
+        let _ = self.events.send(PlaybackEvent::Paused {
+            position_ms: position,
+        });
+    }
+
+    fn stop_playback(&mut self) {
+        self.stop_workers();
+        self.output.player.clear();
+        self.output.player.pause();
+        self.anchor = None;
+        self.playhead_base_ms = 0;
+        self.last_tick_second = u64::MAX;
+        self.status = PlaybackStatus::Stopped;
+        let _ = self.events.send(PlaybackEvent::Stopped);
+    }
+
+    fn seek(&mut self, position_ms: u32) {
+        let seconds = u64::from(position_ms) / 1000;
+        let was_playing = self.status == PlaybackStatus::Playing;
+        self.stop_workers();
+        self.output.player.clear();
+        self.anchor = None;
+        // The segment clock restarts at the new offset once the prebuffered
+        // audio starts (pump sets the anchor).
+        self.playhead_base_ms = 0;
+        self.last_tick_second = u64::MAX;
+        if let Some(index) = self.current {
+            if let Some(song) = self.queue.get(index).cloned() {
+                // A seek stays on the same track: no loading transition, and
+                // while paused it must stay paused.
+                self.spawn_front(song, index, seconds, false);
+                self.status = if was_playing {
+                    PlaybackStatus::Loading
+                } else {
+                    PlaybackStatus::Paused
+                };
+            }
+        }
+        // Exactly one Seeked per accepted seek so MPRIS emits one Seeked.
+        let _ = self.events.send(PlaybackEvent::Seeked {
+            position_ms: seconds.saturating_mul(1000) as u32,
+        });
+    }
+
+    fn spawn_front(&mut self, song: SongRef, index: usize, offset_secs: u64, begin: bool) {
+        let Some(server) = self.server.as_ref() else {
+            return;
+        };
+        let salt = self.salt.salt();
+        let worker = match stream::spawn_worker(
+            &self.agent,
+            &server.base_url,
+            &server.auth,
+            salt,
+            &song.id,
+            &self.format,
+            self.max_bit_rate,
+            offset_secs,
+            self.output.channels,
+            self.output.rate,
+            self.worker_tx.clone(),
+            self.next_worker_seq,
+        ) {
+            Ok(worker) => worker,
+            Err(message) => {
+                // The error text comes from the URL builder and is free of
+                // credentials by construction.
+                log::error!("stream request could not be built: {message}");
+                let _ = self.events.send(PlaybackEvent::Error {
+                    code: "stream_unavailable".into(),
+                    message: "the stream request could not be built".into(),
+                });
+                return;
+            }
+        };
+        self.next_worker_seq += 1;
+        let track = self.build_track(&song);
+        let _ = self.events.send(PlaybackEvent::TrackStarted {
+            track: track.clone(),
+            position_ms: (offset_secs.saturating_mul(1000)).min(u64::from(u32::MAX)) as u32,
+            begin,
+        });
+        self.front = Some(FrontTrack {
+            worker,
+            song,
+            track,
+            segment_offset_ms: 0,
+            worker_offset_ms: offset_secs.saturating_mul(1000),
+            appended_ms: 0,
+            eof: false,
+            worker_failed: false,
+            index,
+        });
+    }
+
+    fn build_track(&self, song: &SongRef) -> Track {
+        // The art URL is the one credential-bearing URL: it is built here and
+        // served to the UI as an image source, never logged.
+        let art_url = self
+            .server
+            .as_ref()
+            .map(|server| {
+                let salt = self.salt.salt();
+                stream::build_cover_art_url(
+                    &server.base_url,
+                    &server.auth,
+                    salt.as_str(),
+                    song.cover_art.as_str(),
+                )
+                .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        Track {
+            id: song.id.clone(),
+            title: song.title.clone(),
+            artists: song.artists.clone(),
+            album: song.album.clone(),
+            art_url,
+            duration_ms: song.duration_ms,
+            item_type: "track".to_string(),
+        }
+    }
+
+    // -- worker events -------------------------------------------------------
+
+    fn handle_worker_event(&mut self, event: WorkerEvent) {
+        match event {
+            WorkerEvent::DownloadDone { seq, outcome } => self.on_download_done(seq, outcome),
+            WorkerEvent::DecodeDone { seq, outcome } => self.on_decode_done(seq, outcome),
+        }
+    }
+
+    fn seq_is_current(&self, seq: u64) -> bool {
+        self.front
+            .as_ref()
+            .is_some_and(|front| front.worker.seq == seq)
+            || self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.worker.seq == seq)
+    }
+
+    fn on_download_done(&mut self, seq: u64, outcome: DownloadOutcome) {
+        if !self.seq_is_current(seq) {
+            return; // stale worker from a seek/stop/advance
+        }
+        let is_front = self
+            .front
+            .as_ref()
+            .is_some_and(|front| front.worker.seq == seq);
+        match outcome {
+            DownloadOutcome::Completed => {}
+            DownloadOutcome::Rejected { status: _ } => {
+                // Bad credentials or permissions; no retry helps. The status
+                // code is deliberately not echoed to keep URLs/sessions out
+                // of any visible message.
+                let _ = self.events.send(PlaybackEvent::Error {
+                    code: "stream_rejected".into(),
+                    message:
+                        "Navidrome rejected the stream request. Check the configured server credentials."
+                            .into(),
+                });
+                self.stop_playback();
+            }
+            DownloadOutcome::Failed => {
+                if is_front {
+                    if let Some(front) = self.front.as_mut() {
+                        front.worker_failed = true;
+                    }
+                    self.schedule_stream_retry();
+                } else if let Some(pending) = self.pending.as_mut() {
+                    // A failed preload/retry replacement: drop it and let the
+                    // retry scheduler (or the queue advance) recover.
+                    log::warn!("preloaded stream for song {} failed", pending.song.id);
+                    pending.worker.abort();
+                    self.pending = None;
+                }
+            }
+        }
+    }
+
+    fn on_decode_done(&mut self, seq: u64, outcome: DecodeOutcome) {
+        if !self.seq_is_current(seq) {
+            return;
+        }
+        match outcome {
+            DecodeOutcome::Completed => {
+                if let Some(front) = self.front.as_mut() {
+                    if front.worker.seq == seq {
+                        front.eof = true;
+                        self.failures = 0;
+                    }
+                }
+                if let Some(pending) = self.pending.as_mut() {
+                    if pending.worker.seq == seq {
+                        pending.eof = true;
+                    }
+                }
+            }
+            DecodeOutcome::Failed(reason) => {
+                // A container the decoder cannot read will not fix itself; a
+                // server-side transcode format usually resolves it.
+                log::error!("stream decode failed: {reason}");
+                let _ = self.events.send(PlaybackEvent::Error {
+                    code: "stream_unavailable".into(),
+                    message: "the stream could not be decoded".into(),
+                });
+                self.stop_playback();
+            }
+        }
+    }
+
+    /// Bounded mid-stream recovery: at most `MAX_STREAM_ATTEMPTS` restarts,
+    /// each resuming the stream after the buffered playhead, then a typed
+    /// error — never an unbounded reconnect loop.
+    fn schedule_stream_retry(&mut self) {
+        if !stream::stream_retry_allowed(self.failures) {
+            let _ = self.events.send(PlaybackEvent::Error {
+                code: "stream_unavailable".into(),
+                message: "Navidrome stopped serving the stream".into(),
+            });
+            self.stop_playback();
+            return;
+        }
+        self.failures += 1;
+        let attempt = self.failures;
+        log::warn!(
+            "stream interrupted after {} buffered ms; scheduling retry {attempt}",
+            self.front.as_ref().map_or(0, |front| front.appended_ms)
+        );
+        self.retry = Some(RetryState {
+            at: Instant::now() + Duration::from_millis(stream::retry_backoff_ms(attempt)),
+        });
+    }
+
+    /// Spawn a replacement worker that continues the current song after the
+    /// buffered audio (the player queue keeps its FIFO order, so no already
+    /// buffered samples are lost or duplicated).
+    fn spawn_retry_worker(&mut self) {
+        let Some(front) = self.front.as_ref() else {
+            self.retry = None;
+            return;
+        };
+        let resume_at = front.worker_offset_ms + front.appended_ms;
+        let seconds = resume_at / 1000;
+        let Some(server) = self.server.as_ref() else {
+            self.retry = None;
+            return;
+        };
+        let salt = self.salt.salt();
+        match stream::spawn_worker(
+            &self.agent,
+            &server.base_url,
+            &server.auth,
+            salt,
+            &front.song.id,
+            &self.format,
+            self.max_bit_rate,
+            seconds,
+            self.output.channels,
+            self.output.rate,
+            self.worker_tx.clone(),
+            self.next_worker_seq,
+        ) {
+            Ok(worker) => {
+                self.next_worker_seq += 1;
+                let song = front.song.clone();
+                let track = front.track.clone();
+                let index = front.index;
+                self.pending = Some(PendingTrack {
+                    worker,
+                    song,
+                    track,
+                    worker_offset_ms: resume_at,
+                    appended_ms: 0,
+                    eof: false,
+                    index,
+                });
+            }
+            Err(message) => {
+                log::error!("stream retry could not be built: {message}");
+                let _ = self.events.send(PlaybackEvent::Error {
+                    code: "stream_unavailable".into(),
+                    message: "the stream could not be resumed".into(),
+                });
+                self.stop_playback();
+            }
+        }
+        self.retry = None;
+    }
+
+    // -- playback progress ----------------------------------------------------
+
+    fn pump(&mut self, now: Instant) {
+        // A scheduled bounded retry comes due here.
+        let retry_due = self.retry.as_ref().is_some_and(|retry| now >= retry.at);
+        if retry_due {
+            self.spawn_retry_worker();
+        }
+
+        self.append_pcm();
+        if self.front.is_none() {
+            return;
+        }
+
+        let segment_position = self.segment_position_ms(now);
+        let position = self.song_position_ms(now);
+
+        // One position update per second.
+        let second = u64::from(position) / POSITION_TICK_MS;
+        if self.status == PlaybackStatus::Playing && second != self.last_tick_second {
+            self.last_tick_second = second;
+            let _ = self.events.send(PlaybackEvent::PositionTick {
+                position_ms: position,
+            });
+        }
+
+        self.maybe_preload(position);
+
+        // Track boundary: the front is fully buffered and fully played.
+        if let Some(front) = self.front.as_ref() {
+            let played_in_front = segment_position.saturating_sub(front.segment_offset_ms);
+            if front.drained() && played_in_front >= front.appended_ms {
+                self.advance_after_track_end();
+            }
+        }
+
+        // Readiness: the loading state was already announced; start the sink
+        // once the prebuffer lead is decoded.
+        if self.status == PlaybackStatus::Loading {
+            if let Some(front) = self.front.as_ref() {
+                let buffered = front.appended_ms >= stream::PREBUFFER_MS || front.drained();
+                if buffered {
+                    self.output.player.play();
+                    self.anchor = Some(now);
+                    // The segment clock starts at zero here; the front's seek
+                    // offset lives in worker_offset_ms and is added per song.
+                    self.playhead_base_ms = 0;
+                    self.last_tick_second = u64::MAX;
+                    self.status = PlaybackStatus::Playing;
+                    let position = self.song_position_ms(now);
+                    let _ = self.events.send(PlaybackEvent::PlaybackStarted {
+                        position_ms: position,
+                    });
+                }
+            }
+        }
+    }
+
+    fn append_pcm(&mut self) {
+        if let Some(front) = self.front.as_ref() {
+            let mut chunks = Vec::new();
+            while let Some(chunk) = front.worker.pcm.try_pop() {
+                chunks.push(chunk);
+            }
+            let mut appended_ms = front.appended_ms;
+            for chunk in chunks {
+                let ms = chunk_ms(&chunk, self.output.rate);
+                if ms > 0 {
+                    let (channels, rate) =
+                        rodio_sample_format(self.output.channels, self.output.rate);
+                    self.output.player.append(rodio::buffer::SamplesBuffer::new(
+                        channels,
+                        rate,
+                        chunk.samples,
+                    ));
+                    appended_ms += ms;
+                }
+            }
+            if let Some(front) = self.front.as_mut() {
+                front.appended_ms = appended_ms;
+            }
+        }
+        // Preloaded next-track PCM is appended after the front's, so the
+        // player's FIFO order stays song-accurate even though these chunks
+        // are queued long before the boundary.
+        if let Some(pending) = self.pending.as_ref() {
+            let mut chunks = Vec::new();
+            while let Some(chunk) = pending.worker.pcm.try_pop() {
+                chunks.push(chunk);
+            }
+            let mut appended_ms = pending.appended_ms;
+            for chunk in chunks {
+                let ms = chunk_ms(&chunk, self.output.rate);
+                if ms > 0 {
+                    let (channels, rate) =
+                        rodio_sample_format(self.output.channels, self.output.rate);
+                    self.output.player.append(rodio::buffer::SamplesBuffer::new(
+                        channels,
+                        rate,
+                        chunk.samples,
+                    ));
+                    appended_ms += ms;
+                }
+            }
+            if let Some(pending) = self.pending.as_mut() {
+                pending.appended_ms = appended_ms;
+            }
+        }
+    }
+
+    fn maybe_preload(&mut self, position_ms: u32) {
+        if self.pending.is_some() {
+            return;
+        }
+        let Some(front) = self.front.as_ref() else {
+            return;
+        };
+        let duration = u64::from(front.song.duration_ms);
+        let played = u64::from(position_ms).saturating_sub(front.worker_offset_ms);
+        let by_duration = duration > 0 && played + stream::PRELOAD_LOOKAHEAD_MS >= duration;
+        let by_buffered = front.drained()
+            && front.appended_ms.saturating_sub(played) <= stream::PRELOAD_LOOKAHEAD_MS;
+        if !(by_duration || by_buffered) {
+            return;
+        }
+        let Some(next_index) = advance_index(front.index, self.queue.len(), self.repeat) else {
+            return;
+        };
+        if next_index == front.index {
+            // Repeat-track restarts are handled at the boundary; no preload.
+            return;
+        }
+        let Some(song) = self.queue.get(next_index).cloned() else {
+            return;
+        };
+        let Some(server) = self.server.as_ref() else {
+            return;
+        };
+        let salt = self.salt.salt();
+        match stream::spawn_worker(
+            &self.agent,
+            &server.base_url,
+            &server.auth,
+            salt,
+            &song.id,
+            &self.format,
+            self.max_bit_rate,
+            0,
+            self.output.channels,
+            self.output.rate,
+            self.worker_tx.clone(),
+            self.next_worker_seq,
+        ) {
+            Ok(worker) => {
+                self.next_worker_seq += 1;
+                let track = self.build_track(&song);
+                self.pending = Some(PendingTrack {
+                    worker,
+                    song,
+                    track,
+                    worker_offset_ms: 0,
+                    appended_ms: 0,
+                    eof: false,
+                    index: next_index,
+                });
+            }
+            Err(message) => {
+                log::warn!("preloading song {} failed: {message}", song.id);
+            }
+        }
+    }
+
+    fn advance_after_track_end(&mut self) {
+        let finished = self.front.take().expect("boundary with no front");
+        finished.worker.abort();
+        if finished.eof {
+            // A fully decoded track counts as success for the retry budget.
+            self.failures = 0;
+        }
+        let segment_end = finished.segment_offset_ms + finished.appended_ms;
+        match self.pending.take() {
+            Some(pending) => {
+                // Gapless hand-off: rodio already queued this song's decoded
+                // audio behind the finished track.
+                self.current = Some(pending.index);
+                self.front = Some(FrontTrack {
+                    worker: pending.worker,
+                    song: pending.song,
+                    track: pending.track,
+                    segment_offset_ms: segment_end,
+                    worker_offset_ms: pending.worker_offset_ms,
+                    appended_ms: pending.appended_ms,
+                    eof: pending.eof,
+                    worker_failed: false,
+                    index: pending.index,
+                });
+                let _ = self.events.send(PlaybackEvent::TrackStarted {
+                    track: self.front.as_ref().unwrap().track.clone(),
+                    position_ms: 0,
+                    begin: false,
+                });
+            }
+            None => match advance_index(finished.index, self.queue.len(), self.repeat) {
+                Some(index) => {
+                    // Nothing preloaded: an audible gap while the next song
+                    // buffers, so the loading state is published again.
+                    self.anchor = None;
+                    self.playhead_base_ms = 0;
+                    self.last_tick_second = u64::MAX;
+                    self.current = Some(index);
+                    let song = self.queue[index].clone();
+                    self.spawn_front(song, index, 0, true);
+                    self.status = PlaybackStatus::Loading;
+                }
+                None => self.stop_playback(),
+            },
+        }
+    }
+
+    // -- clock ---------------------------------------------------------------
+
+    /// Position on the segment clock: `playhead_base_ms` at the anchor
+    /// moment, advancing with wall-clock time while playing.
+    fn segment_position_ms(&self, now: Instant) -> u64 {
+        match self.anchor {
+            Some(anchor) => {
+                self.playhead_base_ms + now.saturating_duration_since(anchor).as_millis() as u64
+            }
+            None => self.playhead_base_ms,
+        }
+    }
+
+    /// Song position derived from the decode clock: the segment position
+    /// minus everything appended before this front, clamped to what is
+    /// actually buffered (and to the declared duration when known).
+    fn song_position_ms(&self, now: Instant) -> u32 {
+        let Some(front) = &self.front else {
+            return self.playhead_base_ms.min(u64::from(u32::MAX)) as u32;
+        };
+        let segment_position = self.segment_position_ms(now);
+        let played_in_front = segment_position.saturating_sub(front.segment_offset_ms);
+        let buffered_ceiling = front.worker_offset_ms + front.appended_ms;
+        let mut position = front.worker_offset_ms.saturating_add(played_in_front);
+        position = position.min(buffered_ceiling);
+        if front.song.duration_ms > 0 {
+            position = position.min(u64::from(front.song.duration_ms));
+        }
+        position.min(u64::from(u32::MAX)) as u32
+    }
+
+    fn stop_workers(&mut self) {
+        if let Some(front) = self.front.take() {
+            front.worker.abort();
+        }
+        if let Some(pending) = self.pending.take() {
+            pending.worker.abort();
+        }
+        self.retry = None;
+    }
+}
+
+fn chunk_ms(chunk: &PcmChunk, rate: u32) -> u64 {
+    if rate == 0 {
+        return 0;
+    }
+    u64::from(chunk.frames as u32) * 1000 / u64::from(rate)
+}
+
+fn rodio_sample_format(channels: u16, rate: u32) -> (rodio::ChannelCount, rodio::SampleRate) {
+    (
+        std::num::NonZero::new(channels).expect("non-zero channel count"),
+        std::num::NonZero::new(rate).expect("non-zero sample rate"),
+    )
+}
+
+/// Next queue index for a skip or a track boundary. `RepeatMode::Track`
+/// restarts the current song, `Context` wraps at the end, `Off` stops.
+fn advance_index(current: usize, len: usize, repeat: RepeatMode) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let current = current.min(len - 1);
+    match repeat {
+        RepeatMode::Track => Some(current),
+        RepeatMode::Context => Some(if current + 1 < len { current + 1 } else { 0 }),
+        RepeatMode::Off => (current + 1 < len).then_some(current + 1),
+    }
+}
+
+/// Shuffle the not-yet-played tail of the queue, keeping the current song in
+/// place. `fastrand` supplies the randomness.
+fn shuffle_tail(queue: &mut VecDeque<SongRef>, current: Option<usize>) {
+    let start = current.map_or(0, |index| index + 1);
+    if start >= queue.len() {
+        return;
+    }
+    let tail: Vec<SongRef> = queue.drain(start..).collect();
+    let mut tail = tail;
+    fastrand::shuffle(&mut tail);
+    queue.extend(tail);
+}
+
+/// FIFO forwarding of a local (socket/MPRIS) command into the pipeline. Every
+/// command is queued in arrival order and executed sequentially, which is the
+/// guarantee Pause relies on: a Play/Toggle/Next/Previous behind it cannot
+/// overtake it.
+fn dispatch_local_command(
+    command: Command,
+    mut send: impl FnMut(Command) -> Result<serde_json::Value, ProtocolError>,
+) -> Result<serde_json::Value, ProtocolError> {
+    send(command)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::protocol::BackendState;
 
-    fn test_uri() -> SpotifyUri {
-        SpotifyUri::from_uri("spotify:track:14XWXWv5FoCbFzLksawpEe").unwrap()
+    fn track(id: &str) -> Track {
+        Track {
+            id: id.to_string(),
+            title: "A song".into(),
+            artists: vec!["An artist".into()],
+            album: "An album".into(),
+            art_url: String::new(),
+            duration_ms: 42_000,
+            item_type: "track".into(),
+        }
     }
 
     #[test]
-    fn loading_does_not_publish_a_false_stop_during_replacement() {
+    fn replacement_track_keeps_playing_status_continuous() {
         let mut state = BackendState {
             playback: PlaybackStatus::Playing,
             position_ms: 42_000,
             ..BackendState::default()
         };
-        apply_event(
-            &mut state,
-            PlayerEvent::Loading {
-                play_request_id: 2,
-                track_id: test_uri(),
-                position_ms: 0,
-            },
-        );
+        let event = PlaybackEvent::TrackStarted {
+            track: track("next"),
+            position_ms: 0,
+            begin: false,
+        };
+        assert!(apply_event(&mut state, &event));
         assert_eq!(state.playback, PlaybackStatus::Playing);
         assert_eq!(state.position_ms, 0);
+        assert_eq!(state.track.as_ref().unwrap().id, "next");
     }
 
     #[test]
-    fn stale_status_event_is_recognized_by_play_request() {
-        let event = PlayerEvent::Paused {
-            play_request_id: 4,
-            track_id: test_uri(),
-            position_ms: 1_000,
+    fn begin_track_publishes_loading_before_the_first_sample() {
+        let mut state = BackendState::default();
+        let event = PlaybackEvent::TrackStarted {
+            track: track("42"),
+            position_ms: 0,
+            begin: true,
         };
-        assert!(event_is_stale(Some(5), &event));
-        assert!(!event_is_stale(Some(4), &event));
-        assert!(!event_is_stale(None, &event));
+        assert!(apply_event(&mut state, &event));
+        assert_eq!(state.playback, PlaybackStatus::Loading);
+        assert!(state.error_code.is_empty());
     }
 
     #[test]
-    fn repeated_position_events_do_not_publish_duplicate_state() {
+    fn repeated_position_ticks_do_not_publish_duplicate_state() {
         let mut state = BackendState {
             playback: PlaybackStatus::Playing,
             position_ms: 1_000,
             ..BackendState::default()
         };
-        let changed = apply_event(
-            &mut state,
-            PlayerEvent::PositionChanged {
-                play_request_id: 1,
-                track_id: test_uri(),
-                position_ms: 1_000,
-            },
-        );
-        assert!(!changed);
+        let event = PlaybackEvent::PositionTick { position_ms: 1_000 };
+        assert!(!apply_event(&mut state, &event));
+
+        let event = PlaybackEvent::PositionTick { position_ms: 2_000 };
+        assert!(apply_event(&mut state, &event));
+        assert_eq!(state.position_ms, 2_000);
     }
 
     #[test]
@@ -750,16 +1492,104 @@ mod tests {
             position_ms: 1_000,
             ..BackendState::default()
         };
-        let changed = apply_event(
-            &mut state,
-            PlayerEvent::Seeked {
-                play_request_id: 1,
-                track_id: test_uri(),
-                position_ms: 1_000,
-            },
-        );
-        assert!(changed);
+        let event = PlaybackEvent::Seeked { position_ms: 1_000 };
+        assert!(apply_event(&mut state, &event));
         assert_eq!(state.seek_sequence, 1);
+        assert_eq!(state.position_ms, 1_000);
+    }
+
+    #[test]
+    fn error_codes_are_typed_and_cleared_by_the_next_track() {
+        let mut state = BackendState::default();
+
+        let rejected = PlaybackEvent::Error {
+            code: "stream_rejected".into(),
+            message: "Navidrome rejected the stream request".into(),
+        };
+        assert!(apply_event(&mut state, &rejected));
+        assert_eq!(state.error_code, "stream_rejected");
+
+        let unavailable = PlaybackEvent::Error {
+            code: "stream_unavailable".into(),
+            message: "Navidrome stopped serving the stream".into(),
+        };
+        assert!(apply_event(&mut state, &unavailable));
+        assert_eq!(state.error_code, "stream_unavailable");
+        assert_eq!(state.error, "Navidrome stopped serving the stream");
+
+        let event = PlaybackEvent::TrackStarted {
+            track: track("42"),
+            position_ms: 0,
+            begin: true,
+        };
+        assert!(apply_event(&mut state, &event));
+        assert!(state.error_code.is_empty());
+        assert!(state.error.is_empty());
+    }
+
+    #[test]
+    fn stopped_clears_track_and_position() {
+        let mut state = BackendState {
+            playback: PlaybackStatus::Playing,
+            position_ms: 9_000,
+            track: Some(track("42")),
+            ..BackendState::default()
+        };
+        assert!(apply_event(&mut state, &PlaybackEvent::Stopped));
+        assert_eq!(state.playback, PlaybackStatus::Stopped);
+        assert_eq!(state.position_ms, 0);
+        assert!(state.track.is_none());
+    }
+
+    #[test]
+    fn server_configuration_connects_the_session_without_a_probe() {
+        let mut state = BackendState::default();
+        let event = PlaybackEvent::ServerConfigured {
+            username: "user".into(),
+        };
+        assert!(apply_event(&mut state, &event));
+        assert!(state.session_connected);
+        assert_eq!(state.username, "user");
+        assert_eq!(state.engine, "navidrome-stream");
+        // No credential-shaped field exists in the state at all.
+        let encoded = serde_json::to_value(&state).unwrap();
+        assert!(encoded.get("password").is_none());
+        assert!(encoded.get("url").is_none());
+    }
+
+    #[test]
+    fn volume_maps_linearly_to_the_sink_gain() {
+        assert_eq!(volume_to_f32(0), 0.0);
+        assert_eq!(volume_to_f32(u16::MAX), 1.0);
+        // u16::MAX/2 is one step below the exact midpoint; linear mapping
+        // keeps it within a rounding step of 0.5.
+        assert!((volume_to_f32(u16::MAX / 2) - 0.5).abs() < 1e-4);
+        assert!((volume_to_f32(32_768) - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn queue_advances_by_repeat_mode() {
+        assert_eq!(advance_index(0, 3, RepeatMode::Off), Some(1));
+        assert_eq!(advance_index(2, 3, RepeatMode::Off), None);
+        assert_eq!(advance_index(2, 3, RepeatMode::Context), Some(0));
+        assert_eq!(advance_index(1, 3, RepeatMode::Track), Some(1));
+        assert_eq!(advance_index(0, 0, RepeatMode::Context), None);
+    }
+
+    #[test]
+    fn shuffle_tail_keeps_the_current_song_first() {
+        let songs: Vec<SongRef> = (0..5)
+            .map(|id| SongRef {
+                id: id.to_string(),
+                ..SongRef::default()
+            })
+            .collect();
+        let mut queue: VecDeque<SongRef> = songs.into();
+        shuffle_tail(&mut queue, Some(0));
+        assert_eq!(queue[0].id, "0");
+        let mut ids: Vec<&str> = queue.iter().map(|song| song.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["0", "1", "2", "3", "4"]);
     }
 
     #[test]
@@ -769,78 +1599,33 @@ mod tests {
         let error = send_without_reply(&commands, Command::Pause).unwrap_err();
         assert_eq!(error.code, "engine_busy");
     }
-
-    #[test]
-    fn audio_key_rejection_is_distinct_and_clears_on_the_next_load() {
-        let mut state = BackendState::default();
-        assert!(apply_event(
-            &mut state,
-            PlayerEvent::AudioKeyUnavailable {
-                play_request_id: 1,
-                track_id: test_uri(),
-            },
-        ));
-        assert_eq!(state.error_code, AUDIO_KEY_UNAVAILABLE_CODE);
-        assert_eq!(state.error, AUDIO_KEY_UNAVAILABLE_MESSAGE);
-
-        assert!(apply_event(
-            &mut state,
-            PlayerEvent::Loading {
-                play_request_id: 2,
-                track_id: test_uri(),
-                position_ms: 0,
-            },
-        ));
-        assert!(state.error_code.is_empty());
-        assert!(state.error.is_empty());
-    }
-
-    #[test]
-    fn reconnect_budget_expires_old_attempts_and_rejects_bursts() {
-        let start = Instant::now();
-        let mut attempts = VecDeque::new();
-
-        for offset in 0..RECONNECT_LIMIT {
-            assert!(record_reconnect(
-                &mut attempts,
-                start + Duration::from_secs(offset as u64)
-            ));
-        }
-        assert!(!record_reconnect(
-            &mut attempts,
-            start + Duration::from_secs(RECONNECT_LIMIT as u64)
-        ));
-        assert!(record_reconnect(&mut attempts, start + RECONNECT_WINDOW));
-    }
 }
 
 #[cfg(test)]
 mod local_control_tests {
     use super::*;
 
-    // Models dispatch to a receiver with retained playback. A stopped Spirc
-    // without a loaded context still needs separate queue restoration.
+    // Models the pipeline as a receiver with retained playback. Commands are
+    // forwarded in arrival order; there is no activation step to race.
     #[derive(Default)]
     struct Receiver {
-        active: bool,
         playing: bool,
         index: i32,
         commands: Vec<Command>,
     }
 
     impl Receiver {
-        fn send(&mut self, command: Command) -> Result<()> {
+        fn send(&mut self, command: Command) -> Result<serde_json::Value, ProtocolError> {
             self.commands.push(command.clone());
             match command {
-                Command::Activate => self.active = true,
-                Command::Play if self.active => self.playing = true,
-                Command::Pause if self.active => self.playing = false,
-                Command::Toggle if self.active => self.playing = !self.playing,
-                Command::Next if self.active => self.index += 1,
-                Command::Previous if self.active => self.index -= 1,
+                Command::Play => self.playing = true,
+                Command::Pause => self.playing = false,
+                Command::Toggle => self.playing = !self.playing,
+                Command::Next => self.index += 1,
+                Command::Previous => self.index -= 1,
                 _ => {}
             }
-            Ok(())
+            Ok(serde_json::json!({}))
         }
 
         fn dispatch(&mut self, command: Command) {
@@ -849,16 +1634,12 @@ mod local_control_tests {
     }
 
     #[test]
-    fn play_then_pause_cannot_be_reordered_by_activation() {
+    fn play_then_pause_cannot_be_reordered() {
         let mut receiver = Receiver::default();
         receiver.dispatch(Command::Play);
         receiver.dispatch(Command::Pause);
-        assert!(receiver.active);
         assert!(!receiver.playing);
-        assert_eq!(
-            receiver.commands,
-            vec![Command::Activate, Command::Play, Command::Pause]
-        );
+        assert_eq!(receiver.commands, vec![Command::Play, Command::Pause]);
     }
 
     #[test]
@@ -871,22 +1652,14 @@ mod local_control_tests {
         assert_eq!(receiver.index, 1);
         assert_eq!(
             receiver.commands,
-            vec![
-                Command::Activate,
-                Command::Next,
-                Command::Activate,
-                Command::Next,
-                Command::Activate,
-                Command::Previous,
-            ]
+            vec![Command::Next, Command::Next, Command::Previous]
         );
     }
 
     #[test]
-    fn toggle_acquires_ownership_before_toggling_retained_playback() {
+    fn toggle_flips_retained_playback_in_arrival_order() {
         let mut receiver = Receiver::default();
         receiver.dispatch(Command::Toggle);
-        assert!(receiver.active);
         assert!(receiver.playing);
         receiver.dispatch(Command::Toggle);
         assert!(!receiver.playing);
@@ -895,7 +1668,6 @@ mod local_control_tests {
     #[test]
     fn play_is_idempotent_for_active_playback() {
         let mut receiver = Receiver {
-            active: true,
             playing: true,
             ..Receiver::default()
         };
@@ -904,7 +1676,7 @@ mod local_control_tests {
     }
 
     #[test]
-    fn pause_and_other_nontransport_commands_do_not_take_ownership() {
+    fn pause_and_other_transport_commands_keep_exact_order() {
         let mut receiver = Receiver::default();
         let commands = vec![
             Command::Pause,
@@ -919,32 +1691,16 @@ mod local_control_tests {
         for command in &commands {
             receiver.dispatch(command.clone());
         }
-        assert!(!receiver.active);
+        assert!(!receiver.playing);
         assert_eq!(receiver.commands, commands);
     }
 
     #[test]
-    fn failed_activation_does_not_dispatch_transport_action() {
-        let mut commands = Vec::new();
-        let result = dispatch_local_command(Command::Next, |command| {
-            commands.push(command);
-            bail!("receiver closed")
+    fn forwarding_errors_propagate_to_the_caller() {
+        let result = dispatch_local_command(Command::Play, |_| {
+            Err(ProtocolError::new("engine_unavailable", "pipeline closed"))
         });
-        assert!(result.is_err());
-        assert_eq!(commands, vec![Command::Activate]);
-    }
-
-    #[test]
-    fn transport_error_is_returned_after_successful_activation() {
-        let mut commands = Vec::new();
-        let result = dispatch_local_command(Command::Play, |command| {
-            commands.push(command.clone());
-            if command == Command::Play {
-                bail!("receiver closed");
-            }
-            Ok(())
-        });
-        assert!(result.is_err());
-        assert_eq!(commands, vec![Command::Activate, Command::Play]);
+        let error = result.unwrap_err();
+        assert_eq!(error.code, "engine_unavailable");
     }
 }

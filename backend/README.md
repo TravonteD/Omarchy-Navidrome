@@ -1,55 +1,74 @@
 # Omarchy Navidrome backend
 
-This crate owns the plugin's local Spotify Connect runtime. It deliberately
-does not reimplement Spotify's private wire protocol: it embeds a commit-pinned
-librespot revision behind an interface owned by this project.
+This crate owns the plugin's local playback runtime for a self-hosted
+[Navidrome](https://www.navidrome.org) server. It streams from the server's
+Subsonic API (`/rest/stream`) with a bounded HTTP download → Symphonia decode
+→ rodio playback pipeline; the engine holds the server URL, username, and
+Navidrome password in memory only and recomputes `md5(password + salt)` token
+auth per request.
 
 The process provides:
 
-- PulseAudio/PipeWire playback with durable XDG-state authorization and a 1 GB
-  disposable audio cache;
-- Spotify Connect state and controls through librespot;
+- PulseAudio/PipeWire playback through rodio, with on-demand transcoding
+  controlled by the `format` and `max_bit_rate` settings;
+- a local queue engine driven by the versioned protocol (load, seek, skip,
+  volume, shuffle, repeat) with gapless preload of the next song;
 - an MPRIS player for Quickshell and other desktop media controls; and
 - a versioned newline-delimited JSON protocol on an owner-only Unix socket.
 
-The project fork's librespot revision is pinned in both `Cargo.toml` and
-`Cargo.lock`. It contains the manual-track-switch smoothing submitted as
-[librespot PR #1740](https://github.com/librespot-org/librespot/pull/1740) and
-stops cleanly when Spotify refuses an audio key instead of skipping through the
-queue. Updating the revision requires the full test suite and a live switch
-test; a floating branch is intentionally never used.
+## Streaming details
 
-Release tags build the backend on GitHub-hosted native runners with a pinned
-Rust toolchain and immutable action revisions. GitHub records build-provenance
-attestations for the exact raw executables. The installer accepts a release
-binary only when `gh attestation verify` binds it to this repository, the
-release workflow, the exact version tag, and the checkout's source commit.
-Checksums committed beside a binary are deliberately not treated as source
-provenance, and no ELF executable is stored in this repository.
+- Stream URLs follow the Subsonic token-auth contract:
+  `t = md5(password + salt)` with a fresh ≥6-character alphanumeric salt per
+  request, `v=1.16.1`, `c=omarchy-navidrome`, `f=json`; `format` is omitted
+  for source playback (`""`) and `maxBitRate`/`timeOffset` are omitted when
+  zero. The URL is used once per request and is never logged; cover-art URLs
+  carry the same auth params and are only surfaced to the UI as image
+  sources.
+- Buffering is bounded on both sides: the download buffer caps at 128 × 64 KiB
+  (8 MiB) and the decode queue at about one second of decoded PCM. A stalled
+  server therefore backpressures instead of filling memory.
+- Readiness is announced (the `Loading` state) before the first audible
+  sample; the sink starts after 500 ms of decoded lead-in. The next song's
+  download starts when the playhead reaches (duration − 15 s), or at the last
+  15 s of buffered audio when the duration is unknown, so its decoded chunks
+  queue behind the current track gaplessly.
+- Seek re-requests the stream with `timeOffset` at 1-second granularity and
+  bumps the seek sequence exactly once so MPRIS emits one `Seeked` signal.
+- Position is published once per second from the decode clock (wall clock
+  anchored at the first audible sample, frozen while paused, clamped to the
+  buffered ceiling), matching the UI timer while Quickshell interpolates
+  between updates.
+- A server that dies mid-stream gets bounded retries (at most 3, with a short
+  growing backoff, each resuming after the buffered playhead) and then a
+  typed `stream_unavailable` error. A 4xx answer becomes `stream_rejected`
+  without echoing the URL or any credential. Neither is an unbounded
+  reconnect loop.
+- Symphonia decodes FLAC, MP3, OGG/Vorbis, M4A/AAC, and WAV locally. Symphonia
+  has no Opus decoder, so Opus material relies on server-side transcoding
+  (set `format` to `mp3`/`flac`/`wav`/`ogg` to force one).
 
-The production process uses a current-thread Tokio control runtime. Librespot's
-separate blocking player runtime is capped at two workers by the systemd unit;
-one worker was deliberately not used because fetching, preloading, and decoding
-must remain able to overlap. Player position is published once per second,
-matching the UI timer while Quickshell interpolates between updates. Backend
-state is held in one watch channel, unchanged events are discarded, commands
-are bounded, and MPRIS emits `Seeked` only for an actual seek event. MPRIS uses
-the library-recommended PID-qualified instance name so a stray second backend
-cannot take the supervised process's bus ownership.
+## Engine structure
 
-If librespot's session task ends, the backend replaces only its Session and
-Spirc pair. The socket, MPRIS name, player, and command queue remain alive.
-Five reconnects are allowed in ten minutes; exceeding that limit exits so
-systemd can perform the existing clean restart.
+The current-thread Tokio runtime keeps the socket, MPRIS, and state updates;
+the playback pipeline runs on a dedicated std thread that owns the rodio
+player and talks to the async side over channels: commands flow in through a
+single FIFO (a queued Pause can never be overtaken by a later transport
+action, and replies ride the same request machinery as before), and
+diff-only playback events flow out into the state watch. If the pipeline
+thread ends unexpectedly the process exits with the typed failure codes so
+systemd's `RestartPreventExitStatus` stays meaningful. Backend state is held
+in one watch channel, unchanged events are discarded, commands are bounded,
+and MPRIS emits `Seeked` only for an actual seek event. MPRIS uses the
+PID-qualified instance name so a stray second backend cannot take the
+supervised process's bus ownership.
 
-## Future work
-
-- [ ] Add Spotify Lossless only when Spotify exposes a supported third-party
-  playback path. Live HiFi-capability probes on 2026-08-16 across six varied
-  catalog tracks returned only `OGG_VORBIS_320`; librespot's maintainers report
-  that FLAC is absent from the normal metadata endpoint and that Spotify asked
-  the project not to circumvent its technical protections through extended
-  metadata. Keep 320 kbps as the stable maximum until that changes.
+Server credentials arrive over the socket with `configure_server` and are
+never logged, serialized into state, or echoed in an error message. The
+password is consumed by the token-auth builder on every request; the shared
+state carries only the username and a `session_connected` flag that flips on
+without a network probe (connectivity problems surface as typed stream
+errors instead).
 
 Build and verify from the repository root:
 
@@ -60,15 +79,14 @@ cargo clippy --manifest-path backend/Cargo.toml --locked --all-targets -- -D war
 OMARCHY_NAVIDROME_BUILD_FROM_SOURCE=1 ./scripts/build-backend.sh
 ```
 
-By default, `scripts/build-backend.sh` first tries the exact-commit attested
-release. `OMARCHY_NAVIDROME_BUILD_FROM_SOURCE=1` forces an auditable local build
-into `$XDG_CACHE_HOME/omarchy-navidrome/target` (override with
-`CARGO_TARGET_DIR`). Omarchy hot-reloads plugins on any write inside their
-directory, so building to a cache path outside the plugin prevents the shell's
-recursive watcher from reloading the plugin and killing the build.
+The backend builds from source into `$XDG_CACHE_HOME/omarchy-navidrome/target`
+(override with `CARGO_TARGET_DIR`). Omarchy hot-reloads plugins on any write
+inside their directory, so building to a cache path outside the plugin
+prevents the shell's recursive watcher from reloading the plugin and killing
+the build.
 
-See [the protocol reference](../docs/BACKEND_PROTOCOL.md) for the compatibility
-contract and [release process](../docs/RELEASING.md) for the artifact-provenance
-requirements. The legacy `omarchy-navidrome-spotifyd.service` remains installable as a
-fallback and conflicts with the primary unit so two local receivers cannot run
-accidentally with the same device identity.
+See [the protocol reference](../docs/BACKEND_PROTOCOL.md) for the
+compatibility contract and [release process](../docs/RELEASING.md) for the
+release requirements. The legacy `omarchy-navidrome-spotifyd.service` remains
+installable as a fallback and conflicts with the primary unit so two local
+receivers cannot run accidentally with the same device identity.

@@ -7,7 +7,7 @@ use tokio::sync::watch;
 
 use crate::{
     engine::{EngineSender, send_without_reply},
-    protocol::{Command, PlaybackStatus, RepeatMode},
+    protocol::{Command, PlaybackStatus, RepeatMode, SongRef},
     state::StateStore,
 };
 
@@ -51,13 +51,14 @@ impl RootInterface for MprisAdapter {
         Ok(false)
     }
     async fn identity(&self) -> fdo::Result<String> {
-        Ok("Omarchy Navidrome (librespot)".into())
+        Ok("Omarchy Navidrome (navidrome-stream)".into())
     }
     async fn desktop_entry(&self) -> fdo::Result<String> {
         Ok("omarchy-navidrome".into())
     }
     async fn supported_uri_schemes(&self) -> fdo::Result<Vec<String>> {
-        Ok(vec!["spotify".into()])
+        // Song ids are opaque Subsonic strings, not URI schemes.
+        Ok(Vec::new())
     }
     async fn supported_mime_types(&self) -> fdo::Result<Vec<String>> {
         Ok(Vec::new())
@@ -105,7 +106,7 @@ impl PlayerInterface for MprisAdapter {
         let position_ms = position.as_millis();
         let valid = self.state.with(|state| {
             state.track.as_ref().is_some_and(|track| {
-                track_id == track_id_for(&track.uri)
+                track_id == track_id_for(&track.id)
                     && position_ms >= 0
                     && position_ms <= i64::from(track.duration_ms)
             })
@@ -119,18 +120,13 @@ impl PlayerInterface for MprisAdapter {
     }
 
     async fn open_uri(&self, uri: String) -> fdo::Result<()> {
-        let is_context = [
-            "spotify:album:",
-            "spotify:artist:",
-            "spotify:playlist:",
-            "spotify:show:",
-        ]
-        .iter()
-        .any(|prefix| uri.starts_with(prefix));
+        // Subsonic song ids are opaque strings; remote controllers hand them
+        // over without surrounding metadata, which the engine accepts.
         self.send(Command::Load {
-            context_uri: is_context.then_some(uri.clone()),
-            uris: if is_context { Vec::new() } else { vec![uri] },
-            offset_uri: None,
+            songs: vec![SongRef {
+                id: uri,
+                ..SongRef::default()
+            }],
             offset_index: None,
             position_ms: 0,
             play: true,
@@ -305,7 +301,7 @@ fn metadata(state: &crate::protocol::BackendState) -> Metadata {
         return Metadata::new();
     };
     let mut metadata = Metadata::new();
-    metadata.set_trackid(Some(track_id_for(&track.uri)));
+    metadata.set_trackid(Some(track_id_for(&track.id)));
     metadata.set_length(Some(Time::from_millis(i64::from(track.duration_ms))));
     if !track.art_url.is_empty() {
         metadata.set_art_url(Some(track.art_url.clone()));
@@ -317,22 +313,24 @@ fn metadata(state: &crate::protocol::BackendState) -> Metadata {
         metadata.set_artist(Some(track.artists.clone()));
     }
     metadata.set_title(Some(track.title.clone()));
-    metadata.set_url(Some(track.uri.clone()));
+    metadata.set_url(Some(track.id.clone()));
     metadata
 }
 
-fn track_id_for(uri: &str) -> TrackId {
-    let mut id = uri
+fn track_id_for(id: &str) -> TrackId {
+    let mut track_id = id
         .rsplit(':')
         .next()
         .unwrap_or("track")
         .chars()
-        .filter(|character| character.is_ascii_alphanumeric() || *character == '_')
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        })
         .collect::<String>();
-    if id.is_empty() {
-        id = "track".to_string();
+    if track_id.is_empty() {
+        track_id = "track".to_string();
     }
-    TrackId::try_from(format!("/com/github/QuickshellSpotify/track/{id}"))
+    TrackId::try_from(format!("/com/github/QuickshellSpotify/track/{track_id}"))
         .unwrap_or(TrackId::NO_TRACK)
 }
 
@@ -346,14 +344,14 @@ mod tests {
     use crate::protocol::{BackendState, Track};
 
     #[test]
-    fn metadata_preserves_spotify_uri_for_qml() {
+    fn metadata_preserves_subsonic_id_for_qml() {
         let state = BackendState {
             track: Some(Track {
-                uri: "spotify:track:abc123".into(),
+                id: "ab12-cd.34".into(),
                 title: "A title".into(),
                 artists: vec!["An artist".into()],
                 album: "An album".into(),
-                art_url: "https://i.scdn.co/image/example".into(),
+                art_url: "https://nav.example/rest/getCoverArt?u=user".into(),
                 duration_ms: 42_000,
                 item_type: "track".into(),
             }),
@@ -361,7 +359,7 @@ mod tests {
         };
         let metadata = metadata(&state);
         assert_eq!(metadata.title(), Some("A title"));
-        assert_eq!(metadata.url().as_deref(), Some("spotify:track:abc123"));
+        assert_eq!(metadata.url().as_deref(), Some("ab12-cd.34"));
         assert_eq!(metadata.length(), Some(Time::from_millis(42_000)));
     }
 

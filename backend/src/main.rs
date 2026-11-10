@@ -5,6 +5,7 @@ mod mpris;
 mod protocol;
 mod socket;
 mod state;
+mod stream;
 
 use std::path::PathBuf;
 
@@ -22,7 +23,7 @@ struct Cli {
     config_path: Option<PathBuf>,
     #[arg(long, global = true)]
     socket_path: Option<PathBuf>,
-    /// Override the configured Connect device name (useful for parallel A/B testing).
+    /// Override the configured player name (useful for parallel A/B testing).
     #[arg(long, global = true)]
     device_name: Option<String>,
     #[command(subcommand)]
@@ -33,11 +34,6 @@ struct Cli {
 enum Action {
     /// Validate configuration without connecting to Navidrome.
     Check,
-    /// Authorize local playback and store a private reusable credential.
-    Authenticate {
-        #[arg(long, default_value_t = 8000)]
-        oauth_port: u16,
-    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -57,8 +53,6 @@ async fn main() -> std::process::ExitCode {
                 .unwrap_or(failure::Failure::Transient);
             if daemon {
                 let _ = failure::record(&socket, kind);
-            }
-            if daemon {
                 eprintln!("Playback failed: {kind}");
             } else {
                 eprintln!("{error:#}");
@@ -88,9 +82,6 @@ async fn launch(cli: Cli) -> Result<()> {
         Some(Action::Check) => {
             println!("{}", serde_json::to_string(&config.summary())?);
             return Ok(());
-        }
-        Some(Action::Authenticate { oauth_port }) => {
-            return engine::authenticate(&config, oauth_port).await;
         }
         None => {}
     }
@@ -138,8 +129,8 @@ async fn run(config: BackendConfig, socket_path: PathBuf) -> Result<()> {
         }
         _ = requested_shutdown.changed() => {}
         result = runtime.wait_done() => {
-            result.context("librespot engine stopped")?;
-            anyhow::bail!("librespot engine stopped unexpectedly");
+            result.context("stream engine stopped")?;
+            anyhow::bail!("stream engine stopped unexpectedly");
         }
         result = &mut mpris_task => {
             match result {

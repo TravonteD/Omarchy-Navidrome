@@ -1,6 +1,28 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
+pub const ENGINE_NAME: &str = "navidrome-stream";
+
+/// Song reference sent by the QML layer with metadata it already has. Only
+/// `id` (the Subsonic song id) is required for playback; every other field is
+/// optional metadata used for immediate UI feedback. The engine streams by id
+/// regardless of whether the other fields are populated.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SongRef {
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub artists: Vec<String>,
+    #[serde(default)]
+    pub album: String,
+    #[serde(default)]
+    pub duration_ms: u32,
+    #[serde(default)]
+    pub cover_art: String,
+    #[serde(default)]
+    pub track: Option<u32>,
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct Request {
@@ -16,7 +38,6 @@ pub enum Command {
     Hello,
     Ping,
     GetState,
-    Activate,
     Play,
     Pause,
     Toggle,
@@ -35,13 +56,17 @@ pub enum Command {
     SetRepeat {
         mode: RepeatMode,
     },
+    /// Identity + credentials for the Navidrome server, kept in engine memory
+    /// only. Never logged, never serialized into state, never echoed in an
+    /// error message.
+    ConfigureServer {
+        url: String,
+        username: String,
+        password: String,
+    },
     Load {
         #[serde(default)]
-        context_uri: Option<String>,
-        #[serde(default)]
-        uris: Vec<String>,
-        #[serde(default)]
-        offset_uri: Option<String>,
+        songs: Vec<SongRef>,
         #[serde(default)]
         offset_index: Option<u32>,
         #[serde(default)]
@@ -50,12 +75,22 @@ pub enum Command {
         play: bool,
     },
     AddToQueue {
-        uri: String,
+        song: SongRef,
     },
 }
 
 const fn default_true() -> bool {
     true
+}
+
+impl SongRef {
+    #[cfg(test)]
+    fn default_with_id(id: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -89,10 +124,14 @@ pub enum PlaybackStatus {
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct Track {
-    pub uri: String,
+    /// Subsonic song id (was `uri` under the Spotify protocol).
+    pub id: String,
     pub title: String,
     pub artists: Vec<String>,
     pub album: String,
+    /// getCoverArt URL built by the backend including its auth token params.
+    /// This is the one place credentials ride in a URL (served to the UI as an
+    /// image source); it must never appear in a log line or error message.
     pub art_url: String,
     pub duration_ms: u32,
     pub item_type: String,
@@ -126,7 +165,7 @@ impl Default for BackendState {
         Self {
             protocol_version: PROTOCOL_VERSION,
             backend_version: env!("CARGO_PKG_VERSION").to_string(),
-            engine: "librespot".to_string(),
+            engine: ENGINE_NAME.to_string(),
             lifecycle: Lifecycle::Starting,
             session_connected: false,
             username: String::new(),
@@ -208,21 +247,97 @@ mod tests {
     #[test]
     fn request_is_flat_and_versioned() {
         let request: Request =
-            serde_json::from_str(r#"{"v":1,"id":7,"command":"seek","position_ms":1234}"#).unwrap();
+            serde_json::from_str(r#"{"v":2,"id":7,"command":"seek","position_ms":1234}"#).unwrap();
         assert_eq!(request.v, PROTOCOL_VERSION);
         assert_eq!(request.id, 7);
         assert_eq!(request.command, Command::Seek { position_ms: 1234 });
     }
 
     #[test]
-    fn load_defaults_to_playing() {
+    fn load_defaults_to_playing_from_the_first_song() {
         let request: Request =
-            serde_json::from_str(r#"{"v":1,"id":1,"command":"load","uris":["spotify:track:abc"]}"#)
+            serde_json::from_str(r#"{"v":2,"id":1,"command":"load","songs":[{"id":"42"}]}"#)
                 .unwrap();
-        let Command::Load { play, .. } = request.command else {
+        let Command::Load {
+            songs,
+            offset_index,
+            position_ms,
+            play,
+        } = request.command
+        else {
             panic!("expected load command");
         };
+        assert_eq!(songs, vec![SongRef::default_with_id("42")]);
+        assert_eq!(offset_index, None);
+        assert_eq!(position_ms, 0);
         assert!(play);
+    }
+
+    #[test]
+    fn song_ref_accepts_partial_metadata() {
+        let song: SongRef = serde_json::from_str(
+            r#"{"id":"a1","title":"Song","artists":["Artist"],"album":"Album","duration_ms":180000,"cover_art":"c1","track":3}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            song,
+            SongRef {
+                id: "a1".into(),
+                title: "Song".into(),
+                artists: vec!["Artist".into()],
+                album: "Album".into(),
+                duration_ms: 180_000,
+                cover_art: "c1".into(),
+                track: Some(3),
+            }
+        );
+
+        let minimal: SongRef = serde_json::from_str(r#"{"id":"a2"}"#).unwrap();
+        assert!(minimal.title.is_empty());
+        assert!(minimal.artists.is_empty());
+        assert_eq!(minimal.duration_ms, 0);
+        assert_eq!(minimal.track, None);
+    }
+
+    #[test]
+    fn configure_server_parses_without_echoing_secrets() {
+        let request: Request = serde_json::from_str(
+            r#"{"v":2,"id":2,"command":"configure_server","url":"https://nav.example","username":"user","password":"hunter2"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            request.command,
+            Command::ConfigureServer {
+                url: "https://nav.example".into(),
+                username: "user".into(),
+                password: "hunter2".into(),
+            }
+        );
+        // The shared state carries no credential-shaped fields at all.
+        let state_json = serde_json::to_value(BackendState::default()).unwrap();
+        let keys = state_json.as_object().unwrap();
+        assert!(keys.get("password").is_none());
+        assert!(keys.get("url").is_none());
+        assert!(keys.get("server_url").is_none());
+        assert_eq!(keys["engine"], ENGINE_NAME);
+    }
+
+    #[test]
+    fn add_to_queue_carries_a_song_reference() {
+        let request: Request = serde_json::from_str(
+            r#"{"v":2,"id":3,"command":"add_to_queue","song":{"id":"77","title":"B-side"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            request.command,
+            Command::AddToQueue {
+                song: SongRef {
+                    id: "77".into(),
+                    title: "B-side".into(),
+                    ..SongRef::default()
+                }
+            }
+        );
     }
 
     #[test]
@@ -235,8 +350,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!(value["type"], "event");
-        assert_eq!(value["v"], 1);
-        assert_eq!(value["state"]["engine"], "librespot");
+        assert_eq!(value["v"], 2);
+        assert_eq!(value["state"]["engine"], "navidrome-stream");
         assert!(value["state"].get("error_code").is_none());
         assert!(value["state"].get("seek_sequence").is_none());
     }
@@ -244,8 +359,8 @@ mod tests {
     #[test]
     fn state_event_includes_machine_readable_errors() {
         let state = BackendState {
-            error_code: "audio_key_unavailable".to_string(),
-            error: "Try another Spotify Connect device".to_string(),
+            error_code: "stream_rejected".to_string(),
+            error: "Navidrome rejected the stream request".to_string(),
             ..BackendState::default()
         };
         let value = serde_json::to_value(ServerMessage::Event {
@@ -255,7 +370,23 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(value["state"]["error_code"], "audio_key_unavailable");
+        assert_eq!(value["state"]["error_code"], "stream_rejected");
         assert_eq!(value["state"]["error"], state.error);
+    }
+
+    #[test]
+    fn track_serializes_with_the_subsonic_id_field() {
+        let track = Track {
+            id: "42".into(),
+            title: "Song".into(),
+            artists: vec!["Artist".into()],
+            album: "Album".into(),
+            art_url: "https://nav.example/rest/getCoverArt?u=user".into(),
+            duration_ms: 42_000,
+            item_type: "track".into(),
+        };
+        let value = serde_json::to_value(&track).unwrap();
+        assert_eq!(value["id"], "42");
+        assert!(value.get("uri").is_none());
     }
 }
