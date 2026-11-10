@@ -206,6 +206,429 @@ function queryEscape(key, value) {
   return encodeURIComponent(key) + "=" + encodeURIComponent(value)
 }
 
+// ------ defensive node parsing shared by every endpoint normalizer -----------
+
+// Bounded numeric coercion: empty and non-finite input yields the fallback
+// (0 unless given), negatives clamp to zero. Some servers send numbers as
+// strings; both shapes must land on the same value.
+function boundedNumber(value, fallback) {
+  if (value === "" || value === null || value === undefined) {
+    return fallback === undefined ? 0 : fallback
+  }
+  var n = Number(value)
+  if (!isFinite(n)) return fallback === undefined ? 0 : fallback
+  if (n < 0) return 0
+  return n
+}
+
+function text(value) {
+  return value === null || value === undefined ? "" : String(value)
+}
+
+// Subsonic JSON uses real booleans; the string "false" must stay false.
+function strictTrue(value) {
+  return value === true
+}
+
+function hasId(node) {
+  return !!node && node.id !== null && node.id !== undefined
+    && String(node.id) !== ""
+}
+
+// Flattens a repeated-key container (array, single node, or absent) through
+// `normalize`, dropping everything it rejects.
+function listOf(node, key, normalize) {
+  if (!node || typeof node !== "object") return []
+  var child = node[key]
+  if (!child || typeof child !== "object") return []
+  var items = child instanceof Array ? child : [child]
+  var out = []
+  for (var i = 0; i < items.length; i++) {
+    var normalized = normalize(items[i])
+    if (normalized !== null) out.push(normalized)
+  }
+  return out
+}
+
+// Any mix of scalars and arrays into a clean string list (repeated keys).
+function idList(value) {
+  var items = value instanceof Array ? value
+    : (value === null || value === undefined ? [] : [value])
+  var out = []
+  for (var i = 0; i < items.length; i++) {
+    if (items[i] !== null && items[i] !== undefined && String(items[i]) !== "") {
+      out.push(String(items[i]))
+    }
+  }
+  return out
+}
+
+// ------ node shapes -----------------------------------------------------------
+
+// IDs are always strings; entries without one are dropped by the callers.
+function normalizeSong(node) {
+  if (!hasId(node)) return null
+  return {
+    id: String(node.id),
+    title: text(node.title),
+    artist: text(node.artist),
+    artistId: text(node.artistId),
+    album: text(node.album),
+    albumId: text(node.albumId),
+    duration: boundedNumber(node.duration, 0),
+    track: boundedNumber(node.track, 0),
+    year: boundedNumber(node.year, null),
+    genre: text(node.genre),
+    coverArt: text(node.coverArt),
+    starred: strictTrue(node.starred),
+    played: typeof node.played === "string" ? node.played : null,
+    suffix: text(node.suffix),
+    bitRate: boundedNumber(node.bitRate, 0),
+    size: boundedNumber(node.size, 0),
+    contentType: text(node.contentType),
+    isVideo: strictTrue(node.isVideo),
+    path: text(node.path)
+  }
+}
+
+function normalizeAlbum(node) {
+  if (!hasId(node)) return null
+  return {
+    id: String(node.id),
+    name: text(node.name),
+    artist: text(node.artist),
+    artistId: text(node.artistId),
+    coverArt: text(node.coverArt),
+    songCount: boundedNumber(node.songCount, 0),
+    duration: boundedNumber(node.duration, 0),
+    year: boundedNumber(node.year, null),
+    genre: text(node.genre),
+    starred: strictTrue(node.starred),
+    played: typeof node.played === "string" ? node.played : null
+  }
+}
+
+function normalizeArtist(node) {
+  if (!hasId(node)) return null
+  return {
+    id: String(node.id),
+    name: text(node.name),
+    coverArt: text(node.coverArt),
+    albumCount: boundedNumber(node.albumCount, 0),
+    starred: strictTrue(node.starred)
+  }
+}
+
+function normalizePlaylist(node) {
+  if (!hasId(node)) return null
+  return {
+    id: String(node.id),
+    name: text(node.name),
+    comment: text(node.comment),
+    owner: text(node.owner),
+    public: strictTrue(node.public),
+    songCount: boundedNumber(node.songCount, 0),
+    duration: boundedNumber(node.duration, 0),
+    created: text(node.created),
+    changed: text(node.changed),
+    coverArt: text(node.coverArt),
+    starred: strictTrue(node.starred)
+  }
+}
+
+// ------ connection probe: license, user, typed probe errors -------------------
+
+// ping + getUser + getLicense run before any heavy listing; each parses
+// defensively so a hostile server can never throw in the probe path.
+function parseLicense(data) {
+  var node = data && typeof data === "object" ? data.license : null
+  if (!node || typeof node !== "object") {
+    return {ok: false, trial: false, expires: null}
+  }
+  var expires = typeof node.expires === "string" && node.expires !== ""
+    ? node.expires
+    : (typeof node.trialExpires === "string" && node.trialExpires !== ""
+      ? node.trialExpires : null)
+  return {
+    ok: strictTrue(node.valid),
+    trial: node.trialExpires !== null && node.trialExpires !== undefined,
+    expires: expires
+  }
+}
+
+var USER_ROLES = [
+  "adminRole", "settingsRole", "streamRole", "downloadRole", "uploadRole",
+  "playlistRole", "coverArtRole", "commentRole", "podcastRole", "shareRole",
+  "jukeboxRole", "scanRole"
+]
+
+// getUser nests under `user`; roles are strictly-true booleans.
+function parseUser(data) {
+  var node = data && typeof data === "object" ? data.user : null
+  if (!node || typeof node !== "object") return null
+  var user = {username: text(node.username)}
+  for (var i = 0; i < USER_ROLES.length; i++) {
+    user[USER_ROLES[i]] = strictTrue(node[USER_ROLES[i]])
+  }
+  return user
+}
+
+// One short line per existing error category; a passing probe reports none.
+function describeProbeError(parsed) {
+  if (parsed && typeof parsed === "object" && parsed.ok === true) return ""
+  var category = errorCategory(
+    parsed && typeof parsed === "object" ? parsed.errorCode : 0)
+  switch (category) {
+    case "wrongCredentials": return "Wrong username or password"
+    case "tokenAuthRejected": return "The server rejected token authentication"
+    case "notAuthorized": return "This user is not authorized to use the server"
+    case "subscriptionExpired": return "The server license has expired"
+    case "outdatedClient": return "The server needs a newer client version"
+    case "serverError": return "The server hit an internal error"
+    case "missingParameter": return "The server rejected the request"
+    case "notFound": return "The server endpoint was not found"
+    default: return "Could not reach the server"
+  }
+}
+
+// ------ search3 and album windows ---------------------------------------------
+
+var SEARCH3_WINDOWS = [
+  "artistCount", "artistOffset", "albumCount", "albumOffset",
+  "songCount", "songOffset"
+]
+
+// Per-category windows, no Lucene: the trimmed query is the only required
+// input; zero and absent counts/offsets are omitted entirely.
+function search3Params(query, limits) {
+  var trimmed = text(query).trim()
+  if (trimmed === "") return null
+  var params = {q: trimmed}
+  var source = limits && typeof limits === "object" ? limits : {}
+  for (var i = 0; i < SEARCH3_WINDOWS.length; i++) {
+    var count = boundedNumber(source[SEARCH3_WINDOWS[i]], 0)
+    if (count > 0) params[SEARCH3_WINDOWS[i]] = count
+  }
+  var folder = source.musicFolderId
+  if (folder !== null && folder !== undefined && String(folder) !== "") {
+    params.musicFolderId = String(folder)
+  }
+  return params
+}
+
+function parseSearch3(data) {
+  var node = data && typeof data === "object" ? data.searchResult3 : null
+  return {
+    artists: listOf(node, "artist", normalizeArtist),
+    albums: listOf(node, "album", normalizeAlbum),
+    songs: listOf(node, "song", normalizeSong)
+  }
+}
+
+var ALBUM_LIST_TYPES = [
+  "random", "newest", "highest", "frequent", "recent", "starred",
+  "alphabeticalByName", "alphabeticalByArtist", "byYear", "byGenre"
+]
+
+// getAlbumList2 window; unknown types are rejected so typos never build
+// URLs. `extra` carries genre/fromYear/toYear/musicFolderId for the types
+// that need them.
+function albumList2Params(type, size, offset, extra) {
+  var known = false
+  for (var i = 0; i < ALBUM_LIST_TYPES.length; i++) {
+    if (ALBUM_LIST_TYPES[i] === type) known = true
+  }
+  if (!known) return null
+  var params = {type: type}
+  var wanted = boundedNumber(size, 0)
+  if (wanted > 0) params.size = wanted
+  var skip = boundedNumber(offset, 0)
+  if (skip > 0) params.offset = skip
+  var source = extra && typeof extra === "object" ? extra : {}
+  if (text(source.genre) !== "") params.genre = text(source.genre)
+  if (text(source.fromYear) !== "") params.fromYear = text(source.fromYear)
+  if (text(source.toYear) !== "") params.toYear = text(source.toYear)
+  if (source.musicFolderId !== null && source.musicFolderId !== undefined
+    && String(source.musicFolderId) !== "") {
+    params.musicFolderId = String(source.musicFolderId)
+  }
+  return params
+}
+
+// getAlbumList2, with the legacy getAlbumList container also accepted.
+function parseAlbumList(data) {
+  if (!data || typeof data !== "object") return []
+  var node = data.albumList2 ? data.albumList2 : data.albumList
+  return listOf(node, "album", normalizeAlbum)
+}
+
+// ------ artist, album detail, top songs, genres -------------------------------
+
+function parseArtist(data) {
+  var node = data && typeof data === "object" ? data.artist : null
+  var artist = normalizeArtist(node)
+  return {
+    artist: artist,
+    albums: artist === null ? [] : listOf(node, "album", normalizeAlbum)
+  }
+}
+
+function parseAlbum(data) {
+  var node = data && typeof data === "object" ? data.album : null
+  var album = normalizeAlbum(node)
+  return {
+    album: album,
+    songs: album === null ? [] : listOf(node, "song", normalizeSong)
+  }
+}
+
+// getTopSongs arrives under artist.topSongs in Navidrome; an artist without
+// top songs parses to [].
+function parseTopSongs(data) {
+  var artist = data && typeof data === "object" ? data.artist : null
+  var top = artist && typeof artist === "object" ? artist.topSongs : null
+  return listOf(top, "song", normalizeSong)
+}
+
+// Genres key on `value`, not on an id.
+function parseGenres(data) {
+  return listOf(data && typeof data === "object" ? data.genres : null,
+    "genre", function(node) {
+      var value = node && typeof node === "object" ? text(node.value) : ""
+      if (value === "") return null
+      return {
+        value: value,
+        songCount: boundedNumber(node.songCount, 0),
+        albumCount: boundedNumber(node.albumCount, 0)
+      }
+    })
+}
+
+// ------ playlists --------------------------------------------------------------
+
+function parsePlaylists(data) {
+  return listOf(data && typeof data === "object" ? data.playlists : null,
+    "playlist", normalizePlaylist)
+}
+
+function parsePlaylist(data) {
+  var node = data && typeof data === "object" ? data.playlist : null
+  var playlist = normalizePlaylist(node)
+  return {
+    playlist: playlist,
+    entries: playlist === null ? [] : listOf(node, "entry", normalizeSong)
+  }
+}
+
+// createPlaylist updates when playlistId is given; otherwise a non-empty
+// name is required. songId rides repeated keys.
+function createPlaylistParams(name, songIds, playlistId) {
+  var params = {}
+  if (playlistId !== null && playlistId !== undefined
+    && String(playlistId) !== "") {
+    params.playlistId = String(playlistId)
+  } else {
+    var trimmed = text(name).trim()
+    if (trimmed === "") return null
+    params.name = trimmed
+  }
+  var ids = idList(songIds)
+  if (ids.length) params.songId = ids
+  return params
+}
+
+// updatePlaylist patches in place: repeated songIdToAdd/songIndexToRemove
+// keys, an explicit "true"/"false" for public, and only present changes.
+function updatePlaylistParams(playlistId, changes) {
+  var id = playlistId === null || playlistId === undefined ? "" : String(playlistId)
+  if (id === "") return null
+  var source = changes && typeof changes === "object" ? changes : {}
+  var params = {playlistId: id}
+  if (text(source.name).trim() !== "") params.name = text(source.name).trim()
+  if (text(source.comment).trim() !== "") params.comment = text(source.comment).trim()
+  if (source.public === true) params.public = "true"
+  else if (source.public === false) params.public = "false"
+  var adds = idList(source.songIdToAdd)
+  if (adds.length) params.songIdToAdd = adds
+  var removals = idList(source.songIndexToRemove)
+  if (removals.length) params.songIndexToRemove = removals
+  return params
+}
+
+function deletePlaylistParams(id) {
+  var key = id === null || id === undefined ? "" : String(id)
+  return key === "" ? null : {id: key}
+}
+
+// ------ star, rating, scrobble -------------------------------------------------
+
+// Any mix of song, album, and artist ids, repeated keys per id kind. A call
+// with no ids at all is rejected so empty stars never hit the wire.
+function starParams(ids) {
+  return starActionParams(ids)
+}
+
+function unstarParams(ids) {
+  return starActionParams(ids)
+}
+
+function starActionParams(ids) {
+  if (!ids || typeof ids !== "object") return null
+  var params = {}
+  var count = 0
+  var kinds = ["id", "albumId", "artistId"]
+  for (var i = 0; i < kinds.length; i++) {
+    var list = idList(ids[kinds[i]])
+    if (list.length) {
+      params[kinds[i]] = list
+      count += list.length
+    }
+  }
+  return count ? params : null
+}
+
+// Rating is an integer 0..5: rounded, clamped, rejected when absent.
+function setRatingParams(id, rating) {
+  var key = id === null || id === undefined ? "" : String(id)
+  if (key === "") return null
+  if (rating === null || rating === undefined || rating === "") return null
+  var value = Number(rating)
+  if (!isFinite(value)) return null
+  value = Math.round(value)
+  if (value < 0) value = 0
+  if (value > 5) value = 5
+  return {id: key, rating: String(value)}
+}
+
+// submission=true is the scrobble; submission=false marks a play start. time
+// is an optional millisecond epoch.
+function scrobbleParams(id, submission, time) {
+  var key = id === null || id === undefined ? "" : String(id)
+  if (key === "") return null
+  var params = {id: key}
+  if (submission === true) params.submission = "true"
+  else if (submission === false) params.submission = "false"
+  var at = Number(time)
+  if (time !== null && time !== undefined && isFinite(at) && at >= 0) {
+    params.time = String(Math.round(at))
+  }
+  return params
+}
+
+// ------ artwork URLs -----------------------------------------------------------
+
+// Full getCoverArt URL, built over the pinned-salt request builder. Null is
+// the UI contract for "no artwork"; a missing server or id yields null.
+function coverArtUrl(serverUrl, coverArtId, size, auth, randomSource) {
+  var id = coverArtId === null || coverArtId === undefined ? "" : String(coverArtId)
+  if (id === "") return null
+  var params = {id: id}
+  var wanted = boundedNumber(size, 0)
+  if (wanted > 0) params.size = wanted
+  var built = requestUrl(serverUrl, "getCoverArt", auth, params, randomSource)
+  return built ? built.url : null
+}
+
 // ------ md5 (RFC 1321) over UTF-8 text; reference vectors live in the tests ----
 
 var MD5_K = [

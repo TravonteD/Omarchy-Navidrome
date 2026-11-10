@@ -138,4 +138,464 @@ TestCase {
     compare(Subsonic.errorCategory(70), "notFound")
     compare(Subsonic.errorCategory(1234), "generic")
   }
+
+  // ------ connection probe parsing ------
+
+  function test_parseLicense_acceptsValidTrialAndMissing() {
+    var licensed = Subsonic.parseLicense({
+      license: {valid: true, email: "alice@example.net",
+        expires: "2027-01-01T00:00:00Z"}})
+    verify(licensed.ok)
+    verify(!licensed.trial)
+    compare(licensed.expires, "2027-01-01T00:00:00Z")
+    var trial = Subsonic.parseLicense({
+      license: {valid: true, trialExpires: "2026-12-01T00:00:00Z"}})
+    verify(trial.ok)
+    verify(trial.trial)
+    compare(trial.expires, "2026-12-01T00:00:00Z")
+    var invalid = Subsonic.parseLicense({
+      license: {valid: false, email: "alice@example.net"}})
+    verify(!invalid.ok)
+    verify(!invalid.trial)
+    verify(invalid.expires === null)
+    // Missing or malformed nodes parse defensively to not-ok.
+    verify(Subsonic.parseLicense({}).ok === false)
+    verify(Subsonic.parseLicense(null).ok === false)
+    verify(Subsonic.parseLicense("garbage").ok === false)
+  }
+
+  function test_parseUser_readsRolesAsStrictBooleans() {
+    var parsed = Subsonic.parseUser({
+      user: {
+        username: "alice",
+        adminRole: true,
+        settingsRole: false,
+        streamRole: true,
+        downloadRole: "true",
+        uploadRole: false,
+        playlistRole: true,
+        coverArtRole: false,
+        commentRole: false,
+        podcastRole: false,
+        shareRole: false,
+        jukeboxRole: false,
+        scanRole: true
+      }})
+    compare(parsed.username, "alice")
+    verify(parsed.adminRole)
+    verify(!parsed.settingsRole)
+    verify(parsed.streamRole)
+    // The string "true" is not a Subsonic boolean.
+    verify(!parsed.downloadRole)
+    verify(parsed.playlistRole)
+    verify(parsed.scanRole)
+    verify(!parsed.coverArtRole)
+    verify(Subsonic.parseUser({}) === null)
+    verify(Subsonic.parseUser({"user": "alice"}) === null)
+  }
+
+  function test_describeProbeError_staysWithinKnownCategories() {
+    compare(Subsonic.describeProbeError({ok: false, errorCode: 40}),
+      "Wrong username or password")
+    compare(Subsonic.describeProbeError({ok: false, errorCode: 41}),
+      "The server rejected token authentication")
+    compare(Subsonic.describeProbeError({ok: false, errorCode: 60}),
+      "The server license has expired")
+    compare(Subsonic.describeProbeError({ok: false, errorCode: 0}),
+      "Could not reach the server")
+    compare(Subsonic.describeProbeError({ok: false, errorCode: 1234}),
+      "Could not reach the server")
+    compare(Subsonic.describeProbeError(null), "Could not reach the server")
+    compare(Subsonic.describeProbeError({ok: true, errorCode: 0}), "")
+  }
+
+  // ------ search3 ------
+
+  function test_search3Params_trimsQueryAndOmitsZeroWindows() {
+    var params = Subsonic.search3Params("  AC/DC  ", {
+      artistCount: 5, artistOffset: 0, albumCount: 20, albumOffset: 40,
+      songCount: 0, songOffset: undefined, musicFolderId: "7"})
+    compare(params.q, "AC/DC")
+    compare(params.artistCount, 5)
+    compare(params.albumCount, 20)
+    compare(params.albumOffset, 40)
+    compare(params.musicFolderId, "7")
+    verify(params.artistOffset === undefined)
+    verify(params.songCount === undefined)
+    verify(params.songOffset === undefined)
+    verify(Subsonic.search3Params("   ", {}) === null)
+    verify(Subsonic.search3Params("", null) === null)
+    verify(Subsonic.search3Params(undefined) === null)
+  }
+
+  function test_parseSearch3_normalizesCoercesAndDrops() {
+    var data = Subsonic.parseResponse({"subsonic-response": {
+      status: "ok",
+      searchResult3: {
+        artist: [
+          {id: 42, name: "Example Quartet", coverArt: "ar-42",
+            albumCount: "5", starred: true},
+          {name: "No identity"}
+        ],
+        album: [
+          {id: "al-1", name: "First Light", artist: "Example Quartet",
+            artistId: "42", coverArt: "al-1", songCount: 8,
+            duration: "1680", year: 2019, genre: "Ambient", starred: true,
+            played: "2026-01-02T03:04:05Z"}
+        ],
+        song: [
+          {id: 9001, title: "Opening", artist: "Example Quartet",
+            artistId: "42", album: "First Light", albumId: "al-1",
+            duration: 210, track: 1, year: 2019, genre: "Ambient",
+            coverArt: "al-1", starred: true,
+            played: "2026-01-02T03:04:05Z", suffix: "flac",
+            bitRate: "991", size: 32400000, contentType: "audio/flac",
+            isVideo: false,
+            path: "Example Quartet/First Light/01 Opening.flac"},
+          {title: "Identity-less", duration: 30}
+        ]
+      }}}).data
+    var parsed = Subsonic.parseSearch3(data)
+    compare(parsed.artists.length, 1)
+    compare(parsed.artists[0].id, "42")
+    compare(parsed.artists[0].name, "Example Quartet")
+    compare(parsed.artists[0].albumCount, 5)
+    verify(parsed.artists[0].starred)
+    compare(parsed.albums.length, 1)
+    compare(parsed.albums[0].id, "al-1")
+    compare(parsed.albums[0].duration, 1680)
+    compare(parsed.albums[0].year, 2019)
+    compare(parsed.albums[0].played, "2026-01-02T03:04:05Z")
+    compare(parsed.songs.length, 1)
+    compare(parsed.songs[0].id, "9001")
+    compare(parsed.songs[0].bitRate, 991)
+    compare(parsed.songs[0].size, 32400000)
+    compare(parsed.songs[0].track, 1)
+    compare(parsed.songs[0].contentType, "audio/flac")
+    verify(!parsed.songs[0].isVideo)
+    verify(parsed.songs[0].starred)
+  }
+
+  function test_parseSearch3_toleratesMalformedInput() {
+    var empty = Subsonic.parseSearch3(null)
+    compare(empty.artists.length, 0)
+    compare(empty.albums.length, 0)
+    compare(empty.songs.length, 0)
+    var bare = Subsonic.parseSearch3({"subsonic-response": {status: "ok"}})
+    compare(bare.songs.length, 0)
+    // Single nodes where arrays are expected, junk entries, and a
+    // string container must all survive without throwing.
+    var weird = Subsonic.parseSearch3({searchResult3: {
+      artist: {id: "42", name: "Solo", albumCount: 1},
+      album: ["junk", {id: "al-1", name: "First Light"}],
+      song: "not a list"
+    }})
+    compare(weird.artists.length, 1)
+    compare(weird.artists[0].id, "42")
+    compare(weird.albums.length, 1)
+    compare(weird.albums[0].name, "First Light")
+    compare(weird.songs.length, 0)
+  }
+
+  function test_parseSearch3_appliesDefaultsForMissingSongFields() {
+    var parsed = Subsonic.parseSearch3({searchResult3: {
+      song: [{id: "t-1", title: "Only Id And Title"}]}})
+    var song = parsed.songs[0]
+    compare(song.id, "t-1")
+    compare(song.duration, 0)
+    compare(song.track, 0)
+    verify(song.year === null)
+    verify(song.played === null)
+    verify(!song.starred)
+    verify(!song.isVideo)
+    compare(song.artist, "")
+    compare(song.album, "")
+    compare(song.path, "")
+  }
+
+  // ------ album windows ------
+
+  function test_albumList2Params_rejectsUnknownTypeAndOmitsZeroSize() {
+    var params = Subsonic.albumList2Params("newest", 20, 0, {})
+    compare(params.type, "newest")
+    compare(params.size, 20)
+    verify(params.offset === undefined)
+    verify(Subsonic.albumList2Params("recentlyAdded", 20) === null)
+    verify(Subsonic.albumList2Params(undefined, 20) === null)
+  }
+
+  function test_albumList2Params_carriesExtraFilters() {
+    var byYear = Subsonic.albumList2Params("byYear", 10, 30,
+      {fromYear: 2019, toYear: "2021"})
+    compare(byYear.fromYear, "2019")
+    compare(byYear.toYear, "2021")
+    compare(byYear.offset, 30)
+    var byGenre = Subsonic.albumList2Params("byGenre", 10, 0,
+      {genre: "Ambient", musicFolderId: "7"})
+    compare(byGenre.genre, "Ambient")
+    compare(byGenre.musicFolderId, "7")
+    verify(Subsonic.albumList2Params("random", 10, 0, null).genre === undefined)
+  }
+
+  function test_parseAlbumList_acceptsCurrentAndLegacyContainers() {
+    var current = Subsonic.parseResponse({"subsonic-response": {
+      status: "ok",
+      albumList2: {album: [
+        {id: "al-1", name: "First Light", artist: "Example Quartet",
+          artistId: "42", songCount: 8, duration: 1680, year: 2019},
+        {id: "al-3", name: "Later", songCount: "2", duration: "300"}
+      ]}}}).data
+    var albums = Subsonic.parseAlbumList(current)
+    compare(albums.length, 2)
+    compare(albums[0].id, "al-1")
+    compare(albums[1].songCount, 2)
+    var legacy = Subsonic.parseAlbumList({albumList: {
+      album: [{id: "al-9", name: "Old Shape", songCount: 1}]}})
+    compare(legacy.length, 1)
+    compare(legacy[0].id, "al-9")
+    compare(Subsonic.parseAlbumList(null).length, 0)
+    compare(Subsonic.parseAlbumList({}).length, 0)
+  }
+
+  // ------ artist and album detail ------
+
+  function test_parseArtist_splitsNodeAndNestedAlbums() {
+    var parsed = Subsonic.parseArtist({artist: {
+        id: "42", name: "Example Quartet", coverArt: "ar-42",
+        albumCount: 2, starred: true,
+        album: [
+          {id: "al-1", name: "First Light", songCount: 8, duration: 1680},
+          {id: "al-2", name: "Second Light", songCount: 6, duration: 1500}
+        ]
+      }})
+    compare(parsed.artist.id, "42")
+    compare(parsed.artist.name, "Example Quartet")
+    compare(parsed.artist.albumCount, 2)
+    verify(parsed.artist.starred)
+    compare(parsed.albums.length, 2)
+    compare(parsed.albums[1].id, "al-2")
+    var missing = Subsonic.parseArtist(null)
+    verify(missing.artist === null)
+    compare(missing.albums.length, 0)
+  }
+
+  function test_parseAlbum_splitsNodeAndNestedSongs() {
+    var parsed = Subsonic.parseAlbum({album: {
+        id: "al-1", name: "First Light", artist: "Example Quartet",
+        artistId: "42", coverArt: "al-1", songCount: 2, duration: 420,
+        year: 2019, genre: "Ambient",
+        song: [
+          {id: "t-1", title: "Opening", duration: 210, track: 1,
+            suffix: "flac", contentType: "audio/flac",
+            path: "Example Quartet/First Light/01 Opening.flac"},
+          {id: "t-2", title: "Closing", duration: "210", track: "2"}
+        ]
+      }})
+    compare(parsed.album.id, "al-1")
+    compare(parsed.album.songCount, 2)
+    compare(parsed.album.duration, 420)
+    compare(parsed.album.year, 2019)
+    compare(parsed.songs.length, 2)
+    compare(parsed.songs[0].id, "t-1")
+    compare(parsed.songs[0].track, 1)
+    compare(parsed.songs[1].track, 2)
+    compare(parsed.songs[1].duration, 210)
+    var missing = Subsonic.parseAlbum("junk")
+    verify(missing.album === null)
+    compare(missing.songs.length, 0)
+  }
+
+  function test_parseTopSongs_dropsIdentitylessSongs() {
+    var parsed = Subsonic.parseTopSongs({artist: {
+        id: "42", name: "Example Quartet",
+        topSongs: {song: [
+          {id: "t-9", title: "Everyone's Favourite", duration: 200,
+            album: "First Light", albumId: "al-1"},
+          {title: "No identity"}
+        ]}}})
+    compare(parsed.length, 1)
+    compare(parsed[0].id, "t-9")
+    compare(parsed[0].albumId, "al-1")
+    // An artist without top songs parses to an empty list.
+    compare(Subsonic.parseTopSongs({artist: {id: "42"}}).length, 0)
+    compare(Subsonic.parseTopSongs(null).length, 0)
+  }
+
+  function test_parseGenres_keysOnValueAndDropsEmpty() {
+    var parsed = Subsonic.parseGenres({genres: {genre: [
+        {value: "Ambient", songCount: 120, albumCount: 9},
+        {value: "Jazz", songCount: "3", albumCount: "1"},
+        {songCount: 5, albumCount: 1},
+        "junk"
+      ]}})
+    compare(parsed.length, 2)
+    compare(parsed[0].value, "Ambient")
+    compare(parsed[0].songCount, 120)
+    compare(parsed[0].albumCount, 9)
+    compare(parsed[1].value, "Jazz")
+    compare(parsed[1].songCount, 3)
+    compare(parsed[1].albumCount, 1)
+    compare(Subsonic.parseGenres(null).length, 0)
+  }
+
+  // ------ playlists ------
+
+  function test_parsePlaylists_normalizesEveryPlaylist() {
+    var parsed = Subsonic.parsePlaylists({playlists: {playlist: [
+        {id: "pl-1", name: "Road Trip", comment: "Long drives",
+          owner: "alice", public: true, songCount: 12, duration: 3600,
+          created: "2026-01-01T00:00:00Z", changed: "2026-02-01T00:00:00Z",
+          coverArt: "pl-1", starred: true},
+        {id: "pl-2", name: "Private Mix", public: false}
+      ]}})
+    compare(parsed.length, 2)
+    compare(parsed[0].id, "pl-1")
+    compare(parsed[0].comment, "Long drives")
+    verify(parsed[0].public)
+    verify(parsed[0].starred)
+    compare(parsed[0].songCount, 12)
+    compare(parsed[0].duration, 3600)
+    verify(!parsed[1].public)
+    compare(Subsonic.parsePlaylists(null).length, 0)
+  }
+
+  function test_parsePlaylist_extractsNormalizedEntries() {
+    var parsed = Subsonic.parsePlaylist({playlist: {
+        id: "pl-1", name: "Road Trip", owner: "alice", songCount: 2,
+        duration: 420,
+        entry: [
+          {id: "t-1", title: "Opening", duration: 210,
+            artist: "Example Quartet"},
+          {id: "t-2", title: "Closing", duration: "210"}
+        ]
+      }})
+    compare(parsed.playlist.id, "pl-1")
+    compare(parsed.entries.length, 2)
+    compare(parsed.entries[0].id, "t-1")
+    compare(parsed.entries[0].artist, "Example Quartet")
+    compare(parsed.entries[1].duration, 210)
+    var missing = Subsonic.parsePlaylist({})
+    verify(missing.playlist === null)
+    compare(missing.entries.length, 0)
+  }
+
+  function test_createPlaylistParams_requiresNameWithoutPlaylistId() {
+    var fresh = Subsonic.createPlaylistParams("  Road Trip  ",
+      ["t-1", "t-2", ""], null)
+    compare(fresh.name, "Road Trip")
+    compare(fresh.songId.length, 2)
+    compare(fresh.songId[0], "t-1")
+    var update = Subsonic.createPlaylistParams("Ignored Name", "t-3", "pl-9")
+    compare(update.playlistId, "pl-9")
+    compare(update.songId[0], "t-3")
+    verify(update.name === undefined)
+    verify(Subsonic.createPlaylistParams("   ", [], null) === null)
+    verify(Subsonic.createPlaylistParams("", []) === null)
+  }
+
+  function test_updatePlaylistParams_expandsRepeatedKeysThroughRequestUrl() {
+    var params = Subsonic.updatePlaylistParams("pl-9", {
+      name: "Road Trip",
+      comment: "",
+      public: true,
+      songIdToAdd: ["t-1", "t-2"],
+      songIndexToRemove: 3})
+    compare(params.playlistId, "pl-9")
+    compare(params.name, "Road Trip")
+    compare(params.public, "true")
+    verify(params.comment === undefined)
+    // Repeated keys ride the existing query builder end to end.
+    var built = Subsonic.requestUrl("https://n.example.com", "updatePlaylist",
+      {u: "alice", p: "sesame", salt: "c19b2d"}, params)
+    compare(built.url, "https://n.example.com/rest/updatePlaylist"
+      + "?c=omarchy-navidrome&f=json&name=Road%20Trip&playlistId=pl-9"
+      + "&public=true&s=c19b2d&songIdToAdd=t-1&songIdToAdd=t-2"
+      + "&songIndexToRemove=3&t=" + Subsonic.authToken("sesame", "c19b2d")
+      + "&u=alice&v=1.16.1")
+    verify(Subsonic.updatePlaylistParams("", {}) === null)
+  }
+
+  function test_deletePlaylistParams_wrapsTheId() {
+    var params = Subsonic.deletePlaylistParams(9)
+    compare(params.id, "9")
+    verify(Subsonic.deletePlaylistParams(null) === null)
+    verify(Subsonic.deletePlaylistParams("") === null)
+  }
+
+  // ------ star, rating, scrobble ------
+
+  function test_starParams_expandRepeatedKeysThroughRequestUrl() {
+    var star = Subsonic.starParams({id: ["t-1", "t-2"], albumId: "al-1"})
+    compare(star.id.length, 2)
+    compare(star.albumId[0], "al-1")
+    verify(star.artistId === undefined)
+    var built = Subsonic.requestUrl("https://n.example.com", "star",
+      {u: "alice", p: "sesame", salt: "c19b2d"}, star)
+    compare(built.url, "https://n.example.com/rest/star"
+      + "?albumId=al-1&c=omarchy-navidrome&f=json&id=t-1&id=t-2"
+      + "&s=c19b2d&t=" + Subsonic.authToken("sesame", "c19b2d")
+      + "&u=alice&v=1.16.1")
+    // unstar builds the same shape over its own endpoint.
+    var unstar = Subsonic.requestUrl("https://n.example.com", "unstar",
+      {u: "alice", p: "sesame", salt: "c19b2d"},
+      Subsonic.unstarParams({artistId: "42"}))
+    compare(unstar.url, "https://n.example.com/rest/unstar"
+      + "?artistId=42&c=omarchy-navidrome&f=json&s=c19b2d"
+      + "&t=" + Subsonic.authToken("sesame", "c19b2d")
+      + "&u=alice&v=1.16.1")
+    verify(Subsonic.starParams({}) === null)
+    verify(Subsonic.starParams({id: []}) === null)
+    verify(Subsonic.starParams(null) === null)
+  }
+
+  function test_setRatingParams_clampsAndValidates() {
+    compare(Subsonic.setRatingParams("t-1", 7).rating, "5")
+    compare(Subsonic.setRatingParams("t-1", -3).rating, "0")
+    compare(Subsonic.setRatingParams("t-1", 3.4).rating, "3")
+    compare(Subsonic.setRatingParams("t-1", "2").rating, "2")
+    compare(Subsonic.setRatingParams(12, 0).id, "12")
+    verify(Subsonic.setRatingParams("t-1", "not a number") === null)
+    verify(Subsonic.setRatingParams("t-1", null) === null)
+    verify(Subsonic.setRatingParams("", 4) === null)
+  }
+
+  function test_scrobbleParams_omitsAbsentSubmissionAndTime() {
+    var now = Subsonic.scrobbleParams("t-1", true, 1770000000000)
+    compare(now.id, "t-1")
+    compare(now.submission, "true")
+    compare(now.time, "1770000000000")
+    var start = Subsonic.scrobbleParams("t-1", false)
+    compare(start.submission, "false")
+    verify(start.time === undefined)
+    var bare = Subsonic.scrobbleParams("t-1")
+    verify(bare.submission === undefined)
+    verify(bare.time === undefined)
+    var startedAt = Subsonic.scrobbleParams("t-1", false, "1770000000000.4")
+    compare(startedAt.time, "1770000000000")
+    verify(Subsonic.scrobbleParams("t-1", true, -5).time === undefined)
+    verify(Subsonic.scrobbleParams("", true) === null)
+    verify(Subsonic.scrobbleParams(null, true) === null)
+  }
+
+  // ------ artwork ------
+
+  function test_coverArtUrl_buildsOverRequestUrlWithPinnedSalt() {
+    var url = Subsonic.coverArtUrl("https://n.example.com", "al-1", 300,
+      {u: "alice", p: "sesame", salt: "c19b2d"})
+    compare(url, "https://n.example.com/rest/getCoverArt"
+      + "?c=omarchy-navidrome&f=json&id=al-1&s=c19b2d&size=300"
+      + "&t=" + Subsonic.authToken("sesame", "c19b2d")
+      + "&u=alice&v=1.16.1")
+    // Size 0 means "server default" and stays off the wire.
+    var unsized = Subsonic.coverArtUrl("https://n.example.com", "al-1", 0,
+      {u: "alice", p: "sesame", salt: "c19b2d"})
+    verify(unsized.indexOf("size=") < 0)
+    // Invalid server or id is the UI's "no artwork" signal.
+    verify(Subsonic.coverArtUrl("not a url", "al-1", 300,
+      {u: "alice", p: "sesame"}) === null)
+    verify(Subsonic.coverArtUrl("https://n.example.com", "", 300,
+      {u: "alice", p: "sesame"}) === null)
+    verify(Subsonic.coverArtUrl("https://n.example.com", null, 300,
+      {u: "alice", p: "sesame"}) === null)
+  }
 }
