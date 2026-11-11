@@ -77,6 +77,10 @@ pub enum Command {
     AddToQueue {
         song: SongRef,
     },
+    /// Read the play queue the server persists for this user (`getPlayQueue`)
+    /// without loading it. The engine never auto-restores; the caller decides
+    /// what to do with the returned SongRefs, current song, and position.
+    GetSavedQueue,
 }
 
 const fn default_true() -> bool {
@@ -338,6 +342,13 @@ mod tests {
                 }
             }
         );
+    }
+
+    #[test]
+    fn get_saved_queue_parses_without_any_fields() {
+        let request: Request =
+            serde_json::from_str(r#"{"v":2,"id":11,"command":"get_saved_queue"}"#).unwrap();
+        assert_eq!(request.command, Command::GetSavedQueue);
     }
 
     #[test]

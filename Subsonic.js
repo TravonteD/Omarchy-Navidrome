@@ -712,6 +712,134 @@ function scrobbleParams(id, submission, time) {
   return params
 }
 
+// ------ bookmarks and saved play queue (resume machinery) ---------------------
+
+// bookmarkParams(id, position?): {id} for a targeted bookmark action, plus
+// the millisecond position when one is given. A call without an id is
+// rejected so empty bookmark writes never hit the wire. getBookmarks and
+// getPlayQueue take no endpoint parameters at all.
+function bookmarkParams(id, position) {
+  var key = id === null || id === undefined ? "" : String(id)
+  if (key === "") return null
+  var params = { id: key }
+  var at = Number(position)
+  if (position !== null && position !== undefined && isFinite(at) && at >= 0) {
+    params.position = String(Math.round(at))
+  }
+  return params
+}
+
+// A Subsonic bookmark nests the song under `entry` (single node or array).
+// Bookmarks without any song id are dropped, matching the shared id rule.
+function normalizeBookmark(node) {
+  if (!node || typeof node !== "object") return null
+  var entry = node.entry !== undefined ? node.entry : node.song
+  if (entry instanceof Array) entry = entry[0]
+  var song = normalizeSong(entry)
+  if (!song) return null
+  return {
+    id: song.id,
+    position: boundedNumber(node.position, 0),
+    username: text(node.username),
+    created: text(node.created),
+    song: song
+  }
+}
+
+// getBookmarks → normalized [{id, position, username, created, song}]
+// sorted newest-first. ISO-8601 timestamps sort lexicographically, so the
+// newest date wins; missing dates sort last. Malformed shapes parse empty,
+// never an error.
+function parseBookmarks(data) {
+  var node = data && typeof data === "object" ? data.bookmarks : null
+  var items = listOf(node, "bookmark", normalizeBookmark)
+  items.sort(function(a, b) {
+    if (a.created === b.created) return 0
+    if (a.created === "") return 1
+    if (b.created === "") return -1
+    return a.created < b.created ? 1 : -1
+  })
+  return items
+}
+
+// getPlayQueue → {songs, current, position}: entries normalized in queue
+// order, the current song's id (the Subsonic contract stores the id, not an
+// index), and the position within it in milliseconds. Missing nodes parse to
+// an empty queue, never an error.
+function parsePlayQueue(data) {
+  var node = data && typeof data === "object" ? data.playQueue : null
+  if (!node || typeof node !== "object") {
+    return {songs: [], current: "", position: 0}
+  }
+  return {
+    songs: listOf(node, "entry", normalizeSong),
+    current: text(node.current),
+    position: boundedNumber(node.position, 0)
+  }
+}
+
+// Pure saved-session restore decision. Preference order: a saved play queue
+// (any non-empty list) restores with the current song's index and position;
+// a queue at position 0 with a bookmark for the current song inherits the
+// bookmark's exact position; with no saved queue at all, the newest bookmark
+// resumes that single song. Rows pass through untouched — both
+// Subsonic-normalized rows and protocol SongRefs carry the id this decision
+// needs — and the caller maps them through the v2 load builder. Returns null
+// when there is nothing to restore. maxSongs bounds the load the same way
+// the playback body caps do.
+function restoreLoadPlan(playQueue, bookmarks, maxSongs) {
+  var queue = playQueue && typeof playQueue === "object"
+    ? playQueue : {songs: [], current: "", position: 0}
+  var marks = bookmarks instanceof Array ? bookmarks : []
+  var cap = Math.max(1, Math.floor(Number(maxSongs) || 1))
+  var best = null
+  if (queue.songs instanceof Array && queue.songs.length) {
+    var index = 0
+    if (String(queue.current || "") !== "") {
+      for (var i = 0; i < queue.songs.length; i++) {
+        if (queue.songs[i] && String(queue.songs[i].id) === String(queue.current)) {
+          index = i
+          break
+        }
+      }
+    }
+    var position = Math.max(0, Math.floor(Number(queue.position) || 0))
+    if (position <= 0) {
+      var currentId = String(queue.current || "") !== ""
+        ? String(queue.current) : String(queue.songs[index].id)
+      for (var j = 0; j < marks.length; j++) {
+        if (marks[j] && String(marks[j].id) === currentId) {
+          position = Math.max(0, Math.floor(Number(marks[j].position) || 0))
+          break
+        }
+      }
+    }
+    return {
+      songs: queue.songs.slice(0, cap),
+      offset_index: Math.min(index, cap - 1),
+      position_ms: position
+    }
+  }
+  for (var k = 0; k < marks.length; k++) {
+    var mark = marks[k]
+    if (!mark || !mark.song || !mark.song.id) continue
+    // Newest wins by its date, so an unsorted bookmark list still resumes
+    // the most recent play; undated bookmarks only win when nothing is dated.
+    if (!best || (String(mark.created || "") !== ""
+        && String(mark.created || "") > String(best.created || ""))) {
+      best = mark
+    }
+  }
+  if (best) {
+    return {
+      songs: [best.song],
+      offset_index: 0,
+      position_ms: Math.max(0, Math.floor(Number(best.position) || 0))
+    }
+  }
+  return null
+}
+
 // ------ artwork URLs -----------------------------------------------------------
 
 // Full getCoverArt URL, built over the pinned-salt request builder. Null is

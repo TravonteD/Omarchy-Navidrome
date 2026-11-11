@@ -24,6 +24,9 @@ struct GlobalConfig {
     format: Option<String>,
     /// Transcode bitrate cap in kbps; 0 (default) means no cap.
     max_bit_rate: Option<u16>,
+    /// submission=true scrobbles fire at track end; false keeps the server's
+    /// play counts frozen.
+    scrobble: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -40,6 +43,8 @@ pub struct BackendConfig {
     pub format: String,
     /// Subsonic `maxBitRate` stream parameter, 0 = no cap.
     pub max_bit_rate: u16,
+    /// Whether the engine submits scrobbles (submission=true) at track end.
+    pub scrobble: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -53,6 +58,7 @@ pub struct ConfigSummary<'a> {
     pub credentials_root: &'a std::path::Path,
     pub format: &'a str,
     pub max_bit_rate: u16,
+    pub scrobble: bool,
 }
 
 impl BackendConfig {
@@ -99,6 +105,7 @@ impl BackendConfig {
         }
 
         let max_bit_rate = global.max_bit_rate.unwrap_or(0);
+        let scrobble = global.scrobble.unwrap_or(true);
 
         let cache_root = global.cache_path.unwrap_or_else(default_cache_root);
         let credentials_root = default_credentials_root();
@@ -114,6 +121,7 @@ impl BackendConfig {
             credentials_root,
             format,
             max_bit_rate,
+            scrobble,
         })
     }
 
@@ -128,6 +136,7 @@ impl BackendConfig {
             credentials_root: &self.credentials_root,
             format: &self.format,
             max_bit_rate: self.max_bit_rate,
+            scrobble: self.scrobble,
         }
     }
 }
@@ -229,6 +238,25 @@ mod tests {
 
         let (path, dir) = write_config("[global]\nformat=\"aiff\"");
         assert!(BackendConfig::load(&path).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn scrobbling_defaults_on_and_can_be_disabled() {
+        let (path, dir) = write_config("[global]\nformat=\"mp3\"");
+        let config = BackendConfig::load(&path).unwrap();
+        assert!(config.scrobble);
+        let summary = serde_json::to_value(config.summary()).unwrap();
+        assert_eq!(summary["scrobble"], true);
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(dir).unwrap();
+
+        let (path, dir) = write_config("[global]\nscrobble=false");
+        let config = BackendConfig::load(&path).unwrap();
+        assert!(!config.scrobble);
+        let summary = serde_json::to_value(config.summary()).unwrap();
+        assert_eq!(summary["scrobble"], false);
         fs::remove_file(&path).unwrap();
         fs::remove_dir(dir).unwrap();
     }

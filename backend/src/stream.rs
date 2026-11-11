@@ -238,6 +238,216 @@ pub fn build_cover_art_url(
     join_endpoint(base_url, "getCoverArt", &query)
 }
 
+/// `<base>/rest/scrobble?id=...&submission=true|false&<auth>`.
+///
+/// `submission=true` is the play-count write; `submission=false` only marks a
+/// now-playing hint and never touches play counts. The URL is used once by
+/// the caller and never logged.
+pub fn build_scrobble_url(
+    base_url: &str,
+    auth: &AuthPair,
+    salt: &str,
+    song_id: &str,
+    submission: bool,
+) -> Result<String, String> {
+    if salt.chars().count() < MIN_SALT_LENGTH {
+        return Err("scrobble salt is too short".to_string());
+    }
+    let query = [
+        query_param("id", song_id),
+        format!("submission={}", if submission { "true" } else { "false" }),
+        auth_query(auth, salt),
+    ]
+    .join("&");
+    join_endpoint(base_url, "scrobble", &query)
+}
+
+/// `<base>/rest/savePlayQueue?id=...&id=...&current=...&[position=...]&<auth>`.
+///
+/// Per the Subsonic contract, `current` is the **id of the currently playing
+/// song** (it must be one of the repeated `id` values), not a queue index.
+/// `position_ms` is the position within that song; `None`/0 omits the
+/// parameter, which servers treat as position 0.
+pub fn build_save_play_queue_url(
+    base_url: &str,
+    auth: &AuthPair,
+    salt: &str,
+    song_ids: &[String],
+    current_id: &str,
+    position_ms: Option<u64>,
+) -> Result<String, String> {
+    if salt.chars().count() < MIN_SALT_LENGTH {
+        return Err("play queue salt is too short".to_string());
+    }
+    if song_ids.is_empty() {
+        return Err("the play queue has no songs to save".to_string());
+    }
+    let mut query: Vec<String> = song_ids.iter().map(|id| query_param("id", id)).collect();
+    query.push(query_param("current", current_id));
+    if let Some(position) = position_ms.filter(|value| *value > 0) {
+        query.push(format!("position={position}"));
+    }
+    query.push(auth_query(auth, salt));
+    join_endpoint(base_url, "savePlayQueue", &query.join("&"))
+}
+
+/// `<base>/rest/getPlayQueue?<auth>` — the read side of play-queue
+/// persistence.
+pub fn build_get_play_queue_url(
+    base_url: &str,
+    auth: &AuthPair,
+    salt: &str,
+) -> Result<String, String> {
+    if salt.chars().count() < MIN_SALT_LENGTH {
+        return Err("play queue salt is too short".to_string());
+    }
+    join_endpoint(base_url, "getPlayQueue", &auth_query(auth, salt))
+}
+
+// ---------------------------------------------------------------------------
+// Non-playback server reads and writes (scrobble, play queue)
+// ---------------------------------------------------------------------------
+
+/// Outcome of one non-playback write (scrobble, queue save). By construction
+/// it carries no URL, no status code, and no credential material, so it is
+/// safe to pass to any log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteOutcome {
+    /// 2xx: the server confirmed the write.
+    Completed,
+    /// 4xx/5xx: a definite failure.
+    Rejected,
+    /// Transport-level failure (timeout, broken connection): the write may
+    /// have landed. Callers treat this as uncertain.
+    Transport,
+}
+
+/// Fire one GET-style Subsonic write and classify the outcome. The URL is
+/// used once for the request and never appears in the result.
+pub fn send_write(agent: &ureq::Agent, url: &str) -> WriteOutcome {
+    match agent.get(url).call() {
+        Ok(_) => WriteOutcome::Completed,
+        Err(ureq::Error::Status(_, _)) => WriteOutcome::Rejected,
+        Err(_) => WriteOutcome::Transport,
+    }
+}
+
+/// A defensively parsed `getPlayQueue` response. Missing nodes parse to an
+/// empty queue; nothing here can panic on hostile input.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ParsedPlayQueue {
+    pub songs: Vec<crate::protocol::SongRef>,
+    /// The current song's id exactly as the server named it ("" when absent).
+    pub current_id: String,
+    /// Position of `current_id` in `songs`, 0 when absent or not found.
+    pub current_index: usize,
+    /// Position within the current song, in milliseconds.
+    pub position_ms: u64,
+}
+
+/// Read `getPlayQueue` and parse it defensively. The URL is used once and
+/// never appears in the outcome.
+pub fn fetch_play_queue(agent: &ureq::Agent, url: &str) -> ReadOutcome {
+    match agent.get(url).call() {
+        Ok(response) if (200..300).contains(&response.status()) => {
+            let mut body = String::new();
+            let _ = response.into_reader().read_to_string(&mut body);
+            ReadOutcome::Parsed(parse_play_queue(&body))
+        }
+        Ok(_) => ReadOutcome::Rejected,
+        Err(ureq::Error::Status(_, _)) => ReadOutcome::Rejected,
+        Err(_) => ReadOutcome::Transport,
+    }
+}
+
+/// Outcome of one `getPlayQueue` read. Carries no URL or credential material.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReadOutcome {
+    Parsed(ParsedPlayQueue),
+    Rejected,
+    Transport,
+}
+
+fn json_text(value: Option<&serde_json::Value>) -> String {
+    match value {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Number(number)) => number.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn json_u64(value: Option<&serde_json::Value>) -> u64 {
+    match value {
+        Some(serde_json::Value::Number(number)) => number.as_u64().unwrap_or(0),
+        // Some servers send numbers as strings; both shapes must parse.
+        Some(serde_json::Value::String(text)) => text.trim().parse::<u64>().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// One `getPlayQueue` entry shaped into a SongRef. Durations arrive in
+/// seconds; an entry without an id is dropped by the caller.
+fn parse_queue_entry(entry: &serde_json::Value) -> Option<crate::protocol::SongRef> {
+    let id = json_text(entry.get("id"));
+    if id.trim().is_empty() {
+        return None;
+    }
+    let mut song = crate::protocol::SongRef {
+        id,
+        ..crate::protocol::SongRef::default()
+    };
+    song.title = json_text(entry.get("title"));
+    let artist = json_text(entry.get("artist"));
+    if !artist.is_empty() {
+        song.artists = vec![artist];
+    }
+    song.album = json_text(entry.get("album"));
+    song.duration_ms = json_u64(entry.get("duration"))
+        .saturating_mul(1000)
+        .min(u64::from(u32::MAX)) as u32;
+    song.cover_art = json_text(entry.get("coverArt"));
+    let track = json_u64(entry.get("track"));
+    song.track = (track > 0).then(|| track.min(u64::from(u32::MAX)) as u32);
+    Some(song)
+}
+
+/// Defensive `getPlayQueue` JSON parsing: a failed status, a missing
+/// `playQueue` node, and id-less entries all simply mean "nothing saved";
+/// this never returns an error and never panics.
+pub fn parse_play_queue(body: &str) -> ParsedPlayQueue {
+    let value: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+    let root = value.get("subsonic-response").unwrap_or(&value);
+    if root.get("status").and_then(|status| status.as_str()) != Some("ok") {
+        return ParsedPlayQueue::default();
+    }
+    let Some(queue) = root.get("playQueue") else {
+        return ParsedPlayQueue::default();
+    };
+    let mut songs = Vec::new();
+    if let Some(entries) = queue.get("entry") {
+        let items: Vec<&serde_json::Value> = match entries {
+            serde_json::Value::Array(items) => items.iter().collect(),
+            item => vec![item],
+        };
+        for item in items {
+            if let Some(song) = parse_queue_entry(item) {
+                songs.push(song);
+            }
+        }
+    }
+    let current_id = json_text(queue.get("current"));
+    let current_index = songs
+        .iter()
+        .position(|song| song.id == current_id)
+        .unwrap_or(0);
+    ParsedPlayQueue {
+        songs,
+        current_id,
+        current_index,
+        position_ms: json_u64(queue.get("position")),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bounded raw-chunk buffer (HTTP downloader → symphonia decoder)
 // ---------------------------------------------------------------------------
@@ -959,6 +1169,192 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn scrobble_url_pins_the_submission_flag() {
+        let submitted =
+            build_scrobble_url("https://nav.example", &test_auth(), TEST_SALT, "tr 9", true)
+                .unwrap();
+        assert_eq!(
+            submitted,
+            "https://nav.example/rest/scrobble?\
+             id=tr%209&\
+             submission=true&\
+             u=user&\
+             t=453c8b23d259fa984521e5c34d37f5dd&\
+             s=abcdef12&\
+             v=1.16.1&\
+             c=omarchy-navidrome&\
+             f=json"
+        );
+        let now_playing = build_scrobble_url(
+            "https://nav.example",
+            &test_auth(),
+            TEST_SALT,
+            "tr-9",
+            false,
+        )
+        .unwrap();
+        assert!(now_playing.contains("id=tr-9&submission=false"));
+        assert!(
+            build_scrobble_url("https://nav.example", &test_auth(), "abc", "tr-9", true).is_err()
+        );
+    }
+
+    #[test]
+    fn save_play_queue_url_repeats_ids_and_pins_current_and_position() {
+        let url = build_save_play_queue_url(
+            "https://nav.example",
+            &test_auth(),
+            TEST_SALT,
+            &["tr-1".to_string(), "tr-2".to_string()],
+            "tr-2",
+            Some(42_000),
+        )
+        .unwrap();
+        assert!(url.starts_with("https://nav.example/rest/savePlayQueue?"));
+        assert!(url.contains("id=tr-1"));
+        assert!(url.contains("id=tr-2"));
+        // Subsonic's `current` is the current song's id, not an index.
+        assert!(url.contains("current=tr-2"));
+        assert!(url.contains("position=42000"));
+        assert!(url.contains("t=453c8b23d259fa984521e5c34d37f5dd"));
+
+        // Position 0 (or None) is omitted; servers treat it as 0.
+        let bare = build_save_play_queue_url(
+            "https://nav.example",
+            &test_auth(),
+            TEST_SALT,
+            &["tr-1".to_string()],
+            "tr-1",
+            None,
+        )
+        .unwrap();
+        assert!(!bare.contains("position="));
+        // An empty queue and a short salt are rejected.
+        assert!(
+            build_save_play_queue_url(
+                "https://nav.example",
+                &test_auth(),
+                TEST_SALT,
+                &[],
+                "",
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            build_save_play_queue_url(
+                "https://nav.example",
+                &test_auth(),
+                "abc",
+                &["tr-1".to_string()],
+                "tr-1",
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn get_play_queue_url_carries_only_the_auth_params() {
+        let url = build_get_play_queue_url("https://nav.example", &test_auth(), TEST_SALT).unwrap();
+        assert_eq!(
+            url,
+            "https://nav.example/rest/getPlayQueue?\
+             u=user&\
+             t=453c8b23d259fa984521e5c34d37f5dd&\
+             s=abcdef12&\
+             v=1.16.1&\
+             c=omarchy-navidrome&\
+             f=json"
+        );
+        assert!(build_get_play_queue_url("https://nav.example", &test_auth(), "abc").is_err());
+    }
+
+    #[test]
+    fn write_builder_errors_never_leak_credentials() {
+        for error in [
+            build_scrobble_url("not a url", &test_auth(), TEST_SALT, "tr-1", true).unwrap_err(),
+            build_save_play_queue_url(
+                "",
+                &test_auth(),
+                TEST_SALT,
+                &["tr-1".to_string()],
+                "tr-1",
+                None,
+            )
+            .unwrap_err(),
+            build_get_play_queue_url("https://nav.example", &test_auth(), "abc").unwrap_err(),
+        ] {
+            assert!(!error.contains("user"));
+            assert!(!error.contains("secret1"));
+            assert!(!error.contains("abcdef12"));
+            assert!(!error.contains("453c8b23"));
+            assert!(!error.contains("nav.example"));
+        }
+    }
+
+    #[test]
+    fn play_queue_response_parses_entries_current_and_position() {
+        let queue = parse_play_queue(
+            r#"{"subsonic-response":{"status":"ok","playQueue":{
+                "current":"tr-2","position":"42000","entry":[
+                    {"id":"tr-1","title":"A","artist":"Art","album":"Al",
+                     "duration":180,"coverArt":"c1","track":3},
+                    {"id":"tr-2","title":"B"}]}}}"#,
+        );
+        assert_eq!(queue.songs.len(), 2);
+        assert_eq!(queue.songs[0].id, "tr-1");
+        assert_eq!(queue.songs[0].artists, vec!["Art".to_string()]);
+        // Subsonic durations are seconds; the protocol wants milliseconds.
+        assert_eq!(queue.songs[0].duration_ms, 180_000);
+        assert_eq!(queue.songs[0].cover_art, "c1");
+        assert_eq!(queue.songs[0].track, Some(3));
+        assert_eq!(queue.current_id, "tr-2");
+        assert_eq!(queue.current_index, 1);
+        assert_eq!(queue.position_ms, 42_000);
+    }
+
+    #[test]
+    fn play_queue_response_never_throws_and_defaults_to_empty() {
+        let hostile = [
+            "",
+            "not json",
+            "{}",
+            r#"{"subsonic-response":{"status":"failed"}}"#,
+            r#"{"subsonic-response":{"status":"ok"}}"#,
+            r#"{"subsonic-response":{"status":"ok","playQueue":null}}"#,
+            // Id-less entries are dropped; hostile numbers clamp to zero.
+            r#"{"subsonic-response":{"status":"ok","playQueue":{
+                "entry":[{"title":"no id"},{"id":"tr-1","duration":-5}]}}}"#,
+            r#"{"subsonic-response":{"status":"ok","playQueue":{
+                "entry":{"id":42,"title":"single node"},
+                "current":42,"position":-9}}}"#,
+        ];
+        for body in hostile {
+            let queue = parse_play_queue(body);
+            assert_eq!(queue.position_ms, 0, "hostile position must clamp: {body}");
+            for song in &queue.songs {
+                assert!(!song.id.is_empty());
+            }
+        }
+        let single = parse_play_queue(
+            r#"{"subsonic-response":{"status":"ok","playQueue":{
+                "entry":{"id":42,"title":"single node"},"current":42}}}"#,
+        );
+        assert_eq!(single.songs.len(), 1);
+        assert_eq!(single.songs[0].id, "42");
+        assert_eq!(single.current_id, "42");
+        assert_eq!(single.current_index, 0);
+        // A current id that is no longer in the list falls back to index 0.
+        let orphans = parse_play_queue(
+            r#"{"subsonic-response":{"status":"ok","playQueue":{
+                "entry":[{"id":"tr-1"}],"current":"gone"}}}"#,
+        );
+        assert_eq!(orphans.current_index, 0);
+        assert_eq!(orphans.current_id, "gone");
     }
 
     #[test]

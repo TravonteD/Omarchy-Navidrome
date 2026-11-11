@@ -21,8 +21,8 @@ use crate::{
     },
     state::StateStore,
     stream::{
-        self, AuthPair, DecodeOutcome, DownloadOutcome, PcmChunk, RandomSalt, SaltSource,
-        WorkerEvent, WorkerHandle,
+        self, AuthPair, DecodeOutcome, DownloadOutcome, ParsedPlayQueue, PcmChunk, RandomSalt,
+        ReadOutcome, SaltSource, WorkerEvent, WorkerHandle, WriteOutcome,
     },
 };
 
@@ -34,6 +34,20 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// MPRIS contract: one position update per second.
 const POSITION_TICK_MS: u64 = 1000;
+/// Audioscrobbler rule: a track counts as played when at least half of it
+/// was heard (fraction rule for short tracks)...
+const SCROBBLE_MIN_FRACTION: f64 = 0.5;
+/// ...or at least four minutes of it (rule for long tracks).
+const SCROBBLE_MIN_PLAYED_MS: u64 = 4 * 60 * 1000;
+/// A burst of queue mutations saves at most once per debounce window.
+const QUEUE_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
+/// Short backoff before the single bounded retry of a failed queue save.
+const QUEUE_SAVE_RETRY_DELAY: Duration = Duration::from_secs(2);
+/// One dirty queue-save state gets an initial attempt plus one retry
+/// (savePlayQueue is idempotent, so the retry never duplicates a write).
+const QUEUE_SAVE_MAX_ATTEMPTS: u8 = 2;
+/// Bounded window at shutdown in which the final queue save must confirm.
+const QUEUE_SAVE_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 
 pub struct EngineRequest {
     pub command: Command,
@@ -141,8 +155,11 @@ pub async fn start(config: BackendConfig, state: StateStore) -> Result<EngineRun
     let (control_tx, control_rx) = std_mpsc::channel::<ControlMessage>();
     let (events, event_rx) = tokio::sync::mpsc::unbounded_channel::<PlaybackEvent>();
     let (worker_tx, worker_rx) = std_mpsc::channel::<WorkerEvent>();
+    let (http_tx, http_rx) = std_mpsc::channel::<HttpWork>();
+    let (http_outcome_tx, http_outcome_rx) = std_mpsc::channel::<HttpOutcome>();
     let shutdown = Arc::new(AtomicBool::new(false));
 
+    spawn_http_worker(stream::stream_agent(), http_rx, http_outcome_tx);
     tokio::spawn(run_commands(command_rx, control_tx.clone()));
     tokio::spawn(run_events(event_rx, state.clone()));
 
@@ -153,6 +170,9 @@ pub async fn start(config: BackendConfig, state: StateStore) -> Result<EngineRun
         output,
         events.clone(),
         worker_tx,
+        config.scrobble,
+        http_tx,
+        http_outcome_rx,
     );
 
     let (done_tx, done) = oneshot::channel();
@@ -405,6 +425,171 @@ pub fn volume_to_f32(volume: u16) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
+// Server writes off the pipeline thread (scrobble, play-queue persistence)
+// ---------------------------------------------------------------------------
+//
+// Scrobble and savePlayQueue calls must never stall audio or the command
+// loop, so the pipeline only builds the request URLs (it is the only place
+// that holds the server credentials) and hands them to one dedicated worker
+// thread. URLs ride the channel in memory only; they are never logged.
+
+pub(crate) enum HttpWork {
+    /// One `scrobble` call. Never retried: a scrobble whose outcome is
+    /// unknown may still have landed, and a second submission would corrupt
+    /// the play count.
+    Scrobble { song_id: String, url: String },
+    /// One debounced `savePlayQueue` call. Idempotent, so a bounded retry
+    /// within the same dirty state is safe.
+    SaveQueue { seq: u64, url: String },
+    /// One `getPlayQueue` read completing the command's deferred reply.
+    GetSavedQueue {
+        url: String,
+        reply: oneshot::Sender<Result<serde_json::Value, ProtocolError>>,
+    },
+}
+
+pub(crate) enum HttpOutcome {
+    Scrobbled {
+        song_id: String,
+        outcome: WriteOutcome,
+    },
+    QueueSaved {
+        seq: u64,
+        outcome: WriteOutcome,
+    },
+}
+
+fn spawn_http_worker(
+    agent: ureq::Agent,
+    work: std_mpsc::Receiver<HttpWork>,
+    outcomes: std_mpsc::Sender<HttpOutcome>,
+) {
+    let spawned = std::thread::Builder::new()
+        .name("stream-writes".to_string())
+        .spawn(move || {
+            while let Ok(work) = work.recv() {
+                match work {
+                    HttpWork::Scrobble { song_id, url } => {
+                        // The URL is used once here and never logged.
+                        let outcome = stream::send_write(&agent, &url);
+                        let _ = outcomes.send(HttpOutcome::Scrobbled { song_id, outcome });
+                    }
+                    HttpWork::SaveQueue { seq, url } => {
+                        let outcome = stream::send_write(&agent, &url);
+                        let _ = outcomes.send(HttpOutcome::QueueSaved { seq, outcome });
+                    }
+                    HttpWork::GetSavedQueue { url, reply } => {
+                        let result = saved_queue_result(stream::fetch_play_queue(&agent, &url));
+                        let _ = reply.send(result);
+                    }
+                }
+            }
+        });
+    // Detached on purpose: the pipeline must never block on this thread, and
+    // at shutdown it only waits a bounded time for the final save.
+    let _ = spawned;
+}
+
+/// `get_saved_queue` response shape: the persisted queue as SongRefs plus the
+/// current song (its exact server id and the derived index) and its position
+/// in milliseconds. Read failures are typed and credential-free.
+fn saved_queue_result(outcome: ReadOutcome) -> Result<serde_json::Value, ProtocolError> {
+    match outcome {
+        ReadOutcome::Parsed(ParsedPlayQueue {
+            songs,
+            current_id,
+            current_index,
+            position_ms,
+        }) => Ok(serde_json::json!({
+            "songs": songs,
+            "current_index": current_index,
+            "current_id": current_id,
+            "position_ms": position_ms,
+        })),
+        ReadOutcome::Rejected | ReadOutcome::Transport => Err(ProtocolError::new(
+            "stream_unavailable",
+            "the saved play queue could not be read",
+        )),
+    }
+}
+
+/// The scrobble decision matrix as implemented:
+///   natural end      → submitted, whatever the fraction (the queue drained
+///                      the song into the next one);
+///   played ≥ 4 min   → submitted (Audioscrobbler rule for long tracks);
+///   played ≥ ½ length→ submitted (rule for short tracks, known duration);
+///   otherwise        → dropped silently.
+fn scrobble_decision(played_ms: u64, duration_ms: u32, natural_end: bool) -> bool {
+    if natural_end {
+        return true;
+    }
+    if played_ms >= SCROBBLE_MIN_PLAYED_MS {
+        return true;
+    }
+    duration_ms > 0 && (played_ms as f64) / f64::from(duration_ms) >= SCROBBLE_MIN_FRACTION
+}
+
+/// Debounced, bounded savePlayQueue scheduling. A burst of queue mutations
+/// coalesces into one save per `QUEUE_SAVE_DEBOUNCE`; a failed or uncertain
+/// save may be retried once within the same dirty state (the write is
+/// idempotent); a new mutation starts a fresh bounded budget. Never an
+/// unbounded retry loop.
+struct QueueSaveScheduler {
+    dirty: bool,
+    due_at: Option<Instant>,
+    attempts: u8,
+}
+
+impl QueueSaveScheduler {
+    fn new() -> Self {
+        Self {
+            dirty: false,
+            due_at: None,
+            attempts: 0,
+        }
+    }
+
+    /// A queue mutation happened: fresh bounded budget, and a burst keeps
+    /// the save parked at its original due time.
+    fn mark_dirty(&mut self, now: Instant) {
+        self.attempts = 0;
+        if self.dirty {
+            return;
+        }
+        self.dirty = true;
+        self.due_at = Some(now + QUEUE_SAVE_DEBOUNCE);
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.dirty && self.due_at.is_some_and(|due| now >= due)
+    }
+
+    /// A save left for the worker thread: the dirty state clears and one
+    /// attempt is spent.
+    fn fired(&mut self) {
+        self.dirty = false;
+        self.due_at = None;
+        self.attempts = self.attempts.saturating_add(1);
+    }
+
+    fn succeeded(&mut self) {
+        self.attempts = 0;
+    }
+
+    /// One bounded retry on a failed/uncertain save. False when the budget
+    /// is spent and the possibly-landed state was dropped as uncertain.
+    fn failed(&mut self, now: Instant) -> bool {
+        if self.attempts >= QUEUE_SAVE_MAX_ATTEMPTS {
+            self.attempts = 0;
+            return false;
+        }
+        self.dirty = true;
+        self.due_at = Some(now + QUEUE_SAVE_RETRY_DELAY);
+        true
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pipeline thread
 // ---------------------------------------------------------------------------
 
@@ -417,6 +602,21 @@ pub struct ControlMessage {
 struct ServerIdentity {
     base_url: String,
     auth: AuthPair,
+}
+
+/// Why playback stopped. Only deliberate leaves (skip, stop, replaced
+/// queue) can earn a fraction-gated submission; engine failures must never
+/// scrobble, and a natural end has already been handled by the boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StopCause {
+    /// Next/Previous moved playback away, or the queue ended on a skip.
+    Skip,
+    /// The Stop command (UI or MPRIS).
+    UserStop,
+    /// A new `load` replaced the queue mid-playback.
+    Replaced,
+    /// Typed engine error (rejected/undecodable/unavailable stream).
+    Failed,
 }
 
 /// The song whose audio is currently at the head of the player queue.
@@ -435,6 +635,10 @@ struct FrontTrack {
     /// The downloader died mid-stream; buffered audio still plays while a
     /// bounded retry rebuilds the stream.
     worker_failed: bool,
+    /// submission=false fired once per front when its audio starts. A seek
+    /// rebuilds the front and may refresh the hint; that is harmless (it
+    /// only updates the now-playing marker, never the play count).
+    now_playing_sent: bool,
     /// Queue index of the song this front is playing.
     index: usize,
 }
@@ -491,9 +695,20 @@ struct Pipeline {
     playhead_base_ms: u64,
     anchor: Option<Instant>,
     last_tick_second: u64,
+    /// Whether `submission=true` scrobbles fire at all (backend config).
+    scrobble_enabled: bool,
+    /// Off-thread channel for scrobble/queue-save/getPlayQueue work.
+    http_tx: std_mpsc::Sender<HttpWork>,
+    /// Write outcomes reported back by the worker thread.
+    http_outcomes: std_mpsc::Receiver<HttpOutcome>,
+    /// Debounced, bounded savePlayQueue scheduling.
+    queue_save: QueueSaveScheduler,
+    /// Monotonic sequence distinguishing queue-save outcomes.
+    queue_save_seq: u64,
 }
 
 impl Pipeline {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         format: String,
         max_bit_rate: u16,
@@ -501,6 +716,9 @@ impl Pipeline {
         output: Output,
         events: tokio::sync::mpsc::UnboundedSender<PlaybackEvent>,
         worker_tx: std_mpsc::Sender<WorkerEvent>,
+        scrobble_enabled: bool,
+        http_tx: std_mpsc::Sender<HttpWork>,
+        http_outcomes: std_mpsc::Receiver<HttpOutcome>,
     ) -> Self {
         Self {
             events,
@@ -525,6 +743,11 @@ impl Pipeline {
             playhead_base_ms: 0,
             anchor: None,
             last_tick_second: u64::MAX,
+            scrobble_enabled,
+            http_tx,
+            http_outcomes,
+            queue_save: QueueSaveScheduler::new(),
+            queue_save_seq: 0,
         }
     }
 
@@ -549,8 +772,7 @@ impl Pipeline {
                 let ControlMessage { command, reply } = message;
                 // Forward through the local-command discipline so arrival
                 // order (and therefore Pause ordering) is preserved.
-                let result = dispatch_local_command(command, |command| self.execute(command));
-                let _ = reply.send(result);
+                self.handle_control(command, Some(reply));
             }
 
             self.pump(Instant::now());
@@ -565,8 +787,7 @@ impl Pipeline {
             match control_rx.recv_timeout(interval) {
                 Ok(message) => {
                     let ControlMessage { command, reply } = message;
-                    let result = dispatch_local_command(command, |command| self.execute(command));
-                    let _ = reply.send(result);
+                    self.handle_control(command, Some(reply));
                 }
                 Err(std_mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std_mpsc::RecvTimeoutError::Disconnected) => {
@@ -578,8 +799,32 @@ impl Pipeline {
     }
 
     fn teardown(&mut self) {
+        // Clean shutdown: one final savePlayQueue with the queue as it stands
+        // (the position advanced since the last debounced save), bounded so a
+        // dead server cannot hang the process. The shutdown itself is not a
+        // scrobble: quitting mid-track is not a play under the Audioscrobbler
+        // rule, and idle shutdowns must not invent one.
+        self.final_queue_save();
         self.stop_workers();
         self.output.player.clear();
+    }
+
+    /// Runs one control message. Commands execute sequentially in arrival
+    /// order; `get_saved_queue` completes its reply off-thread and owns the
+    /// reply channel until then.
+    fn handle_control(
+        &mut self,
+        command: Command,
+        reply: Option<oneshot::Sender<Result<serde_json::Value, ProtocolError>>>,
+    ) {
+        if let Command::GetSavedQueue = command {
+            self.get_saved_queue(reply);
+            return;
+        }
+        let result = dispatch_local_command(command, |command| self.execute(command));
+        if let Some(reply) = reply {
+            let _ = reply.send(result);
+        }
     }
 
     // -- command execution --------------------------------------------------
@@ -618,6 +863,7 @@ impl Pipeline {
             Command::AddToQueue { song } => {
                 self.require_server()?;
                 self.queue.push_back(song);
+                self.mark_queue_dirty();
                 Ok(serde_json::json!({}))
             }
             Command::Play => {
@@ -642,14 +888,14 @@ impl Pipeline {
                 Ok(serde_json::json!({}))
             }
             Command::Stop => {
-                self.stop_playback();
+                self.stop_playback(StopCause::UserStop);
                 Ok(serde_json::json!({}))
             }
             Command::Next => {
                 if let Some(index) = self.next_index() {
                     self.jump_to(index);
                 } else {
-                    self.stop_playback();
+                    self.stop_playback(StopCause::Skip);
                 }
                 Ok(serde_json::json!({}))
             }
@@ -674,6 +920,8 @@ impl Pipeline {
                 self.shuffle = enabled;
                 if enabled {
                     shuffle_tail(&mut self.queue, self.current);
+                    // Shuffle reorders the queue tail: a queue mutation.
+                    self.mark_queue_dirty();
                 }
                 let _ = self.events.send(PlaybackEvent::ShuffleChanged { enabled });
                 Ok(serde_json::json!({}))
@@ -683,10 +931,12 @@ impl Pipeline {
                 let _ = self.events.send(PlaybackEvent::RepeatChanged { mode });
                 Ok(serde_json::json!({}))
             }
-            Command::Hello | Command::Ping | Command::GetState => Err(ProtocolError::new(
-                "invalid_request",
-                "command is handled by the protocol server",
-            )),
+            Command::GetSavedQueue | Command::Hello | Command::Ping | Command::GetState => {
+                Err(ProtocolError::new(
+                    "invalid_request",
+                    "command is handled by the protocol server or completes asynchronously",
+                ))
+            }
         }
     }
 
@@ -750,10 +1000,11 @@ impl Pipeline {
         position_ms: u32,
         play: bool,
     ) {
-        self.stop_playback();
+        self.stop_playback(StopCause::Replaced);
         self.failures = 0;
         self.queue = songs.into();
         self.current = Some(index);
+        self.mark_queue_dirty();
         let song = self.queue[index].clone();
         self.spawn_front(song, index, u64::from(position_ms) / 1000, true);
         if play {
@@ -767,10 +1018,14 @@ impl Pipeline {
         }
     }
 
-    /// Start playing the queue entry at `index` from its beginning.
+    /// Start playing the queue entry at `index` from its beginning. Reached
+    /// by the Next/Previous skips (and by Play on a stopped queue), so the
+    /// track being left follows the skip rule of the scrobble matrix.
     fn jump_to(&mut self, index: usize) {
+        self.leave_track(false);
+        self.mark_queue_dirty();
         if index >= self.queue.len() {
-            self.stop_playback();
+            self.stop_playback(StopCause::Skip);
             return;
         }
         self.stop_workers();
@@ -793,7 +1048,7 @@ impl Pipeline {
                     self.jump_to(index);
                 }
             }
-            _ => self.stop_playback(),
+            _ => self.stop_playback(StopCause::Skip),
         }
     }
 
@@ -824,7 +1079,17 @@ impl Pipeline {
         });
     }
 
-    fn stop_playback(&mut self) {
+    /// Stop playback. A deliberate leave (skip, stop, replaced queue) first
+    /// runs the fraction-gated scrobble decision; engine failures must never
+    /// scrobble. See [`scrobble_decision`] for the full matrix.
+    fn stop_playback(&mut self, cause: StopCause) {
+        if cause != StopCause::Failed {
+            self.leave_track(false);
+        }
+        self.stop_playback_without_leave();
+    }
+
+    fn stop_playback_without_leave(&mut self) {
         self.stop_workers();
         self.output.player.clear();
         self.output.player.pause();
@@ -863,6 +1128,8 @@ impl Pipeline {
         });
     }
 
+    /// Start playing the song at the front from its beginning and reset the
+    /// per-track leave bookkeeping.
     fn spawn_front(&mut self, song: SongRef, index: usize, offset_secs: u64, begin: bool) {
         let Some(server) = self.server.as_ref() else {
             return;
@@ -910,6 +1177,7 @@ impl Pipeline {
             appended_ms: 0,
             eof: false,
             worker_failed: false,
+            now_playing_sent: false,
             index,
         });
     }
@@ -981,7 +1249,7 @@ impl Pipeline {
                         "Navidrome rejected the stream request. Check the configured server credentials."
                             .into(),
                 });
-                self.stop_playback();
+                self.stop_playback(StopCause::Failed);
             }
             DownloadOutcome::Failed => {
                 if is_front {
@@ -1026,7 +1294,7 @@ impl Pipeline {
                     code: "stream_unavailable".into(),
                     message: "the stream could not be decoded".into(),
                 });
-                self.stop_playback();
+                self.stop_playback(StopCause::Failed);
             }
         }
     }
@@ -1040,7 +1308,7 @@ impl Pipeline {
                 code: "stream_unavailable".into(),
                 message: "Navidrome stopped serving the stream".into(),
             });
-            self.stop_playback();
+            self.stop_playback(StopCause::Failed);
             return;
         }
         self.failures += 1;
@@ -1104,7 +1372,7 @@ impl Pipeline {
                     code: "stream_unavailable".into(),
                     message: "the stream could not be resumed".into(),
                 });
-                self.stop_playback();
+                self.stop_playback(StopCause::Failed);
             }
         }
         self.retry = None;
@@ -1113,6 +1381,10 @@ impl Pipeline {
     // -- playback progress ----------------------------------------------------
 
     fn pump(&mut self, now: Instant) {
+        // Debounced savePlayQueue and write outcomes first: they must drain
+        // on every tick, including idle ones with no front.
+        self.pump_queue_save(now);
+
         // A scheduled bounded retry comes due here.
         let retry_due = self.retry.as_ref().is_some_and(|retry| now >= retry.at);
         if retry_due {
@@ -1165,6 +1437,12 @@ impl Pipeline {
                     });
                 }
             }
+        }
+
+        // A track whose audio just started (fresh front, gapless hand-off,
+        // resume, or post-seek rebuild) fires its now-playing hint once.
+        if self.status == PlaybackStatus::Playing {
+            self.send_now_playing();
         }
     }
 
@@ -1283,6 +1561,12 @@ impl Pipeline {
     }
 
     fn advance_after_track_end(&mut self) {
+        // The queue drained the current song into the next one: this is the
+        // natural end. The submission lands unconditionally when the decoder
+        // reached the true end of stream; a worker that died mid-stream
+        // (eof=false) leaves a partially heard song and follows the skip
+        // rule instead.
+        self.leave_track(self.front.as_ref().is_some_and(|front| front.eof));
         let finished = self.front.take().expect("boundary with no front");
         finished.worker.abort();
         if finished.eof {
@@ -1290,6 +1574,8 @@ impl Pipeline {
             self.failures = 0;
         }
         let segment_end = finished.segment_offset_ms + finished.appended_ms;
+        // The current index changes here: a queue mutation for persistence.
+        self.mark_queue_dirty();
         match self.pending.take() {
             Some(pending) => {
                 // Gapless hand-off: rodio already queued this song's decoded
@@ -1304,6 +1590,7 @@ impl Pipeline {
                     appended_ms: pending.appended_ms,
                     eof: pending.eof,
                     worker_failed: false,
+                    now_playing_sent: false,
                     index: pending.index,
                 });
                 let _ = self.events.send(PlaybackEvent::TrackStarted {
@@ -1324,7 +1611,9 @@ impl Pipeline {
                     self.spawn_front(song, index, 0, true);
                     self.status = PlaybackStatus::Loading;
                 }
-                None => self.stop_playback(),
+                // The natural-end leave already ran at the top of this
+                // method; stopping here must not decide again.
+                None => self.stop_playback_without_leave(),
             },
         }
     }
@@ -1358,6 +1647,226 @@ impl Pipeline {
             position = position.min(u64::from(front.song.duration_ms));
         }
         position.min(u64::from(u32::MAX)) as u32
+    }
+
+    // -- scrobble and play-queue persistence ---------------------------------
+
+    /// Fire-and-forget `scrobble` over the off-thread worker. Requires a
+    /// configured server; without one the call is dropped silently.
+    fn send_scrobble(&mut self, song_id: &str, submission: bool) {
+        if !self.scrobble_enabled {
+            return;
+        }
+        let Some(server) = self.server.as_ref() else {
+            return;
+        };
+        let salt = self.salt.salt();
+        match stream::build_scrobble_url(&server.base_url, &server.auth, &salt, song_id, submission)
+        {
+            Ok(url) => {
+                // Off-thread: the write must never stall audio or the
+                // command loop. Uncertain outcomes are never retried (a
+                // double submission would corrupt the play count).
+                let _ = self.http_tx.send(HttpWork::Scrobble {
+                    song_id: song_id.to_string(),
+                    url,
+                });
+            }
+            Err(message) => {
+                // Builder errors are credential-free static strings.
+                log::warn!("scrobble request could not be built: {message}");
+            }
+        }
+    }
+
+    /// submission=false on a front's first audible start. Harmless per the
+    /// plan: it only refreshes the server's now-playing hint.
+    fn send_now_playing(&mut self) {
+        let Some(front) = self.front.as_ref() else {
+            return;
+        };
+        if front.now_playing_sent {
+            return;
+        }
+        let song_id = front.song.id.clone();
+        self.send_scrobble(&song_id, false);
+        if let Some(front) = self.front.as_mut() {
+            front.now_playing_sent = true;
+        }
+    }
+
+    /// Leaving the current track. `natural_end` is true only when the
+    /// decoder reached the true end of stream — the queue drained the song
+    /// into the next one, and the submission lands regardless of the
+    /// fraction. Every other leave (skip, stop, replaced queue) follows the
+    /// Audioscrobbler rule: at least half the track or four minutes heard,
+    /// else dropped silently. A worker that died mid-stream leaves a
+    /// partially heard song even when its buffered audio finished playing,
+    /// so eof=false follows the skip rule too.
+    fn leave_track(&mut self, natural_end: bool) {
+        let Some(front) = self.front.as_ref() else {
+            return;
+        };
+        let played_ms = u64::from(self.song_position_ms(Instant::now()));
+        let duration_ms = front.song.duration_ms;
+        if !scrobble_decision(played_ms, duration_ms, natural_end) {
+            return;
+        }
+        let song_id = front.song.id.clone();
+        self.send_scrobble(&song_id, true);
+    }
+
+    /// A queue mutation happened (load, add_to_queue, advance, skip,
+    /// shuffle): schedule one debounced save.
+    fn mark_queue_dirty(&mut self) {
+        self.queue_save.mark_dirty(Instant::now());
+    }
+
+    /// Enqueue one savePlayQueue for the queue as it stands. Returns false
+    /// when there is nothing to save (no server or empty queue) or the
+    /// request could not be built; builder errors are credential-free.
+    fn send_queue_save(&mut self, seq: u64) -> bool {
+        let Some(server) = self.server.as_ref() else {
+            return false;
+        };
+        if self.queue.is_empty() {
+            return false;
+        }
+        let current = self
+            .current
+            .map_or(0, |index| index.min(self.queue.len() - 1));
+        let current_id = self.queue[current].id.clone();
+        let ids: Vec<String> = self.queue.iter().map(|song| song.id.clone()).collect();
+        // Subsonic's `current` carries the current song's id; `position` is
+        // its position in milliseconds (omitted at 0, which servers treat
+        // as 0 anyway).
+        let position_ms = u64::from(self.song_position_ms(Instant::now()));
+        let salt = self.salt.salt();
+        match stream::build_save_play_queue_url(
+            &server.base_url,
+            &server.auth,
+            &salt,
+            &ids,
+            &current_id,
+            (position_ms > 0).then_some(position_ms),
+        ) {
+            Ok(url) => {
+                let _ = self.http_tx.send(HttpWork::SaveQueue { seq, url });
+                true
+            }
+            Err(message) => {
+                log::warn!("play queue save could not be built: {message}");
+                false
+            }
+        }
+    }
+
+    fn pump_queue_save(&mut self, now: Instant) {
+        while let Ok(outcome) = self.http_outcomes.try_recv() {
+            self.handle_http_outcome(outcome, now);
+        }
+        if self.queue_save.due(now) {
+            let seq = self.queue_save_seq;
+            self.queue_save_seq += 1;
+            self.queue_save.fired();
+            // Nothing to save (server gone, queue emptied): drop silently.
+            let _ = self.send_queue_save(seq);
+        }
+    }
+
+    fn handle_http_outcome(&mut self, outcome: HttpOutcome, now: Instant) {
+        match outcome {
+            HttpOutcome::Scrobbled { song_id, outcome } => match outcome {
+                stream::WriteOutcome::Completed => {
+                    log::debug!("scrobble recorded for song {song_id}");
+                }
+                stream::WriteOutcome::Rejected => {
+                    // Definite failure: dropped without retry. Only the song
+                    // id is ever named — never the URL, token, or salt.
+                    log::debug!("scrobble for song {song_id} was rejected");
+                }
+                stream::WriteOutcome::Transport => {
+                    // Uncertain: the write may have landed before the
+                    // connection broke. Never retried — a second submission
+                    // would corrupt the play count.
+                    log::warn!("scrobble for song {song_id} is uncertain; not retried");
+                }
+            },
+            HttpOutcome::QueueSaved { outcome, .. } => match outcome {
+                stream::WriteOutcome::Completed => self.queue_save.succeeded(),
+                stream::WriteOutcome::Rejected | stream::WriteOutcome::Transport => {
+                    // savePlayQueue is idempotent, so one retry within this
+                    // dirty state is bounded and safe; past the budget the
+                    // possibly-landed save is reported uncertain and dropped.
+                    if !self.queue_save.failed(now) {
+                        log::warn!(
+                            "saving the play queue did not confirm; given up for this state"
+                        );
+                    }
+                }
+            },
+        }
+    }
+
+    /// Clean shutdown/idle: one final savePlayQueue with the queue as it
+    /// stands, regardless of the debounce, so the next session resumes the
+    /// exact track and position. Bounded to `QUEUE_SAVE_SHUTDOWN_WAIT` so a
+    /// dead server cannot hang the process; an unconfirmed final save is
+    /// reported as uncertain, never retried.
+    fn final_queue_save(&mut self) {
+        if self.queue.is_empty() || self.server.is_none() {
+            return;
+        }
+        let seq = self.queue_save_seq;
+        self.queue_save_seq += 1;
+        if !self.send_queue_save(seq) {
+            return;
+        }
+        let deadline = Instant::now() + QUEUE_SAVE_SHUTDOWN_WAIT;
+        loop {
+            match self.http_outcomes.recv_timeout(Duration::from_millis(250)) {
+                Ok(HttpOutcome::QueueSaved { seq: done, .. }) if done == seq => return,
+                Ok(_) => {}
+                Err(std_mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std_mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+            if Instant::now() >= deadline {
+                log::warn!("the final queue save did not confirm in time; it may not have landed");
+                return;
+            }
+        }
+    }
+
+    /// get_saved_queue: read the server-persisted play queue without loading
+    /// it (the engine never auto-restores; the caller decides). Completes
+    /// off-thread so the command loop never blocks on the server.
+    fn get_saved_queue(
+        &mut self,
+        reply: Option<oneshot::Sender<Result<serde_json::Value, ProtocolError>>>,
+    ) {
+        let Some(reply) = reply else {
+            return;
+        };
+        let Some(server) = self.server.as_ref() else {
+            let _ = reply.send(Err(ProtocolError::new(
+                "missing_credentials",
+                "configure the Navidrome server before reading the saved queue",
+            )));
+            return;
+        };
+        let salt = self.salt.salt();
+        match stream::build_get_play_queue_url(&server.base_url, &server.auth, &salt) {
+            Ok(url) => {
+                let _ = self.http_tx.send(HttpWork::GetSavedQueue { url, reply });
+            }
+            Err(message) => {
+                log::warn!("saved queue request could not be built: {message}");
+                let _ = reply.send(Err(ProtocolError::new(
+                    "stream_unavailable",
+                    "the saved play queue could not be read",
+                )));
+            }
+        }
     }
 
     fn stop_workers(&mut self) {
@@ -1574,6 +2083,108 @@ mod tests {
         assert_eq!(advance_index(2, 3, RepeatMode::Context), Some(0));
         assert_eq!(advance_index(1, 3, RepeatMode::Track), Some(1));
         assert_eq!(advance_index(0, 0, RepeatMode::Context), None);
+    }
+
+    #[test]
+    fn scrobble_decision_follows_the_submission_matrix() {
+        // Natural end: always submitted, whatever the fraction.
+        assert!(scrobble_decision(0, 0, true));
+        assert!(scrobble_decision(1_000, 500_000, true));
+        // Fraction rule boundary: exactly half counts.
+        assert!(scrobble_decision(500, 1_000, false));
+        assert!(!scrobble_decision(499, 1_000, false));
+        // Four-minute rule boundary: counts regardless of the fraction.
+        assert!(scrobble_decision(240_000, 600_000, false));
+        assert!(!scrobble_decision(239_999, 600_000, false));
+        // Unknown duration relies on the four-minute rule alone.
+        assert!(scrobble_decision(240_000, 0, false));
+        assert!(!scrobble_decision(239_999, 0, false));
+        // Below both thresholds: dropped silently.
+        assert!(!scrobble_decision(90_000, 300_000, false));
+    }
+
+    #[test]
+    fn queue_save_burst_coalesces_into_one_debounced_save() {
+        let start = Instant::now();
+        let mut scheduler = QueueSaveScheduler::new();
+        // A burst of mutations inside the window marks dirty once.
+        scheduler.mark_dirty(start);
+        scheduler.mark_dirty(start + Duration::from_millis(100));
+        scheduler.mark_dirty(start + Duration::from_millis(200));
+        assert!(!scheduler.due(start));
+        assert!(!scheduler.due(start + Duration::from_secs(4)));
+        assert!(scheduler.due(start + QUEUE_SAVE_DEBOUNCE));
+        // One fired save clears the state and spends one attempt.
+        scheduler.fired();
+        assert!(!scheduler.due(start + QUEUE_SAVE_DEBOUNCE + QUEUE_SAVE_DEBOUNCE));
+        assert_eq!(scheduler.attempts, 1);
+    }
+
+    #[test]
+    fn failed_queue_save_retries_once_then_drops_the_state() {
+        let start = Instant::now();
+        let mut scheduler = QueueSaveScheduler::new();
+        scheduler.mark_dirty(start);
+        scheduler.fired();
+        // First failure: one bounded retry is scheduled soon.
+        assert!(scheduler.failed(start));
+        assert!(scheduler.due(start + QUEUE_SAVE_RETRY_DELAY));
+        scheduler.fired();
+        // Second failure: budget spent, the possibly-landed save is dropped.
+        assert!(!scheduler.failed(start));
+        assert!(!scheduler.dirty);
+        assert_eq!(scheduler.attempts, 0);
+    }
+
+    #[test]
+    fn new_queue_mutation_and_success_reset_the_save_budget() {
+        let start = Instant::now();
+        let mut scheduler = QueueSaveScheduler::new();
+        scheduler.mark_dirty(start);
+        scheduler.fired();
+        scheduler.failed(start);
+        // A new mutation starts a fresh bounded budget.
+        scheduler.mark_dirty(start);
+        assert_eq!(scheduler.attempts, 0);
+        scheduler.fired();
+        scheduler.succeeded();
+        assert_eq!(scheduler.attempts, 0);
+        assert!(!scheduler.dirty);
+    }
+
+    #[test]
+    fn saved_queue_result_shape_is_typed_and_defensive() {
+        let queue = stream::ParsedPlayQueue {
+            songs: vec![SongRef {
+                id: "tr-1".into(),
+                title: "Song".into(),
+                artists: vec!["Artist".into()],
+                album: "Album".into(),
+                duration_ms: 180_000,
+                cover_art: "cr-1".into(),
+                track: Some(3),
+            }],
+            current_id: "tr-1".into(),
+            current_index: 0,
+            position_ms: 42_000,
+        };
+        let value = saved_queue_result(stream::ReadOutcome::Parsed(queue)).unwrap();
+        assert_eq!(value["songs"][0]["id"], "tr-1");
+        assert_eq!(value["songs"][0]["duration_ms"], 180_000);
+        assert_eq!(value["current_id"], "tr-1");
+        assert_eq!(value["current_index"], 0);
+        assert_eq!(value["position_ms"], 42_000);
+
+        // Read failures are typed, credential-free errors.
+        for outcome in [
+            stream::ReadOutcome::Rejected,
+            stream::ReadOutcome::Transport,
+        ] {
+            let error = saved_queue_result(outcome).unwrap_err();
+            assert_eq!(error.code, "stream_unavailable");
+            assert!(!error.message.contains("http"));
+            assert!(!error.message.contains("token"));
+        }
     }
 
     #[test]

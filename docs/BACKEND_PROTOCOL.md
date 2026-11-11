@@ -81,9 +81,10 @@ Version 2 commands are:
   65535;
 - `set_shuffle` and `set_repeat` (`off`, `context`, or `track`);
 - `configure_server`;
-- `add_to_queue` with a `song` object; and
+- `add_to_queue` with a `song` object;
 - `load` with `songs` plus optional `offset_index`, `position_ms`, and `play`
-  (true by default).
+  (true by default); and
+- `get_saved_queue`.
 
 ### SongRef (`load` and `add_to_queue`)
 
@@ -139,6 +140,85 @@ leaves the queue loaded but paused.
 
 Appends the song to the end of the current queue.
 
+### get_saved_queue
+
+```json
+{"v":2,"id":11,"command":"get_saved_queue"}
+```
+
+Reads the play queue the server persists for this user (`getPlayQueue`)
+**without loading it** — the engine never auto-restores; the caller decides
+what to do with the result. The response result carries the queue as
+SongRefs plus the current song and its position:
+
+```json
+{"type":"response","v":2,"id":11,"ok":true,"result":{
+  "songs":[{"id":"tr-1","title":"Song","artists":["Artist"],"album":"Album",
+            "duration_ms":180000,"cover_art":"cr-1","track":3}],
+  "current_index": 2,
+  "current_id": "tr-3",
+  "position_ms": 42000
+}}
+```
+
+- `songs` is the persisted queue in server order as SongRefs (the same shape
+  `load` accepts). Subsonic durations arrive in seconds and are converted to
+  `duration_ms`; id-less entries are dropped.
+- `current_id` is the current song's id exactly as the server named it (the
+  Subsonic play-queue contract stores the **id**, not an index; it may be
+  absent).
+- `current_index` is the position of `current_id` in `songs`, 0 when the
+  server named no current song or the id is no longer in the list.
+- `position_ms` is the position within the current song, 0 when absent.
+
+An empty or missing server-side queue parses to
+`{"songs":[],"current_index":0,"current_id":"","position_ms":0}` — never an
+error. Parsing is defensive throughout (missing nodes are empty, numbers-as-
+strings are accepted, hostile values clamp to zero). Requires a configured
+server: without one the command answers `missing_credentials`. A failed
+server read answers `stream_unavailable`. The fetch runs off the playback
+pipeline on the engine's write thread, so the command loop and the audio
+never block on the server.
+
+## Server writes (scrobble and play-queue persistence)
+
+The engine owns the truth of a track's natural end, so it also owns the
+honest-scrobble contract:
+
+- **Play start** of every track fires `scrobble?id=…&submission=false` once
+  (harmless: it only refreshes the server's now-playing hint, never the play
+  count).
+- **Natural end** — the queue drained the current song into the next one and
+  the decoder reached the true end of stream — fires
+  `submission=true` exactly once, regardless of the played fraction.
+- **Skip (next/previous), stop, and a queue replaced mid-play** fire
+  `submission=true` only when the Audioscrobbler rule holds at the moment of
+  leaving: at least half the track was heard, or at least four minutes of it
+  (whichever comes first). Below both thresholds the submission is dropped
+  silently. A worker that died mid-stream leaves a partially heard song even
+  when its buffered audio finished playing, so it follows this rule too.
+  Engine failures (rejected/undecodable/unavailable stream) never scrobble.
+- **Seeking** stays on the same track and decides nothing.
+
+Every scrobble rides the engine's off-pipeline write thread: the HTTP call
+can never stall audio or the command loop. Under the uncertainty contract, a
+scrobble whose outcome is unknown (timeout or transport failure mid-write)
+is treated as uncertain and **never retried** — a second submission would
+corrupt the play count. A definite failure (4xx/5xx) is dropped without
+retry as well. Log lines name the song id only: never a URL, token, salt,
+password, or status code.
+
+The engine also persists the queue with `savePlayQueue` after every queue
+mutation (`load`, `add_to_queue`, natural advance, skip, shuffle) and once
+more on graceful shutdown, debounced so a burst of mutations saves at most
+once per ~5 seconds. The save carries the queue's repeated `id` parameters,
+`current` (the current song's id per the Subsonic contract), and `position`
+in milliseconds. `savePlayQueue` is idempotent, so a failed or uncertain
+save may be retried **once** within the same dirty state (a short backoff),
+then it is reported uncertain and dropped — never an unbounded retry loop.
+The final shutdown save is bounded to ~2 seconds; an unconfirmed final save
+is logged as uncertain, never retried.
+
 ## Errors
 
 | code | meaning |
@@ -148,7 +228,7 @@ Appends the song to the end of the current queue.
 | `missing_credentials` | `load`/`add_to_queue` (or another playback command) arrived before `configure_server` |
 | `invalid_configuration` | `configure_server` received a unusable URL or empty username/password |
 | `stream_rejected` | Navidrome refused the stream request (bad credentials or permissions); no retry is attempted |
-| `stream_unavailable` | the stream could not be built, resumed, or decoded |
+| `stream_unavailable` | the stream could not be built, resumed, or decoded, or a server read (saved play queue) failed |
 | `engine_unavailable` / `engine_busy` | the engine task is gone or its command queue is full |
 | `serialization_error` | a `get_state` snapshot could not be serialized |
 
@@ -162,6 +242,7 @@ Adding an optional field or command is backward-compatible. Removing or
 renaming a field (v2 renamed `Track.uri` to `Track.id` and replaced `load`'s
 `context_uri`/`uris` bodies with `songs`), changing its meaning, or changing
 framing requires a new protocol version. The Quickshell service uses this
-socket to configure the server, start local playback (`load`), and append to
-the local queue. Clients must retain the Subsonic API/MPRIS fallback behavior
-when the socket is absent or reports an unsupported version.
+socket to configure the server, start local playback (`load`), append to the
+local queue, and read the server-persisted queue (`get_saved_queue`). Clients
+must retain the Subsonic API/MPRIS fallback behavior when the socket is
+absent or reports an unsupported version.

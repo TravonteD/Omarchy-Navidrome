@@ -695,4 +695,150 @@ TestCase {
     verify(Subsonic.coverArtUrl("https://n.example.com", null, 300,
       {u: "alice", p: "sesame"}) === null)
   }
+
+  // ------ bookmarks and saved play queue (resume machinery) ------
+
+  function test_bookmarkParams_rejectsEmptyAndCarriesPosition() {
+    var targeted = Subsonic.bookmarkParams("tr-1", 42000)
+    compare(targeted.id, "tr-1")
+    compare(targeted.position, "42000")
+    var bare = Subsonic.bookmarkParams("tr-1")
+    compare(bare.id, "tr-1")
+    verify(bare.position === undefined)
+    // Invalid positions stay off the wire; empty ids are rejected.
+    verify(Subsonic.bookmarkParams("tr-1", -5).position === undefined)
+    verify(Subsonic.bookmarkParams("tr-1", "not a number").position === undefined)
+    verify(Subsonic.bookmarkParams("", 100) === null)
+    verify(Subsonic.bookmarkParams(null, 100) === null)
+  }
+
+  function test_parseBookmarks_normalizesAndSortsNewestFirst() {
+    var parsed = Subsonic.parseBookmarks({"bookmarks": {"bookmark": [
+      {entry: {id: "tr-1", title: "Old", duration: 180}, position: 1000,
+       username: "alice", created: "2026-01-02T10:00:00Z"},
+      {entry: {id: "tr-2", title: "New", duration: 200}, position: 2500,
+       created: "2026-01-05T10:00:00Z"},
+      {entry: [{id: "tr-3", title: "ListNode"}], position: 300,
+       username: "bob", created: "2026-01-04T10:00:00Z"},
+      {position: 900, created: "2026-01-06T10:00:00Z"},
+      {entry: {id: "tr-4"}, created: "2027-01-01T00:00:00Z"},
+      {entry: {id: "tr-5"}, created: ""}
+    ]}})
+    // Newest first; undated bookmarks sort last; id-less entries drop.
+    compare(parsed.length, 5)
+    compare(parsed[0].id, "tr-4")
+    compare(parsed[1].id, "tr-2")
+    compare(parsed[2].id, "tr-3")
+    compare(parsed[3].id, "tr-1")
+    compare(parsed[4].id, "tr-5")
+    compare(parsed[1].position, 2500)
+    compare(parsed[1].username, "")
+    compare(parsed[0].created, "2027-01-01T00:00:00Z")
+    compare(parsed[1].song.title, "New")
+    // Defensive defaults: nothing, garbage, or a failed status parse empty.
+    compare(Subsonic.parseBookmarks(null).length, 0)
+    compare(Subsonic.parseBookmarks({}).length, 0)
+    compare(Subsonic.parseBookmarks("garbage").length, 0)
+    compare(Subsonic.parseBookmarks({"bookmarks": {"bookmark": {}}}).length, 0)
+  }
+
+  function test_parsePlayQueue_defensiveNormalizedSongsCurrentAndPosition() {
+    var parsed = Subsonic.parsePlayQueue({"playQueue": {
+      current: "tr-2",
+      position: "42000",
+      entry: [
+        {id: "tr-1", title: "A", artist: "Art", album: "Al", duration: 180,
+         coverArt: "c1", track: 3},
+        {id: "tr-2", title: "B"}
+      ]
+    }})
+    compare(parsed.songs.length, 2)
+    compare(parsed.songs[0].id, "tr-1")
+    compare(parsed.songs[0].artist, "Art")
+    compare(parsed.songs[0].duration, 180)
+    compare(parsed.songs[0].coverArt, "c1")
+    compare(parsed.current, "tr-2")
+    compare(parsed.position, 42000)
+    // Single-entry and missing-node shapes parse defensively.
+    var single = Subsonic.parsePlayQueue({"playQueue": {
+      entry: {id: "tr-9", title: "Solo"}, current: "tr-9", position: 5}})
+    compare(single.songs.length, 1)
+    compare(single.current, "tr-9")
+    compare(Subsonic.parsePlayQueue(null).songs.length, 0)
+    compare(Subsonic.parsePlayQueue(null).current, "")
+    compare(Subsonic.parsePlayQueue(null).position, 0)
+    compare(Subsonic.parsePlayQueue({}).position, 0)
+    compare(Subsonic.parsePlayQueue("garbage").current, "")
+  }
+
+  function test_restoreLoadPlan_prefersTheSavedQueueWithCurrentAndPosition() {
+    var queue = {
+      songs: [{id: "tr-1"}, {id: "tr-2"}, {id: "tr-3"}],
+      current: "tr-2",
+      position: 42000
+    }
+    var plan = Subsonic.restoreLoadPlan(queue, [], 100)
+    compare(plan.songs.length, 3)
+    compare(plan.offset_index, 1)
+    compare(plan.position_ms, 42000)
+    // Unknown current song: the queue still restores from the top.
+    plan = Subsonic.restoreLoadPlan(
+      {songs: [{id: "tr-1"}, {id: "tr-2"}], current: "gone", position: 9000}, [], 100)
+    compare(plan.offset_index, 0)
+    compare(plan.position_ms, 9000)
+    // A missing position defaults to 0, which the load treats as "from start".
+    plan = Subsonic.restoreLoadPlan(
+      {songs: [{id: "tr-1"}], current: "", position: 0}, [], 100)
+    compare(plan.position_ms, 0)
+    compare(plan.offset_index, 0)
+  }
+
+  function test_restoreLoadPlan_inheritsBookmarkPositionForUnstartedCurrentSong() {
+    var queue = {
+      songs: [{id: "tr-1"}, {id: "tr-2"}],
+      current: "tr-2",
+      position: 0
+    }
+    var marks = [
+      {id: "tr-9", position: 5000},
+      {id: "tr-2", position: 123000}
+    ]
+    var plan = Subsonic.restoreLoadPlan(queue, marks, 100)
+    compare(plan.offset_index, 1)
+    compare(plan.position_ms, 123000)
+    // Without a bookmark the queue position stays 0.
+    plan = Subsonic.restoreLoadPlan(queue, [{id: "tr-9", position: 5000}], 100)
+    compare(plan.position_ms, 0)
+  }
+
+  function test_restoreLoadPlan_fallsBackToTheNewestBookmark() {
+    var marks = [
+      {id: "tr-1", position: 1000, created: "2026-01-02",
+       song: {id: "tr-1", title: "Old"}},
+      {id: "tr-2", position: 42000, created: "2026-01-05",
+       song: {id: "tr-2", title: "New"}}
+    ]
+    var plan = Subsonic.restoreLoadPlan(null, marks, 100)
+    compare(plan.songs.length, 1)
+    compare(plan.songs[0].id, "tr-2")
+    compare(plan.offset_index, 0)
+    compare(plan.position_ms, 42000)
+    // Nothing anywhere: no restore at all.
+    verify(Subsonic.restoreLoadPlan(null, [], 100) === null)
+    verify(Subsonic.restoreLoadPlan({songs: []}, [{id: "tr-1"}], 100) === null)
+    verify(Subsonic.restoreLoadPlan({songs: []}, [], 100) === null)
+  }
+
+  function test_restoreLoadPlan_capsTheLoadedQueue() {
+    var queue = {
+      songs: [{id: "tr-1"}, {id: "tr-2"}, {id: "tr-3"}, {id: "tr-4"}],
+      current: "tr-3",
+      position: 1000
+    }
+    var plan = Subsonic.restoreLoadPlan(queue, [], 2)
+    compare(plan.songs.length, 2)
+    // The current index clamps inside the capped load.
+    compare(plan.offset_index, 1)
+    compare(plan.position_ms, 1000)
+  }
 }

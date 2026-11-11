@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use protocol::{BackendState, Lifecycle};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 
 use crate::{config::BackendConfig, state::StateStore};
@@ -123,10 +124,16 @@ async fn run(config: BackendConfig, socket_path: PathBuf) -> Result<()> {
     ));
 
     let mut requested_shutdown = shutdown_rx.clone();
+    // systemd stops the unit with SIGTERM (idle shutdown included); without
+    // handling it the process dies before the engine's graceful teardown and
+    // the final queue save.
+    let mut terminate =
+        signal(SignalKind::terminate()).context("failed to listen for the termination signal")?;
     tokio::select! {
         signal = tokio::signal::ctrl_c() => {
             signal.context("failed to wait for termination signal")?;
         }
+        _ = terminate.recv() => {}
         _ = requested_shutdown.changed() => {}
         result = runtime.wait_done() => {
             result.context("stream engine stopped")?;
@@ -148,6 +155,9 @@ async fn run(config: BackendConfig, socket_path: PathBuf) -> Result<()> {
         current.playback = crate::protocol::PlaybackStatus::Stopped;
         true
     });
+    // The pipeline's teardown performs the final savePlayQueue; give it a
+    // bounded window so the write leaves before the process exits.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(4), runtime.wait_done()).await;
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), mpris_task).await;
     Ok(())
 }

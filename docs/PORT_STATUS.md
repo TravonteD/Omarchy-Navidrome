@@ -209,6 +209,89 @@ extended script tests, and both Quickshell integration checks (the
 authorization test now drives the live Navidrome save round-trip against a
 stubbed secret-tool and the BackendClient typing). `qmllint` stays clean.
 
+## Package 4 — queue, scrobble, and resume (10 November 2026)
+
+The engine now owns the honest-scrobble contract, server-side queue
+persistence, and the restore machinery, per the plan's "Queue, scrobble, and
+resume" package:
+
+- **Scrobbles (backend-side).** The stream engine builds
+  `scrobble?id=…&submission=…` URLs from its in-memory credentials and hands
+  them to one dedicated `stream-writes` worker thread — the HTTP call can
+  never stall audio or the command loop. Play start fires
+  `submission=false` once per front (harmless now-playing hint, refreshed
+  again after a seek rebuilds the front). The decision matrix, documented
+  next to `scrobble_decision` in `engine.rs`: natural end (the queue drained
+  the song into the next one **and** the decoder reached the true end of
+  stream) submits `submission=true` exactly once regardless of the fraction;
+  skip (next/previous), stop, and a queue replaced mid-play submit only when
+  the Audioscrobbler rule holds at the moment of leaving (≥ ½ of the track or
+  ≥ 4 minutes heard, whichever comes first), else they drop silently; a
+  worker that died mid-stream counts as a partial hear and follows the skip
+  rule; engine failures never scrobble; a seek stays on the track and decides
+  nothing. Uncertainty contract: an outcome-unknown scrobble is logged as an
+  uncertain marker and never retried (a double submission corrupts play
+  counts); a definite 4xx/5xx is dropped without retry too. Log lines name
+  the song id only — no URL, token, salt, password, or status code.
+- **Queue persistence (backend-owned).** After every queue mutation (`load`,
+  `add_to_queue`, natural advance, skip, shuffle) the engine schedules one
+  debounced `savePlayQueue` (burst → at most one save per ~5 s), carrying the
+  repeated `id` params, `current`, and `position`. Per the Subsonic contract,
+  `current` is the **current song's id** (it must be one of the `id`
+  values), not an index — a deliberate deviation from the package brief's
+  "current index" wording; the brief's intent (persist where you are) is
+  preserved. The save is idempotent, so a failed/uncertain save gets one
+  bounded retry within the same dirty state, then it is reported uncertain
+  and dropped — never an unbounded loop. Graceful shutdown performs a final
+  save regardless of the debounce, bounded to ~2 s; `main.rs` now also
+  handles SIGTERM (systemd's stop signal, i.e. the idle-shutdown path) so the
+  teardown — and with it the final save — actually runs, and waits ≤ 4 s for
+  the engine to finish it. Shutdown itself never scrobbles: quitting
+  mid-track is not a play under the Audioscrobbler rule, and idle shutdowns
+  must not invent one.
+- **`get_saved_queue` (protocol v2).** New command; the backend fetches
+  `getPlayQueue` off the pipeline and answers
+  `{"songs":[SongRef…],"current_index":n,"current_id":"…","position_ms":n}`
+  — `current_index` is the derived position of `current_id` in `songs` (0
+  when absent or gone). Empty/missing server queues parse empty, never an
+  error (defensive parser in `stream.rs`: numbers-as-strings, clamps, id-less
+  entries dropped). Requires a configured server (`missing_credentials`
+  otherwise); server read failures answer `stream_unavailable`. The engine
+  never auto-loads — the caller decides. `docs/BACKEND_PROTOCOL.md` gained
+  the command, the response shape, and a "Server writes" section recording
+  the scrobble matrix and the save-debounce contract.
+- **Bookmarks and restore (QML).** `Subsonic.js` grew pure resume helpers:
+  `bookmarkParams(id, position?)`, `parseBookmarks(data)` (normalized
+  `[{id, position, username, created, song}]`, newest-first, id-less dropped)
+  and `parsePlayQueue(data)` (`{songs, current, position}`) reusing the
+  shared normalizers, plus the pure decision helper `restoreLoadPlan(
+  playQueue, bookmarks, maxSongs)`: a saved queue wins (current index +
+  position), a queue at position 0 inherits a bookmark's exact position for
+  the partially played current song, and with no saved queue the newest
+  bookmark resumes that single song. `Service.qml` instantiates the
+  SubsonicApi transport (inert until called) and gained
+  `restoreSavedSession()`: it reads the queue through the backend's
+  `get_saved_queue` (credentials never leave the engine), refines the
+  position via `getBookmarks`, and loads the result paused through the
+  regular v2 `loadPlayback` path so pressing Play resumes where the last
+  session stopped. Package 5 binds the real resume UI; the interim trigger
+  is the backend finishing `configure_server` while nothing is playing,
+  guarded by a once-per-session flag plus an idle check (no media, backend
+  not playing/loading, no pending playback push) so a reconnect can never
+  clobber live playback.
+- **Config.** `scrobble = true` (validated bool) joined `[global]` and
+  `ConfigSummary`; false freezes the server's play counts.
+
+Validation: the full `scripts/test.sh` gate passes — 57 backend Rust tests
+(was 44; the scrobble decision matrix, the debounced bounded queue-save
+scheduler, the `get_saved_queue` response shape, pinned-salt scrobble/save/
+getPlayQueue URL builders, defensive `getPlayQueue` parsing, credential
+redaction assertions on every builder error, and the `scrobble` config
+toggle), 244 QML test cases (was 237; the seven new Subsonic.js
+bookmark/play-queue/restore-plan tests), 19 python helper tests, the script
+tests, and both Quickshell integration checks. `cargo fmt`/`clippy` and
+`qmllint` stay clean.
+
 ## Next packages
 
 1. Navidrome API layer (`Api.js`/`SpotifyApi.qml` rewrite on Subsonic JSON) —
@@ -217,7 +300,8 @@ stubbed secret-tool and the BackendClient typing). `qmllint` stays clean.
 2. Setup, credentials, connectivity — landed (see above); package 5 reuses
    `saveNavidromeCredentials()` for the in-app setup UI.
 3. Stream engine (Rust `/rest/stream` player with symphonia + rodio).
-4. Queue, scrobble, resume persistence.
+4. Queue, scrobble, resume persistence — landed (see above); package 5 binds
+   the restore trigger to the real resume UI.
 5. Collection and discovery UI adaptation.
 6. Lyrics (`getLyricsBySongId`), internet radio, settings cleanup.
 7. Docs, release, install scripts.

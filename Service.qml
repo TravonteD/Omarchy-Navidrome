@@ -3094,8 +3094,72 @@ Item {
       return
     backendClient.configureServer(credentials.url, credentials.username,
       credentials.password, function(ok, result, error) {
-        if (!ok) root.fail(error || "Could not configure the Navidrome server")
+        if (!ok) {
+          root.fail(error || "Could not configure the Navidrome server")
+          return
+        }
+        // Interim restore trigger (package 5 binds the real resume UI):
+        // once the backend knows the server, offer the saved queue back.
+        root.restoreSavedSession(null)
       })
+  }
+
+  // Saved-session restore (package 4 machinery; package 5 binds the button):
+  // the backend's get_saved_queue answer is the preferred source — the play
+  // queue and its position come straight from the server while the
+  // credentials never leave the engine — and a bookmark refines the exact
+  // position of a partially played current song. The queue is loaded paused
+  // through the regular v2 path, so pressing Play resumes where the last
+  // session stopped. The one-attempt-per-session guard plus the idle check
+  // keep a reconnect from clobbering live playback.
+  property bool restoreAttempted: false
+
+  function backendIdleForRestore() {
+    if (hasMedia) return false
+    var state = backendClient.lastState
+    if (state && (state.playback === "playing" || state.playback === "loading"))
+      return false
+    return !pendingPlaybackBody && !localActivationRequested
+  }
+
+  function restoreSavedSession(callback) {
+    if (!backendClient.connected || !backendClient.serverConfigured
+        || !authManager.loggedIn || restoreAttempted || !backendIdleForRestore()) {
+      if (typeof callback === "function") callback(false)
+      return false
+    }
+    restoreAttempted = true
+    backendClient.sendCommand("get_saved_queue", null, function(ok, result, error) {
+      if (!ok) {
+        if (typeof callback === "function") callback(false)
+        return
+      }
+      var saved = result && typeof result === "object" ? result : ({})
+      var queuePlan = {
+        songs: Api.arrayValues(saved.songs),
+        current: String(saved.current_id || ""),
+        position: Number(saved.position_ms) || 0
+      }
+      subsonicApi.request("getBookmarks", {}, function(bookmarkResult) {
+        var marks = bookmarkResult && bookmarkResult.ok === true
+          ? Subsonic.parseBookmarks(bookmarkResult.data) : []
+        var plan = Subsonic.restoreLoadPlan(queuePlan, marks,
+          Api.PLAYBACK_URI_LIMIT)
+        if (!plan) {
+          if (typeof callback === "function") callback(false)
+          return
+        }
+        backendClient.loadPlayback({
+          items: plan.songs,
+          offset_index: plan.offset_index,
+          position_ms: plan.position_ms,
+          play: false
+        }, function(loadOk) {
+          if (typeof callback === "function") callback(loadOk === true)
+        })
+      })
+    })
+    return true
   }
 
   function probeForLocalDevice() {
@@ -3657,6 +3721,7 @@ Item {
     radioSerial++
     playlistItemsSerial++
     clearPendingPlayback()
+    restoreAttempted = false
     resumeCandidate = null
     resumeCandidateLoadedAt = 0
     radioContextSelected = false
@@ -4195,6 +4260,17 @@ Item {
     // Transitional: SpotifyApi.qml (and the whole Web API layer) is deleted in
     // package 5; the AuthManager shim fails every Web API path immediately.
     auth: authManager
+  }
+
+  SubsonicApi {
+    id: subsonicApi
+    // The QML-side Subsonic transport. The saved-session restore uses it for
+    // getBookmarks only: the play queue itself is read through the backend's
+    // get_saved_queue command so the credentials never leave the engine.
+    // Inert when idle — no polling, no requests without an explicit call.
+    serverUrl: authManager.navidromeUrl
+    username: authManager.navidromeUsername
+    password: authManager.navidromePassword
   }
 
   SpotifyConnectManager {
