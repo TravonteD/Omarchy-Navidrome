@@ -86,8 +86,10 @@ Item {
   property string draftAudioQuality: "320 kbps"
   property var contextItem: null
   property var contextSourceItems: []
-  property string contextSourceUri: ""
-  property string contextPlaybackUri: ""
+  // Identity key of the collection the context menu was opened from
+  // (Api.savedKeyFor of a playlist, "" elsewhere). No uri tokens: playlist
+  // identity is type:id now.
+  property string contextSourceKey: ""
   property int contextSourceIndex: -1
   property var contextPlaylist: null
   property var pendingPlaylistItem: null
@@ -331,16 +333,13 @@ Item {
     return "Ready — starts automatically when you play music"
   }
 
-  function openMediaContext(item, sceneX, sceneY, sourceItems, contextUri, index,
-      playbackContextUri) {
+  function openMediaContext(item, sceneX, sceneY, sourceItems, contextKey, index) {
     if (!item) return
     contextItem = item
     contextSourceItems = Array.isArray(sourceItems) ? sourceItems : []
-    contextSourceUri = String(contextUri || "")
-    contextPlaybackUri = playbackContextUri === undefined
-      ? contextSourceUri : String(playbackContextUri || "")
+    contextSourceKey = String(contextKey || "")
     contextSourceIndex = index === undefined ? -1 : Math.floor(Number(index))
-    contextPlaylist = playlistForContext(contextSourceUri)
+    contextPlaylist = playlistForContext(contextSourceKey)
     mediaContextMenu.x = Math.max(Style.space(6), Math.min(
       window.width - mediaContextMenu.width - Style.space(6), Number(sceneX) || 0))
     mediaContextMenu.y = Math.max(Style.space(6), Math.min(
@@ -417,13 +416,16 @@ Item {
     })
   }
 
-  function playlistForContext(uri) {
-    var value = String(uri || "")
+  // Playlist identity is the type:id saved key; a refreshed playlist object
+  // (new snapshot) keeps matching because the id does not change.
+  function playlistForContext(key) {
+    var value = String(key || "")
     if (!service || !value) return null
-    if (service.selectedPlaylist && service.selectedPlaylist.uri === value)
+    if (service.selectedPlaylist
+        && Api.savedKeyFor(service.selectedPlaylist) === value)
       return service.selectedPlaylist
     if (service.detailItem && service.detailItem.type === "playlist"
-        && service.detailItem.uri === value) return service.detailItem
+        && Api.savedKeyFor(service.detailItem) === value) return service.detailItem
     return null
   }
 
@@ -465,7 +467,7 @@ Item {
     searchText = String(state.searchText || service.searchQuery || "")
     searchType = Api.SEARCH_TYPES.indexOf(String(state.searchType || "")) >= 0
       ? String(state.searchType) : "track"
-    libraryType = ["tracks", "albums", "artists", "shows", "episodes", "audiobooks"]
+    libraryType = ["tracks", "albums", "artists"]
       .indexOf(String(state.libraryType || "")) >= 0 ? String(state.libraryType) : "tracks"
     homeType = ["recent", "frequent", "newest", "starred"].indexOf(
       String(state.homeType || "")) >= 0 ? String(state.homeType) : "recent"
@@ -626,10 +628,10 @@ Item {
     syncUnifiedSearchField()
   }
 
-  function activateMedia(item, sourceItems, contextUri, successMessage) {
+  function activateMedia(item, sourceItems, successMessage) {
     if (!item || !service) return
     if (unifiedSearchField.activeFocus) focusScope.forceActiveFocus()
-    service.playItem(item, sourceItems, contextUri, successMessage)
+    service.playItem(item, sourceItems, successMessage)
   }
 
   function playSelectedPlaylist() {
@@ -641,7 +643,7 @@ Item {
         service.fail("No visible playlist items to play")
         return
       }
-      activateMedia(items[0], items, "",
+      activateMedia(items[0], items,
         Api.visibleOrderPlaybackMessage(items.length))
       return
     }
@@ -1008,10 +1010,9 @@ Item {
   function pageCursorActions() {
     var actions = []
     if (currentTab === "home")
-      actions.push("home-recent", "home-tracks", "home-artists")
+      actions.push("home-recent", "home-frequent", "home-newest", "home-starred")
     if (currentTab === "library")
-      actions.push("library-tracks", "library-albums", "library-artists",
-        "library-shows", "library-episodes", "library-audiobooks")
+      actions.push("library-tracks", "library-albums", "library-artists")
     if (currentTab === "playlists" && service && service.selectedPlaylist)
       actions.push("playlist-play", "playlist-more")
     if (showingUniversalSearch) {
@@ -1025,20 +1026,21 @@ Item {
     if (currentTab === "detail" && service && service.detailItem
         && !showingUniversalSearch) {
       var kind = service.detailItem.type
-      if (["show", "audiobook"].indexOf(kind) < 0
-          || (service.detailItems && service.detailItems.length > 0))
-        actions.push("detail-play")
+      actions.push("detail-play", "detail-more")
+      // Playlists have no server star; only songs, albums, and artists.
       if (["track", "album", "artist"].indexOf(kind) >= 0)
         actions.push("detail-save")
-      actions.push("detail-more")
     }
     if (artistCatalog) {
       actions.push("list-albums", "list-songs")
-      if (service && service.artistThisIsPlaylist) actions.push("detail-thisis")
     } else {
       var collection = pageCollection()
       if (collection && collection.showSort) actions.push("sort")
       if (collection || pageListView()) actions.push("list")
+      if (currentTab === "discover" && service
+          && service.discoverGenre !== "") actions.push("list-genres")
+      if (currentTab === "discover" && service
+          && service.discoverGenre !== "") actions.push("genre-clear")
       if (collection && collection.hasMore) actions.push("more")
       if (collection && collection.filterScanAvailable) actions.push("filter-scan")
     }
@@ -1276,28 +1278,24 @@ Item {
       if (service) service.loadLibrary(libraryType, false)
     } else if (action.indexOf("search-") === 0) {
       selectSearchType(action.substring(7))
+    } else if (action === "genre-clear" && service) {
+      service.clearGenreBrowse()
     } else if (action === "playlist-play" && service && service.selectedPlaylist)
       playSelectedPlaylist()
     else if (action === "playlist-more" && service && service.selectedPlaylist)
       openMediaContext(service.selectedPlaylist, Style.space(80),
-        Style.space(120), [], service.selectedPlaylist.uri, -1)
+        Style.space(120), [], Api.savedKeyFor(service.selectedPlaylist), -1)
     else if (action === "sort") {
       var sortCollection = pageCollection()
       if (sortCollection) sortCollection.cycleSort()
     } else if (action === "detail-play" && service && service.detailItem) {
-      if (["show", "audiobook"].indexOf(service.detailItem.type) >= 0
-          && service.detailItems && service.detailItems.length)
-        activateMedia(service.detailItems[0], service.detailItems, "")
-      else activateMedia(service.detailItem)
+      activateMedia(service.detailItem)
     } else if (action === "detail-save" && service && service.detailItem) {
       if (!service.isSaved(service.detailItem))
         service.toggleSaved(service.detailItem)
     } else if (action === "detail-more" && service && service.detailItem) {
       openMediaContext(service.detailItem, Style.space(80), Style.space(120),
-        service.detailItems || [], service.detailItem.uri, -1)
-    } else if (action === "detail-thisis") {
-      var thisIs = findNamedItem(pageLoader.item, "artist-thisis")
-      if (thisIs && thisIs.triggerPrimary) thisIs.triggerPrimary()
+        service.detailItems || [], Api.savedKeyFor(service.detailItem), -1)
     } else if (String(action).indexOf("ctx-") === 0) {
       activateContextMenuAction(action)
     } else if (Api.isCursorListAction(action)) {
@@ -1309,7 +1307,8 @@ Item {
           list.currentItem.triggerPrimary()
       }
     } else if (action === "more") {
-      var more = pageCollection()
+      var more = collectionForListAction(currentTab === "discover"
+        && service && service.discoverGenre !== "" ? "list-genres" : "list")
       if (more && more.requestMore) more.requestMore()
     } else if (action === "sleep-15" && service) {
       service.setSleepMinutes(15)
@@ -1345,7 +1344,7 @@ Item {
       var anchor = collection.currentContextAnchor()
       if (anchor && anchor.item) {
         openMediaContext(anchor.item, anchor.x, anchor.y, anchor.items,
-          anchor.uri, anchor.index, anchor.playbackUri)
+          anchor.key, anchor.index)
         return true
       }
     }
@@ -1383,7 +1382,9 @@ Item {
       x = point.x
       y = point.y
     }
-    openMediaContext(item, x, y, [item], item.uri, 0)
+    // The now-playing item is not a playlist: its context menu has no
+    // backing collection, so the context key stays empty.
+    openMediaContext(item, x, y, [item], "", 0)
     return true
   }
 
@@ -1626,13 +1627,13 @@ Item {
 
   function shortcutRows() {
     var rows = [
-      { section: "SEARCH", action: "Search all of Spotify", keys: "Ctrl+F or /" },
-      { action: "Toggle current area / all of Spotify", keys: "Ctrl+F or / again" },
+      { section: "SEARCH", action: "Search everywhere", keys: "Ctrl+F or /" },
+      { action: "Toggle current area / everywhere", keys: "Ctrl+F or / again" },
       { action: "Leave search", keys: "Esc" },
       { section: "NAVIGATION", action: "Go back", keys: "Alt+Left" },
       { action: "Leave Settings or Devices", keys: "Esc" },
       { action: "Open Settings", keys: "Ctrl+," },
-      { action: "Open For You", keys: "Alt+Shift+H" },
+      { action: "Open Home", keys: "Alt+Shift+H" },
       { action: "Open Queue", keys: "Alt+Shift+Q" },
       { action: "Open Devices", keys: "Alt+Shift+D" },
       { action: "Open the current artist", keys: "Ctrl+Shift+A" },
@@ -1978,9 +1979,9 @@ Item {
 
   function primaryNavigationItems() {
     var items = [
-      { id: "home", label: "For you", icon: "󰎆" },
+      { id: "home", label: "Home", icon: "󰎆" },
       { id: "search", label: "Search", icon: "󰍉" },
-      { id: "discover", label: "Discover", icon: "󰲸" }
+      { id: "discover", label: "Explore", icon: "󰲸" }
     ]
     if (service && service.lastRadioPlaylist) items.push({
       id: "radio",
@@ -1993,9 +1994,9 @@ Item {
 
   function extraNarrowNavigationItems() {
     return [
-      { id: "home", label: "For you", icon: "󰎆" },
+      { id: "home", label: "Home", icon: "󰎆" },
       { id: "search", label: "Search", icon: "󰍉" },
-      { id: "discover", label: "Discover", icon: "󰲸" },
+      { id: "discover", label: "Explore", icon: "󰲸" },
       { id: "queue", label: "Queue", icon: "󰐕" },
       { id: "library", label: "Your Library", icon: "󰋑" },
       { id: "playlists", label: "Playlists", icon: "󱁐" },
@@ -2074,14 +2075,14 @@ Item {
   }
 
   function pageTitle() {
-    if (currentTab === "login") return "Log in to Spotify"
-    if (showingUniversalSearch) return "Search Spotify"
-    if (currentTab === "home") return "For you"
-    if (currentTab === "discover") return "Discover"
+    if (currentTab === "login") return "Log in"
+    if (showingUniversalSearch) return "Search"
+    if (currentTab === "home") return "Home"
+    if (currentTab === "discover") return "Explore"
     if (currentTab === "library") return "Your Library"
     if (currentTab === "playlists") return "Playlists"
     if (currentTab === "queue") return "Queue"
-    if (currentTab === "devices") return "Spotify Connect"
+    if (currentTab === "devices") return "Devices"
     if (currentTab === "setup") return "Settings"
     if (currentTab === "detail") {
       if (artistScopedSearchActive) return "Search in " + service.detailItem.name
@@ -2091,24 +2092,25 @@ Item {
   }
 
   function pageSubtitle() {
-    if (currentTab === "login") return "Connect your Spotify account to get started"
+    if (currentTab === "login") return "Connect your Navidrome server to get started"
     if (showingUniversalSearch) return activeSearchScope.available
       ? "Searching everywhere — enable the area checkmark to narrow the results"
-      : "Songs, artists, albums, playlists, podcasts and audiobooks"
-    if (currentTab === "home") return "Recently played and your personal favorites"
-    if (currentTab === "discover") return "Personal mixes and fresh music from Spotify"
-    if (currentTab === "library") return "Songs, albums, artists, podcasts and audiobooks"
-    if (currentTab === "playlists") return "Your Spotify playlists"
+      : "Songs, artists, albums and playlists"
+    if (currentTab === "home")
+      return "Recently played, frequent, newest and starred albums"
+    if (currentTab === "discover") return "Random albums and genre browsing"
+    if (currentTab === "library") return "Starred songs, albums and artists"
+    if (currentTab === "playlists") return "Your playlists"
     if (currentTab === "queue") return "What plays next"
-    if (currentTab === "devices") return "Speakers and players"
+    if (currentTab === "devices") return "Playback on this computer"
     if (currentTab === "setup") return "Account, playback and app preferences"
     if (currentTab === "detail") {
       if (artistScopedSearchActive)
-        return "Songs, albums and playlists matching “" + artistSearchText.trim() + "”"
+        return "Songs and albums matching “" + artistSearchText.trim() + "”"
       return service && service.detailItem
-        ? Api.spotifyTypeLabel(service.detailItem.type) : "Spotify item"
+        ? Api.spotifyTypeLabel(service.detailItem.type) : "Library item"
     }
-    return "Songs, artists, albums, playlists, podcasts and audiobooks"
+    return "Songs, artists, albums and playlists"
   }
 
   function sidebarPlaylistName(item) {
@@ -2131,25 +2133,18 @@ Item {
     return options
   }
 
-  function openExternal(item) {
-    if (item && item.externalUrl) Qt.openUrlExternally(item.externalUrl)
-  }
-
-  function copyExternal(item) {
-    if (!item || !item.externalUrl) return
-    Quickshell.execDetached(["wl-copy", String(item.externalUrl)])
-    if (service) service.succeed("Spotify link copied")
-  }
-
   function playlistPosition(item, sourceItems) {
     if (!service || !item || !contextPlaylist) return -1
     var source = sourceItems === undefined
       ? contextPlaylistItems() : Api.arrayValues(sourceItems)
+    var itemKey = Api.savedKeyFor(item)
+    if (!itemKey) return -1
     var occurrence = 0
     for (var shown = 0; shown < contextSourceIndex; shown++)
-      if (contextSourceItems[shown] && contextSourceItems[shown].uri === item.uri) occurrence++
+      if (contextSourceItems[shown]
+          && Api.savedKeyFor(contextSourceItems[shown]) === itemKey) occurrence++
     for (var i = 0; i < source.length; i++) {
-      if (source[i] && source[i].uri === item.uri) {
+      if (source[i] && Api.savedKeyFor(source[i]) === itemKey) {
         if (occurrence === 0) return i
         occurrence--
       }
@@ -2537,7 +2532,7 @@ Item {
         rightPadding: Style.space(8)
         topPadding: Style.space(4)
         bottomPadding: Style.space(4)
-        text: root.contextItem ? String(root.contextItem.name || "Spotify item") : "Spotify item"
+        text: root.contextItem ? String(root.contextItem.name || "Library item") : "Library item"
         color: root.muted
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
@@ -2559,14 +2554,12 @@ Item {
 
       ContextMenuButton {
         contextAction: "ctx-play"
-        visible: root.contextItem
-          && ["show", "audiobook"].indexOf(root.contextItem.type) < 0
+        visible: root.contextItem !== null
         text: "Play"
         iconText: "󰐊"
         onClicked: {
           mediaContextMenu.close()
-          root.activateMedia(root.contextItem, root.contextSourceItems,
-            root.contextPlaybackUri)
+          root.activateMedia(root.contextItem, root.contextSourceItems)
         }
       }
 
@@ -2655,7 +2648,7 @@ Item {
 
       ContextMenuButton {
         contextAction: "ctx-library"
-        visible: root.contextItem && !!root.contextItem.uri
+        visible: root.contextItem && !!root.contextItem.id
           && ["track", "album", "artist"].indexOf(root.contextItem.type) >= 0
         text: root.service && root.service.isSaved(root.contextItem)
           ? "Remove from library" : "Save to library"
@@ -2699,34 +2692,6 @@ Item {
           var position = root.playlistPosition(root.contextItem)
           mediaContextMenu.close()
           root.service.removePlaylistItem(root.contextItem, position, root.contextPlaylist)
-        }
-      }
-
-      PanelSeparator {
-        width: parent.width
-        visible: root.contextItem && root.contextItem.externalUrl
-        foreground: root.foreground
-      }
-
-      ContextMenuButton {
-        contextAction: "ctx-copy"
-        visible: root.contextItem && root.contextItem.externalUrl
-        text: "Copy Spotify link"
-        iconText: "󰌷"
-        onClicked: {
-          mediaContextMenu.close()
-          root.copyExternal(root.contextItem)
-        }
-      }
-
-      ContextMenuButton {
-        contextAction: "ctx-open"
-        visible: root.contextItem && root.contextItem.externalUrl
-        text: "Open in Spotify"
-        iconText: "󰏌"
-        onClicked: {
-          mediaContextMenu.close()
-          root.openExternal(root.contextItem)
         }
       }
         }
@@ -3503,7 +3468,7 @@ Item {
 
               Button {
                 width: parent.width
-                text: root.compactWidth ? "" : "Liked Songs"
+                text: root.compactWidth ? "" : "Starred"
                 iconText: root.compactWidth ? "" : "󰋑"
                 foreground: root.foreground
                 selected: root.currentTab === "library"
@@ -3512,7 +3477,7 @@ Item {
                   ? 0 : Style.spacing.controlPaddingX
                 focusable: false
                 hasCursor: root.cursorOn("sidebar", "nav-library")
-                tooltipText: "Liked Songs"
+                tooltipText: "Starred"
                 onClicked: root.chooseTab("library")
                 onHovered: function(on) {
                   if (on) root.setPanelCursor("sidebar", "nav-library")
@@ -3911,7 +3876,7 @@ Item {
                 height: parent.height
                 foreground: root.foreground
                 placeholderText: root.activeSearchScope.available && root.searchInContext
-                  ? "Search in " + root.activeSearchScope.label : "Search Spotify"
+                  ? "Search in " + root.activeSearchScope.label : "Search"
                 enabled: root.service && root.service.auth.loggedIn
                 hasCursor: root.cursorOn("header", "search")
                 onTextEdited: root.editUnifiedSearch(text)
@@ -3952,9 +3917,9 @@ Item {
                 PanelToolTip {
                   visible: unifiedSearchField.hovered
                   text: root.activeSearchScope.available
-                    ? "Search all of Spotify · Ctrl+F or /\nPress again to search in "
+                    ? "Search everywhere · Ctrl+F or /\nPress again to search in "
                       + root.activeSearchScope.label
-                    : "Search all of Spotify · Ctrl+F or /"
+                    : "Search everywhere · Ctrl+F or /"
                 }
                 KeyHint { region: "header"; action: "search"; sequences: ["/", "Ctrl+F"] }
               }
@@ -3979,7 +3944,7 @@ Item {
                 }
                 horizontalPadding: Style.space(8)
                 tooltipText: root.searchInContext
-                  ? root.shortcutHint("Search all of Spotify", "Ctrl+F or /")
+                  ? root.shortcutHint("Search everywhere", "Ctrl+F or /")
                   : root.shortcutHint("Search only in "
                     + root.activeSearchScope.label, "Ctrl+F or /")
                 onClicked: root.toggleSearchScope()
@@ -4620,15 +4585,15 @@ Item {
             ? "Loading your library windows…"
             : (root.homeFilter.trim() ? "No matches in " + root.activeSearchScope.label + "."
               : "Nothing here yet.")
-          onActivated: function(item, items, uri) {
-            root.activateMedia(item, items, uri)
+          onActivated: function(item, items) {
+            root.activateMedia(item, items)
           }
           onOpened: function(item) { root.openItem(item) }
           onQueued: function(item) { if (root.service) root.service.addToQueue(item) }
           onPlaylistRequested: function(item) { root.openPlaylistPicker(item) }
           onSaveToggled: function(item) { if (root.service) root.service.toggleSaved(item) }
-          onContextRequested: function(item, x, y, index, items, uri, playbackUri) {
-            root.openMediaContext(item, x, y, items, uri, index, playbackUri)
+          onContextRequested: function(item, x, y, index, items, key) {
+            root.openMediaContext(item, x, y, items, key, index)
           }
           onViewStateChanged: function(filter, sort, y) {
             root.rememberScroll("home:" + root.homeType, y)
@@ -4642,35 +4607,171 @@ Item {
     id: discoverPage
 
     Item {
-      MediaCollection {
+      id: discoverRoot
+      readonly property bool genreActive: root.service
+        && root.service.discoverGenre !== ""
+      // The two shelves share the page height once a genre is selected.
+      readonly property real pageHeight: Math.max(0, parent.height
+        - genreBar.height - parent.spacing)
+      readonly property real shelfHeight: Math.max(40,
+        (pageHeight - genreHeading.height - parent.spacing) / 2)
+
+      function genreOptions() {
+        var genres = root.service ? root.service.discoverGenres : []
+        var options = []
+        for (var i = 0; i < genres.length; i++) {
+          var genre = genres[i]
+          if (!genre || !genre.value) continue
+          options.push({
+            value: String(genre.value),
+            label: String(genre.value),
+            description: Number(genre.albumCount) > 0
+              ? Number(genre.albumCount) + " albums" : ""
+          })
+        }
+        return options
+      }
+
+      Column {
         anchors.fill: parent
-        service: root.service
-        sourceItems: root.service ? root.service.discoverAlbums : []
-        filterText: root.discoverFilter
-        showFilter: false
-        showQueue: false
-        showPlaylist: false
-        showSave: true
-        browseContexts: true
-        loading: root.service && root.service.discoverLoading
-        hasMore: false
-        restoredContentY: root.scrollFor("discover")
-        stateKey: "discover"
-        emptyMessage: root.service && root.service.discoverLoading
-          ? "Finding albums from your library…"
-          : (root.discoverFilter.trim() ? "No matches in Discover."
-            : (root.service && root.service.discoverMessage
-            ? root.service.discoverMessage : "No albums were found yet."))
-        onActivated: function(item, items, uri) {
-          root.activateMedia(item, items, uri)
+        spacing: Style.space(7)
+
+        Row {
+          id: genreBar
+          width: parent.width
+          spacing: Style.space(5)
+
+          Text {
+            id: genreBarTitle
+            anchors.verticalCenter: parent.verticalCenter
+            text: "GENRES"
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+          }
+
+          SearchableDropdown {
+            id: genrePicker
+            width: Math.max(Style.space(140), parent.width
+              - (clearGenreButton.visible
+                ? clearGenreButton.width + parent.spacing : 0)
+              - genreBarTitle.width - parent.spacing)
+            height: implicitHeight
+            anchors.verticalCenter: parent.verticalCenter
+            showLabel: false
+            foreground: root.foreground
+            background: root.background
+            accent: root.accent
+            fontFamily: root.fontFamily
+            placeholderText: root.service && root.service.discoverLoading
+              ? "Loading genres…" : "Pick a genre to browse its albums"
+            emptyText: root.service && root.service.discoverLoading
+              ? "Loading genres…" : "No genres yet"
+            options: discoverRoot.genreOptions()
+            value: root.service ? root.service.discoverGenre : ""
+            onChanged: function(value) {
+              if (root.service) root.service.openDiscoverGenre(value)
+            }
+          }
+
+          Button {
+            id: clearGenreButton
+            visible: discoverRoot.genreActive
+            anchors.verticalCenter: parent.verticalCenter
+            text: "Clear"
+            foreground: root.foreground
+            hasCursor: root.cursorOn("page", "genre-clear")
+            onHovered: function(on) {
+              if (on) root.setPanelCursor("page", "genre-clear")
+            }
+            KeyHint { region: "page"; action: "genre-clear" }
+            onClicked: if (root.service) root.service.clearGenreBrowse()
+          }
         }
-        onOpened: function(item) { root.openItem(item) }
-        onSaveToggled: function(item) { if (root.service) root.service.toggleSaved(item) }
-        onContextRequested: function(item, x, y, index, items, uri, playbackUri) {
-          root.openMediaContext(item, x, y, items, uri, index, playbackUri)
+
+        MediaCollection {
+          id: randomAlbums
+          width: parent.width
+          height: discoverRoot.genreActive
+            ? discoverRoot.shelfHeight : discoverRoot.pageHeight
+          service: root.service
+          sourceItems: root.service ? root.service.discoverAlbums : []
+          filterText: root.discoverFilter
+          showFilter: false
+          showQueue: false
+          showPlaylist: false
+          showSave: true
+          browseContexts: true
+          loading: root.service && root.service.discoverLoading
+          hasMore: false
+          restoredContentY: root.scrollFor("discover")
+          stateKey: "discover"
+          emptyMessage: root.service && root.service.discoverLoading
+            ? "Finding albums from your library…"
+            : (root.discoverFilter.trim() ? "No matches in Explore."
+              : (root.service && root.service.discoverMessage
+              ? root.service.discoverMessage : "No albums were found yet."))
+          onActivated: function(item, items) {
+            root.activateMedia(item, items)
+          }
+          onOpened: function(item) { root.openItem(item) }
+          onSaveToggled: function(item) { if (root.service) root.service.toggleSaved(item) }
+          onContextRequested: function(item, x, y, index, items, key) {
+            root.openMediaContext(item, x, y, items, key, index)
+          }
+          onViewStateChanged: function(filter, sort, y) {
+            root.rememberScroll("discover", y)
+          }
         }
-        onViewStateChanged: function(filter, sort, y) {
-          root.rememberScroll("discover", y)
+
+        Text {
+          id: genreHeading
+          width: parent.width
+          height: visible ? implicitHeight : 0
+          visible: discoverRoot.genreActive
+          text: "ALBUMS IN “" + (root.service ? root.service.discoverGenre : "")
+            + "”"
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          font.bold: true
+          elide: Text.ElideRight
+        }
+
+        MediaCollection {
+          id: genreAlbums
+          width: parent.width
+          height: visible ? discoverRoot.shelfHeight : 0
+          visible: discoverRoot.genreActive
+          keyboardListId: "list-genres"
+          service: root.service
+          sourceItems: root.service ? root.service.genreAlbums : []
+          filterText: ""
+          showFilter: false
+          showSort: false
+          showQueue: false
+          showPlaylist: false
+          showSave: true
+          browseContexts: true
+          loading: root.service && root.service.genreAlbumsLoading
+          hasMore: root.service && root.service.genreAlbumsNext !== ""
+          emptyMessage: root.service && root.service.genreAlbumsLoading
+            ? "Finding albums in this genre…"
+            : "No albums were found in this genre."
+          onActivated: function(item, items) {
+            root.activateMedia(item, items)
+          }
+          onOpened: function(item) { root.openItem(item) }
+          onSaveToggled: function(item) { if (root.service) root.service.toggleSaved(item) }
+          onContextRequested: function(item, x, y, index, items, key) {
+            root.openMediaContext(item, x, y, items, key, index)
+          }
+          onLoadMoreRequested: if (root.service) root.service.loadMoreGenreAlbums()
+          onViewStateChanged: function(filter, sort, y) {
+            root.rememberScroll("discover-genre:" + (root.service
+              ? root.service.discoverGenre : ""), y)
+          }
         }
       }
     }
@@ -4687,8 +4788,7 @@ Item {
       readonly property bool searchLoading: root.service
         && root.service.artistCatalogLoading
       readonly property int searchResultCount: root.service
-        ? root.service.artistSongs.length + root.service.artistAlbums.length
-          + root.service.artistPlaylists.length : 0
+        ? root.service.artistSongs.length + root.service.artistAlbums.length : 0
       readonly property int searchColumnCount: Api.responsiveResultColumns(
         Math.max(0, width - Style.space(10)), Style.space(760))
       readonly property var searchRows: Api.sectionedMediaRows([
@@ -4705,27 +4805,18 @@ Item {
           items: root.service ? root.service.artistAlbums : [],
           loading: root.service && root.service.artistAlbumsLoading,
           hasMore: root.service && root.service.artistAlbumsNext !== ""
-        },
-        {
-          id: "playlists",
-          heading: "PLAYLISTS",
-          items: root.service ? root.service.artistPlaylists : [],
-          loading: root.service && root.service.artistPlaylistsLoading,
-          hasMore: root.service && root.service.artistPlaylistsNext !== ""
         }
       ], searchColumnCount)
 
       function artistSearchSource(sectionId) {
         if (!root.service) return []
         if (sectionId === "albums") return root.service.artistAlbums
-        if (sectionId === "playlists") return root.service.artistPlaylists
         return root.service.artistSongs
       }
 
       function loadMoreArtistSearch(sectionId) {
         if (!root.service) return
         if (sectionId === "albums") root.service.loadMoreArtistAlbums()
-        else if (sectionId === "playlists") root.service.loadMoreArtistPlaylists()
         else root.service.loadMoreArtistSongs()
       }
 
@@ -4839,14 +4930,7 @@ Item {
                 focusable: false
                 hasCursor: root.cursorOn("page", "detail-play")
                 enabled: root.service && root.service.detailItem
-                  && (["show", "audiobook"].indexOf(root.service.detailItem.type) < 0
-                    || root.service.detailItems.length > 0)
-                onClicked: {
-                  if (["show", "audiobook"].indexOf(root.service.detailItem.type) >= 0)
-                    root.activateMedia(root.service.detailItems[0],
-                      root.service.detailItems, "")
-                  else root.activateMedia(root.service.detailItem)
-                }
+                onClicked: root.activateMedia(root.service.detailItem)
                 onHovered: function(on) {
                   if (on) root.setPanelCursor("page", "detail-play")
                 }
@@ -4893,7 +4977,8 @@ Item {
                   var point = detailMoreActions.mapToItem(window.contentItem,
                     detailMoreActions.width, 0)
                   root.openMediaContext(root.service.detailItem, point.x, point.y,
-                    root.service.detailItems, root.service.detailItem.uri, -1)
+                    root.service.detailItems,
+                    Api.savedKeyFor(root.service.detailItem), -1)
                 }
               }
             }
@@ -4957,13 +5042,13 @@ Item {
                 emptyMessage: root.service && (root.service.artistAlbumsLoading
                   || root.service.detailLoading)
                   ? "Finding releases…" : "No matching albums or EPs."
-                onActivated: function(item, items, uri) {
-                  root.activateMedia(item, items, uri)
+                onActivated: function(item, items) {
+                  root.activateMedia(item, items)
                 }
                 onOpened: function(item) { root.openItem(item) }
                 onSaveToggled: function(item) { if (root.service) root.service.toggleSaved(item) }
-                onContextRequested: function(item, x, y, index, items, uri, playbackUri) {
-                  root.openMediaContext(item, x, y, items, uri, index, playbackUri)
+                onContextRequested: function(item, x, y, index, items, key) {
+                  root.openMediaContext(item, x, y, items, key, index)
                 }
                 onLoadMoreRequested: if (root.service) root.service.loadMoreArtistAlbums()
               }
@@ -4988,8 +5073,7 @@ Item {
               MediaCollection {
                 width: parent.width
                 height: Math.max(30, parent.height - artistSongsHeading.height
-                  - artistThisIsRow.height - parent.spacing
-                  * (artistThisIsRow.visible ? 2 : 1))
+                  - parent.spacing)
                 keyboardListId: "list-songs"
                 service: root.service
                 sourceItems: root.service ? root.service.artistSongs : []
@@ -5002,49 +5086,17 @@ Item {
                 emptyMessage: root.service && (root.service.artistSongsLoading
                   || root.service.detailLoading)
                   ? "Finding songs…" : "No matching songs."
-                onActivated: function(item, items, uri) {
-                  root.activateMedia(item, items, uri)
+                onActivated: function(item, items) {
+                  root.activateMedia(item, items)
                 }
                 onOpened: function(item) { root.openItem(item) }
                 onQueued: function(item) { if (root.service) root.service.addToQueue(item) }
                 onPlaylistRequested: function(item) { root.openPlaylistPicker(item) }
                 onSaveToggled: function(item) { if (root.service) root.service.toggleSaved(item) }
-                onContextRequested: function(item, x, y, index, items, uri, playbackUri) {
-                  root.openMediaContext(item, x, y, items, uri, index, playbackUri)
+                onContextRequested: function(item, x, y, index, items, key) {
+                  root.openMediaContext(item, x, y, items, key, index)
                 }
                 onLoadMoreRequested: if (root.service) root.service.loadMoreArtistSongs()
-              }
-
-              MediaRow {
-                id: artistThisIsRow
-                objectName: "artist-thisis"
-                width: parent.width
-                height: visible ? implicitHeight : 0
-                visible: root.service && root.service.artistThisIsPlaylist
-                itemData: root.service ? root.service.artistThisIsPlaylist : null
-                selected: root.cursorOn("page", "detail-thisis")
-                foreground: root.foreground
-                accent: root.accent
-                fontFamily: root.fontFamily
-                browseOnActivate: true
-                showQueue: false
-                showPlaylist: false
-                showSave: true
-                artworkEnabled: !root.service || root.service.artworkEnabled
-                saved: root.service && root.service.isSaved(itemData)
-                onActivated: function(item) { root.activateMedia(item, [item], item.uri) }
-                onOpenRequested: function(item) { root.openItem(item) }
-                onSaveRequested: function(item) {
-                  if (root.service) root.service.toggleSaved(item)
-                }
-                onContextRequested: function(item, sceneX, sceneY) {
-                  root.openMediaContext(item, sceneX, sceneY, [item], item.uri, 0)
-                }
-                ShortcutHint {
-                  active: root.shortcutHintsActive
-                    && root.navHintFor("page", "detail-thisis") !== ""
-                  navHint: root.navHintFor("page", "detail-thisis")
-                }
               }
             }
           }
@@ -5122,7 +5174,7 @@ Item {
               height: visible ? implicitHeight : 0
               visible: !detailRoot.searchLoading
                 && detailRoot.searchResultCount === 0
-              text: "No songs, albums, or playlists matched this search."
+              text: "No songs or albums matched this search."
               color: root.muted
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
@@ -5261,8 +5313,8 @@ Item {
           sourceItems: root.service ? root.service.detailItems : []
           filterText: root.detailFilter
           sortKey: root.detailSort
-          contextUri: root.service && root.service.detailItem
-            ? root.service.detailItem.uri : ""
+          contextKey: root.service && root.service.detailItem
+            ? Api.savedKeyFor(root.service.detailItem) : ""
           showQueue: true
           showFilter: false
           showSort: true
@@ -5274,21 +5326,21 @@ Item {
           loading: root.service && root.service.detailLoading
           hasMore: root.service && root.service.detailNext !== ""
           restoredContentY: root.scrollFor("detail:" + (root.service && root.service.detailItem
-            ? root.service.detailItem.uri : ""))
+            ? Api.savedKeyFor(root.service.detailItem) : ""))
           stateKey: "detail:" + (root.service && root.service.detailItem
-            ? root.service.detailItem.uri : "")
+            ? Api.savedKeyFor(root.service.detailItem) : "")
           restoreReady: !root.service || !root.service.detailRestorePending
           emptyMessage: root.service && root.service.detailMessage
             ? root.service.detailMessage : "No items are available for this selection."
-          onActivated: function(item, items, uri) {
-            root.activateMedia(item, items, uri)
+          onActivated: function(item, items) {
+            root.activateMedia(item, items)
           }
           onOpened: function(item) { root.openItem(item) }
           onQueued: function(item) { if (root.service) root.service.addToQueue(item) }
           onPlaylistRequested: function(item) { root.openPlaylistPicker(item) }
           onSaveToggled: function(item) { if (root.service) root.service.toggleSaved(item) }
-          onContextRequested: function(item, x, y, index, items, uri, playbackUri) {
-            root.openMediaContext(item, x, y, items, uri, index, playbackUri)
+          onContextRequested: function(item, x, y, index, items, key) {
+            root.openMediaContext(item, x, y, items, key, index)
           }
           onReorderRequested: function(sourceIndex, destinationIndex) {
             if (root.service && root.service.detailItem)
@@ -5301,7 +5353,7 @@ Item {
             root.detailFilter = filter
             root.detailSort = sort
             root.rememberScroll("detail:" + (root.service && root.service.detailItem
-              ? root.service.detailItem.uri : ""), y)
+              ? Api.savedKeyFor(root.service.detailItem) : ""), y)
           }
         }
       }
@@ -5439,7 +5491,7 @@ Item {
           Text {
             width: parent.width
             visible: !root.service || root.service.searchHistory.length === 0
-            text: "Type a title, artist, album, playlist, podcast, episode, or audiobook."
+            text: "Type a title, artist, album, or playlist name."
             color: root.muted
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
@@ -5467,15 +5519,15 @@ Item {
           emptyMessage: root.service && root.service.searchLoading
             ? root.service.searchProgressText(root.searchClock) : "No " + Api.searchTypeLabel(root.searchType)
               + " results."
-          onActivated: function(item, items, uri) {
-            root.activateMedia(item, items, uri)
+          onActivated: function(item, items) {
+            root.activateMedia(item, items)
           }
           onOpened: function(item) { root.openItem(item) }
           onQueued: function(item) { if (root.service) root.service.addToQueue(item) }
           onPlaylistRequested: function(item) { root.openPlaylistPicker(item) }
           onSaveToggled: function(item) { if (root.service) root.service.toggleSaved(item) }
-          onContextRequested: function(item, x, y, index, items, uri, playbackUri) {
-            root.openMediaContext(item, x, y, items, uri, index, playbackUri)
+          onContextRequested: function(item, x, y, index, items, key) {
+            root.openMediaContext(item, x, y, items, key, index)
           }
           onLoadMoreRequested: if (root.service) root.service.loadMoreSearch(root.searchType)
           onViewStateChanged: function(filter, sort, y) {
@@ -5506,10 +5558,7 @@ Item {
             model: [
               { type: "tracks", label: "Songs", icon: "󰎈" },
               { type: "albums", label: "Albums", icon: "󰀥" },
-              { type: "artists", label: "Artists", icon: "󰠃" },
-              { type: "shows", label: "Podcasts", icon: "󰦔" },
-              { type: "episodes", label: "Episodes", icon: "󰐾" },
-              { type: "audiobooks", label: "Books", icon: "󰂺" }
+              { type: "artists", label: "Artists", icon: "󰠃" }
             ]
             Button {
               required property var modelData
@@ -5553,15 +5602,15 @@ Item {
             : (root.libraryFilter.trim()
               ? "No matches in " + root.activeSearchScope.label + "."
               : "No saved items in this section.")
-          onActivated: function(item, items, uri) {
-            root.activateMedia(item, items, uri)
+          onActivated: function(item, items) {
+            root.activateMedia(item, items)
           }
           onOpened: function(item) { root.openItem(item) }
           onQueued: function(item) { if (root.service) root.service.addToQueue(item) }
           onPlaylistRequested: function(item) { root.openPlaylistPicker(item) }
           onSaveToggled: function(item) { if (root.service) root.service.toggleSaved(item) }
-          onContextRequested: function(item, x, y, index, items, uri, playbackUri) {
-            root.openMediaContext(item, x, y, items, uri, index, playbackUri)
+          onContextRequested: function(item, x, y, index, items, key) {
+            root.openMediaContext(item, x, y, items, key, index)
           }
           onLoadMoreRequested: if (root.service) root.service.loadLibrary(root.libraryType, true)
           onViewStateChanged: function(filter, sort, y) {
@@ -5678,7 +5727,7 @@ Item {
                 var point = playlistMoreActions.mapToItem(window.contentItem,
                   playlistMoreActions.width, 0)
                 root.openMediaContext(root.service.selectedPlaylist, point.x, point.y,
-                  [], root.service.selectedPlaylist.uri, -1)
+                  [], Api.savedKeyFor(root.service.selectedPlaylist), -1)
               }
             }
           }
@@ -5707,8 +5756,8 @@ Item {
           sourceItems: root.service ? root.service.playlistItems : []
           filterText: root.playlistFilter
           sortKey: root.playlistSort
-          contextUri: root.service && root.service.selectedPlaylist
-            ? root.service.selectedPlaylist.uri : ""
+          contextKey: root.service && root.service.selectedPlaylist
+            ? Api.savedKeyFor(root.service.selectedPlaylist) : ""
           showQueue: true
           showFilter: false
           showSort: true
@@ -5729,8 +5778,8 @@ Item {
           stateKey: "playlist:" + (root.service && root.service.selectedPlaylist
             ? root.service.selectedPlaylist.id : "")
           restoreReady: !root.service || !root.service.playlistRestorePending
-          onActivated: function(item, items, uri) {
-            root.activateMedia(item, items, uri,
+          onActivated: function(item, items) {
+            root.activateMedia(item, items,
               playbackUsesVisibleOrder
                 ? Api.visibleOrderPlaybackMessage(items.length) : "")
           }
@@ -5738,8 +5787,8 @@ Item {
           onQueued: function(item) { if (root.service) root.service.addToQueue(item) }
           onPlaylistRequested: function(item) { root.openPlaylistPicker(item) }
           onSaveToggled: function(item) { if (root.service) root.service.toggleSaved(item) }
-          onContextRequested: function(item, x, y, index, items, uri, playbackUri) {
-            root.openMediaContext(item, x, y, items, uri, index, playbackUri)
+          onContextRequested: function(item, x, y, index, items, key) {
+            root.openMediaContext(item, x, y, items, key, index)
           }
           onReorderRequested: function(sourceIndex, destinationIndex) {
             if (root.service && root.service.selectedPlaylist)

@@ -488,15 +488,12 @@ var TYPE_LABELS = {
   track: { singular: "Song", plural: "Songs" },
   artist: { singular: "Artist", plural: "Artists" },
   album: { singular: "Album", plural: "Albums" },
-  playlist: { singular: "Playlist", plural: "Playlists" },
-  show: { singular: "Podcast", plural: "Podcasts" },
-  episode: { singular: "Episode", plural: "Episodes" },
-  audiobook: { singular: "Audiobook", plural: "Books" }
+  playlist: { singular: "Playlist", plural: "Playlists" }
 }
 
 function typeLabel(type, plural) {
   var entry = TYPE_LABELS[String(type || "")]
-  if (!entry) return plural ? "results" : "Spotify item"
+  if (!entry) return plural ? "results" : "Library item"
   return plural ? entry.plural : entry.singular
 }
 
@@ -667,9 +664,8 @@ function backendLoadFieldsV2(items, options) {
 // a play request into a v2 load body. The visible list becomes the engine's
 // queue starting at the clicked row, mirroring playbackBody's wrap-around so
 // Next reaches the list's end the same way the Spotify play endpoint did.
-// Context offset rules come from playbackContextOffsetPosition; a resume
-// offset in milliseconds is honored for a row loaded mid-song.
-function playbackLoadBodyV2(item, sourceItems, contextUri, resumeMs) {
+// A resume offset in milliseconds is honored for a row loaded mid-song.
+function playbackLoadBodyV2(item, sourceItems, resumeMs) {
   if (!item || typeof item !== "object") return null
   // Playback must start somewhere: a clicked row with no usable id (a pure
   // context header, for instance) cannot anchor the queue.
@@ -685,7 +681,7 @@ function playbackLoadBodyV2(item, sourceItems, contextUri, resumeMs) {
     }
   }
   if (start < 0) {
-    var offset = playbackContextOffsetPosition(item, rows, contextUri)
+    var offset = playbackContextOffsetPosition(item, rows)
     if (offset >= 0 && offset < rows.length) start = offset
   }
   if (start < 0) start = 0
@@ -708,13 +704,14 @@ function playbackLoadBodyV2(item, sourceItems, contextUri, resumeMs) {
 // One row shape for every Subsonic-backed surface (home, library, search,
 // detail, playlists, queue). The view layer (MediaRow, MediaByline,
 // MediaCollection, the panel views) renders these without caring which
-// endpoint produced them. No Spotify-only field survives: there is no
-// Spotify uri, no externalUrl, no snapshot semantics. `uri` is an app-local
-// identity token (`navidrome:<type>:<id>`) so the view plumbing that
-// previously compared Spotify uris (context menus, playlist identity,
-// occurrence matching) keeps a stable unique key without leaking any
-// Spotify vocabulary into playback — Service builds v2 load bodies from
-// `id` alone and never reads row uris.
+// endpoint produced them. Identity is the `savedKeyFor` key (`type:id`);
+// row `uri` remains only as an app-local token (`navidrome:<type>:<id>`)
+// for the few consumers that want a URI-shaped string: the persisted
+// last-radio playlist identity in Service (session state and the remote
+// playback context check) and the interim Spotify-shaped row shims. Panel
+// and MediaCollection identity plumbing (context menus, playlist identity,
+// occurrence matching, restore keys) compare the saved key, never uris.
+// Service builds v2 load bodies from `id` alone and never reads row uris.
 //
 // `art` carries the pinned artwork context {serverUrl, username, password,
 // salt}; the same salt for the whole session keeps getCoverArt URLs stable
@@ -935,7 +932,9 @@ function subsonicSongRefRow(song) {
     year: null,
     genre: "",
     playlistPosition: undefined,
-    starred: false
+    // A SongRef carries no star information; leaving it undefined keeps
+    // checkSavedItems from recording a guess as server truth.
+    starred: undefined
   }
 }
 
@@ -1081,7 +1080,7 @@ function barSlotWidth(fixed, cap, fitted, minimum) {
 // engine can continue there instead of leaving Play dead.
 function resumePlaybackAvailable(hasMedia, candidate) {
   return hasMedia !== true && !!candidate && !!candidate.item
-    && !!candidate.item.uri
+    && !!candidate.item.id
 }
 
 // Footer text while nothing is loaded: the live value, else the matching field
@@ -1810,12 +1809,13 @@ function searchScope(tab, detailItem, selectedPlaylist, homeType, libraryType) {
   if (area === "detail" && detailItem) {
     item = detailItem
     label = String(item.name || "").trim()
-    key = "detail:" + String(item.uri || item.id || "")
+    key = "detail:" + savedKeyFor(item)
     mode = item.type === "artist" ? "artist" : "filter"
   } else if (area === "playlists" && selectedPlaylist) {
     item = selectedPlaylist
     label = String(item.name || "").trim()
-    key = "playlist:" + String(item.uri || item.id || "")
+    // The area prefix already names the type; the id is the identity.
+    key = "playlist:" + String(item.id || "")
   } else if (area === "home") {
     var homeLabels = {
       recent: "Recently played",
@@ -1824,23 +1824,24 @@ function searchScope(tab, detailItem, selectedPlaylist, homeType, libraryType) {
       starred: "Starred"
     }
     var selectedHome = String(homeType || "recent")
-    label = homeLabels[selectedHome] || "Home"
-    key = "home:" + selectedHome
+    if (homeLabels[selectedHome] !== undefined) {
+      label = homeLabels[selectedHome]
+      key = "home:" + selectedHome
+    }
   } else if (area === "discover") {
-    label = "Discover"
+    label = "Explore"
     key = "discover"
   } else if (area === "library") {
     var libraryLabels = {
-      tracks: "Liked Songs",
+      tracks: "Starred",
       albums: "Saved albums",
-      artists: "Followed artists",
-      shows: "Saved podcasts",
-      episodes: "Saved episodes",
-      audiobooks: "Saved books"
+      artists: "Saved artists"
     }
     var selectedLibrary = String(libraryType || "tracks")
-    label = libraryLabels[selectedLibrary] || "Your Library"
-    key = "library:" + selectedLibrary
+    if (libraryLabels[selectedLibrary] !== undefined) {
+      label = libraryLabels[selectedLibrary]
+      key = "library:" + selectedLibrary
+    }
   } else if (area === "queue") {
     label = "Queue"
     key = "queue"
@@ -2250,9 +2251,6 @@ function searchTypeKey(type) {
   if (value === "artist") return "artists"
   if (value === "album") return "albums"
   if (value === "playlist") return "playlists"
-  if (value === "show") return "shows"
-  if (value === "episode") return "episodes"
-  if (value === "audiobook") return "audiobooks"
   return "tracks"
 }
 
@@ -2404,14 +2402,9 @@ var PLAYBACK_URI_LIMIT = 100
 // sort must always play that displayed order. Context headers (album,
 // playlist, artist) carry the full list behind them instead of a server
 // context, so they never force the "original" order.
-function playbackUsesVisibleOrder(contextUri, filterText, sortKey) {
+function playbackUsesVisibleOrder(filterText, sortKey) {
   return String(filterText || "").trim() !== ""
     || String(sortKey || "default") !== "default"
-}
-
-function playbackContextForView(contextUri, filterText, sortKey) {
-  return playbackUsesVisibleOrder(contextUri, filterText, sortKey)
-    ? "" : String(contextUri || "")
 }
 
 function visibleOrderPlaybackMessage(itemCount) {
@@ -2423,18 +2416,16 @@ function visibleOrderPlaybackMessage(itemCount) {
 
 // Context offset for the v2 load builder. Subsonic rows play the visible
 // list in order, so the only position that matters is where the clicked row
-// sits in that list (matched by row identity first, then by uri key).
-function playbackContextOffsetPosition(item, sourceItems, contextUri) {
+// sits in that list (matched by row identity first, then by the type:id
+// saved key — playlist rows can repeat a track, so the first match wins).
+function playbackContextOffsetPosition(item, sourceItems) {
   var values = Array.isArray(sourceItems) ? sourceItems : []
-  var itemUri = String((item && item.uri) || "")
-  var visibleIndex = -1
+  var wanted = savedKeyFor(item)
+  if (!wanted) return -1
   for (var i = 0; i < values.length; i++) {
-    if (values[i] && String(values[i].uri || "") === itemUri) {
-      visibleIndex = i
-      break
-    }
+    if (values[i] && savedKeyFor(values[i]) === wanted) return i
   }
-  return visibleIndex
+  return -1
 }
 
 function millisecondsToClock(milliseconds) {
@@ -2444,20 +2435,28 @@ function millisecondsToClock(milliseconds) {
   return minutes + ":" + (remainder < 10 ? "0" : "") + remainder
 }
 
+// Merge pages of canonical rows without duplicates. The stable key is the
+// type:id saved key; an interim Spotify-shaped row keeps working through its
+// uri/id fallback, and keyless rows pass through untouched.
 function mergeUnique(existing, incoming) {
   var result = Array.isArray(existing) ? existing.slice() : []
   var seen = {}
   var i
   for (i = 0; i < result.length; i++) {
-    var oldKey = String((result[i] && (result[i].uri || result[i].id)) || "")
+    var oldKey = rowIdentityKey(result[i])
     if (oldKey) seen[oldKey] = true
   }
   var values = Array.isArray(incoming) ? incoming : []
   for (i = 0; i < values.length; i++) {
-    var key = String((values[i] && (values[i].uri || values[i].id)) || "")
+    var key = rowIdentityKey(values[i])
     if (key && seen[key]) continue
     if (key) seen[key] = true
     result.push(values[i])
   }
   return result
+}
+
+function rowIdentityKey(item) {
+  if (!item || typeof item !== "object") return ""
+  return savedKeyFor(item) || String(item.uri || item.id || "")
 }

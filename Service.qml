@@ -308,15 +308,6 @@ Item {
   property string savedAlbumsNext: ""
   property var followedArtists: []
   property string followedArtistsNext: ""
-  // Podcast-family collections have no Subsonic equivalent; the slots stay
-  // (empty, marked loaded) so the view layer keeps its shape until the
-  // cleanup pass removes the tabs. Part B.
-  property var savedShows: []
-  property string savedShowsNext: ""
-  property var savedEpisodes: []
-  property string savedEpisodesNext: ""
-  property var savedAudiobooks: []
-  property string savedAudiobooksNext: ""
   property var playlistItems: []
   property string playlistItemsNext: ""
   property string playlistItemsError: ""
@@ -408,17 +399,10 @@ Item {
   property var artistSongs: []
   property string artistSongsNext: ""
   property bool artistSongsLoading: false
-  property var artistPlaylists: []
-  property string artistPlaylistsNext: ""
-  property bool artistPlaylistsLoading: false
-  // "This Is <artist>" was a Spotify editorial playlist; Subsonic has no
-  // equivalent, so the slot stays null until the view pass removes it.
-  property var artistThisIsPlaylist: null
-  property bool artistThisIsLoading: false
   property string artistCatalogQuery: ""
   property int artistCatalogSerial: 0
   readonly property bool artistCatalogLoading: artistAlbumsLoading
-    || artistSongsLoading || artistPlaylistsLoading
+    || artistSongsLoading
 
   property bool playlistActionBusy: false
   property bool playlistConversionBusy: false
@@ -435,18 +419,12 @@ Item {
   property bool savedTracksLoaded: false
   property bool savedAlbumsLoaded: false
   property bool followedArtistsLoaded: false
-  property bool savedShowsLoaded: false
-  property bool savedEpisodesLoaded: false
-  property bool savedAudiobooksLoaded: false
   property bool queueLoaded: false
   property bool devicesLoaded: false
   property bool playlistsLoading: false
   property bool savedTracksLoading: false
   property bool savedAlbumsLoading: false
   property bool followedArtistsLoading: false
-  property bool savedShowsLoading: false
-  property bool savedEpisodesLoading: false
-  property bool savedAudiobooksLoading: false
   property bool playlistItemsLoading: false
   property bool queueLoading: false
   property bool devicesLoading: false
@@ -1352,12 +1330,6 @@ Item {
     return !!value && value.type === "playlist" && !!value.id && !!value.uri
   }
 
-  function sameRadioPlaylist(left, right) {
-    if (!validRadioPlaylist(left) || !validRadioPlaylist(right)) return false
-    return String(left.id) === String(right.id)
-      || String(left.uri) === String(right.uri)
-  }
-
   function restoreLastRadioPlaylist(value) {
     if (!lastRadioPlaylist && validRadioPlaylist(value))
       lastRadioPlaylist = value
@@ -1370,15 +1342,6 @@ Item {
     var state = Api.shallowCopy(sessionState)
     state.lastRadioPlaylist = value
     persistSession(state)
-  }
-
-  function radioPlaylistForPlayback(item, contextUri, explicitRadio) {
-    if (validRadioPlaylist(explicitRadio)) return explicitRadio
-    if (!validRadioPlaylist(lastRadioPlaylist)) return null
-    if (sameRadioPlaylist(item, lastRadioPlaylist)
-        || String(contextUri || "") === String(lastRadioPlaylist.uri))
-      return lastRadioPlaylist
-    return null
   }
 
   function verifyRadioPlaybackContext() {
@@ -1436,23 +1399,6 @@ Item {
         endpoint: "starred2", savedKey: "artist",
         row: function(node) { return Api.subsonicArtistRow(node, root.subsonicArt) }
       }
-    if (value === "shows" || value === "episodes" || value === "audiobooks") {
-      // No Subsonic content: resolve immediately as an empty, loaded list.
-      // The library tabs go away with the view cleanup (Part B).
-      return {
-        items: value === "shows" ? "savedShows"
-          : (value === "episodes" ? "savedEpisodes" : "savedAudiobooks"),
-        next: value === "shows" ? "savedShowsNext"
-          : (value === "episodes" ? "savedEpisodesNext" : "savedAudiobooksNext"),
-        loading: value === "shows" ? "savedShowsLoading"
-          : (value === "episodes" ? "savedEpisodesLoading"
-            : "savedAudiobooksLoading"),
-        loaded: value === "shows" ? "savedShowsLoaded"
-          : (value === "episodes" ? "savedEpisodesLoaded"
-            : "savedAudiobooksLoaded"),
-        endpoint: "", row: function(node) { return null }
-      }
-    }
     return {
       items: "savedTracks", next: "savedTracksNext",
       loading: "savedTracksLoading", loaded: "savedTracksLoaded",
@@ -1468,15 +1414,6 @@ Item {
 
   function loadLibraryCollection(kind, append, callback, serial) {
     var spec = libraryCollectionSpec(kind)
-    if (!spec.endpoint) {
-      // Empty-by-destination collections still behave like loaded ones.
-      root[spec.items] = []
-      root[spec.next] = ""
-      root[spec.loaded] = true
-      root[spec.loading] = false
-      if (typeof callback === "function") callback()
-      return
-    }
     if (root[spec.loading]) {
       if (typeof callback === "function") callback()
       return
@@ -1736,10 +1673,39 @@ Item {
     }, { mutating: true, priority: "interactive" })
   }
 
+  // The now-playing row's own star state: checkSavedItems only stores truth
+  // a row already carries (a `starred` field), and rows rebuilt from engine
+  // state or bare MPRIS metadata carry none. refreshTrackSavedTruth closes
+  // that gap with one bounded getSong read per unknown track — the same
+  // no-optimistic discipline as every other star surface: nothing flips
+  // until the server answers, and a failed read leaves the cache alone.
+  property int trackTruthSerial: 0
+
   function syncCurrentTrackSaved(force) {
     var item = currentTrackItem
     if (!uiVisible || !authManager.loggedIn || !item) return
     checkSavedItems([item], force === true)
+    refreshTrackSavedTruth(item)
+  }
+
+  function refreshTrackSavedTruth(item) {
+    var key = Api.savedKeyFor(item)
+    if (!key || String(item.type || "track") !== "track") return
+    if (isSavedBusy(item)) return
+    if (savedStateIsFresh(key, Date.now())) return
+    if (savedUrisChecking[key] === true) return
+    var expected = ++trackTruthSerial
+    markSavedUrisChecking([key], true)
+    subsonicApi.request("getSong", { id: String(item.id) }, function(result) {
+      // Clear the checking marker even when a newer track has taken over,
+      // so a returning track can still be re-checked later.
+      root.markSavedUrisChecking([key], false)
+      if (expected !== root.trackTruthSerial) return
+      if (!result || result.ok !== true) return
+      var song = Subsonic.normalizeSong(result.data && result.data.song
+        ? result.data.song : null)
+      root.rememberSavedStates([key], [!!song && song.starred === true])
+    }, { priority: "interactive" })
   }
 
   function toggleCurrentTrackSaved() {
@@ -1755,25 +1721,10 @@ Item {
     loadLibraryCollection("artists", append)
   }
 
-  function loadSavedShows(append) {
-    loadLibraryCollection("shows", append)
-  }
-
-  function loadSavedEpisodes(append) {
-    loadLibraryCollection("episodes", append)
-  }
-
-  function loadSavedAudiobooks(append) {
-    loadLibraryCollection("audiobooks", append)
-  }
-
   function libraryItems(kind) {
     var value = String(kind || "tracks")
     if (value === "albums") return savedAlbums
     if (value === "artists") return followedArtists
-    if (value === "shows") return savedShows
-    if (value === "episodes") return savedEpisodes
-    if (value === "audiobooks") return savedAudiobooks
     return savedTracks
   }
 
@@ -1781,9 +1732,6 @@ Item {
     var value = String(kind || "tracks")
     if (value === "albums") return savedAlbumsNext
     if (value === "artists") return followedArtistsNext
-    if (value === "shows") return savedShowsNext
-    if (value === "episodes") return savedEpisodesNext
-    if (value === "audiobooks") return savedAudiobooksNext
     return savedTracksNext
   }
 
@@ -1791,9 +1739,6 @@ Item {
     var value = String(kind || "tracks")
     if (value === "albums") return savedAlbumsLoading
     if (value === "artists") return followedArtistsLoading
-    if (value === "shows") return savedShowsLoading
-    if (value === "episodes") return savedEpisodesLoading
-    if (value === "audiobooks") return savedAudiobooksLoading
     return savedTracksLoading
   }
 
@@ -1801,9 +1746,6 @@ Item {
     var value = String(kind || "tracks")
     if (value === "albums") return savedAlbumsLoaded
     if (value === "artists") return followedArtistsLoaded
-    if (value === "shows") return savedShowsLoaded
-    if (value === "episodes") return savedEpisodesLoaded
-    if (value === "audiobooks") return savedAudiobooksLoaded
     return savedTracksLoaded
   }
 
@@ -2173,11 +2115,6 @@ Item {
     artistSongs = []
     artistSongsNext = ""
     artistSongsLoading = false
-    artistPlaylists = []
-    artistPlaylistsNext = ""
-    artistPlaylistsLoading = false
-    artistThisIsPlaylist = null
-    artistThisIsLoading = false
     detailLoading = true
     activeView = "detail"
     checkSavedItems([item])
@@ -2233,15 +2170,6 @@ Item {
     }, { priority: "interactive" })
   }
 
-  // loadArtistThisIs is deliberately inert: "This Is <artist>" playlists are
-  // Spotify editorial content with no Subsonic counterpart. The slot and the
-  // loading flag stay so the artist view keeps its shape until the cleanup
-  // pass removes them (Part B).
-  function loadArtistThisIs(expectedDetail, artist) {
-    artistThisIsPlaylist = null
-    artistThisIsLoading = false
-  }
-
   // Artist page data: the discography comes from getArtist's album list,
   // and the songs section from getTopSongs. While the artist page filter is
   // active, both sections become bounded search3 windows over a plain text
@@ -2258,14 +2186,9 @@ Item {
     artistSongs = []
     artistSongsNext = ""
     artistSongsLoading = false
-    artistPlaylists = []
-    artistPlaylistsNext = ""
-    artistPlaylistsLoading = false
     detailMessage = ""
     detailLoading = true
-    // Subsonic has no artist-scoped playlist search; the playlist section of
-    // the artist page stays empty (Part B removes it).
-    requestArtistCatalog("album", false, expectedDetail, expectedCatalog, parent)
+    requestArtistCatalog(false, expectedDetail, expectedCatalog, parent)
     requestArtistTopSongs(false, expectedDetail, expectedCatalog, parent, 0)
   }
 
@@ -2275,17 +2198,19 @@ Item {
     return name && filter ? name + " " + filter : name
   }
 
-  function requestArtistCatalog(type, append, expectedDetail, expectedCatalog,
+  // The artist discography: getArtist answers the album list without a
+  // filter; with one, a bounded search3 window over "artist name + filter"
+  // stands in (Subsonic has no artist-scoped Lucene).
+  function requestArtistCatalog(append, expectedDetail, expectedCatalog,
       artist) {
-    var albums = type === "album"
-    if (!albums || !artist || !artist.id) return
-    if (albums) artistAlbumsLoading = true
+    if (!artist || !artist.id) return
+    artistAlbumsLoading = true
     if (!artistCatalogQuery) {
       subsonicApi.request("getArtist", { id: String(artist.id) },
         function(result) {
           if (expectedDetail !== root.detailSerial
               || expectedCatalog !== root.artistCatalogSerial) return
-          if (albums) root.artistAlbumsLoading = false
+          root.artistAlbumsLoading = false
           root.detailLoading = root.artistCatalogLoading
           if (!result || result.ok !== true) {
             root.fail(String(result && result.errorMessage || "The server request failed"))
@@ -2297,7 +2222,7 @@ Item {
             var row = Api.subsonicAlbumRow(parsed.albums[i], root.subsonicArt)
             if (row) rows.push(row)
           }
-          root.applyArtistCatalogPage(type, append, { items: rows, next: "" })
+          root.applyArtistCatalogPage(append, { items: rows, next: "" })
         }, { priority: "interactive" })
       return
     }
@@ -2305,7 +2230,7 @@ Item {
       Api.search3WindowParams("album", 0), function(result) {
         if (expectedDetail !== root.detailSerial
             || expectedCatalog !== root.artistCatalogSerial) return
-        if (albums) root.artistAlbumsLoading = false
+        root.artistAlbumsLoading = false
         root.detailLoading = root.artistCatalogLoading
         if (!result || result.ok !== true) {
           root.fail(String(result && result.errorMessage || "The server request failed"))
@@ -2318,26 +2243,14 @@ Item {
           var row = Api.subsonicAlbumRow(albumsFound[i], root.subsonicArt)
           if (row) rows.push(row)
         }
-        root.applyArtistCatalogPage(type, append, { items: rows, next: "" })
+        root.applyArtistCatalogPage(append, { items: rows, next: "" })
       })
   }
 
-  function applyArtistCatalogPage(type, append, page) {
-    var existing = type === "album" ? artistAlbums
-      : (type === "playlist" ? artistPlaylists : artistSongs)
-    var items = (append ? Api.mergeUnique(existing, page.items) : page.items)
-
-    var next = page.next
-    if (type === "album") {
-      artistAlbums = items
-      artistAlbumsNext = next
-    } else if (type === "playlist") {
-      artistPlaylists = items
-      artistPlaylistsNext = next
-    } else {
-      artistSongs = items
-      artistSongsNext = next
-    }
+  function applyArtistCatalogPage(append, page) {
+    var items = (append ? Api.mergeUnique(artistAlbums, page.items) : page.items)
+    artistAlbums = items
+    artistAlbumsNext = page.next
     checkSavedItems(page.items)
   }
 
@@ -2402,17 +2315,13 @@ Item {
 
   function loadMoreArtistAlbums() {
     if (artistAlbumsLoading || !detailItem) return
-    requestArtistCatalog("album", true, detailSerial, artistCatalogSerial, detailItem)
+    requestArtistCatalog(true, detailSerial, artistCatalogSerial, detailItem)
   }
 
   function loadMoreArtistSongs() {
     // Top songs arrive complete; there is no continuation window.
     if (artistSongsLoading || !detailItem) return
     requestArtistTopSongs(true, detailSerial, artistCatalogSerial, detailItem, 0)
-  }
-
-  function loadMoreArtistPlaylists() {
-    // No Subsonic artist-playlist search; nothing to load.
   }
 
   function loadMoreDetail() {
@@ -2569,6 +2478,62 @@ Item {
     if (value === "newest") return homeNewest
     if (value === "starred") return homeStarred
     return homeRecent
+  }
+
+  // Genre browsing (Explore): one genre name drives a byGenre getAlbumList2
+  // window; "Load more" and the FilterScanController pacing in the view ask
+  // for the next offset until a window comes back short.
+  property string discoverGenre: ""
+  property var genreAlbums: []
+  property string genreAlbumsNext: ""
+  property bool genreAlbumsLoading: false
+  property int genreSerial: 0
+
+  function openDiscoverGenre(name) {
+    var value = String(name || "").trim()
+    // Re-selecting the current genre re-fetches, so Refresh stays honest.
+    var expected = ++genreSerial
+    discoverGenre = value
+    genreAlbums = []
+    genreAlbumsNext = ""
+    genreAlbumsLoading = value !== ""
+    if (!value) return
+    requestGenreAlbumWindow(value, 0, expected)
+  }
+
+  function requestGenreAlbumWindow(genre, offset, expected) {
+    subsonicApi.request("getAlbumList2",
+      Subsonic.albumList2Params("byGenre", 30, offset, { genre: genre }),
+      function(result) {
+        if (expected !== root.genreSerial) return
+        root.genreAlbumsLoading = false
+        if (!result || result.ok !== true) {
+          root.fail(String(result && result.errorMessage || "The server request failed"))
+          return
+        }
+        var rows = Api.subsonicAlbumListRows(result.data, root.subsonicArt)
+        // A full window promises a continuation; a short one is the end.
+        root.genreAlbumsNext = rows.length >= 30 ? String(offset + 30) : ""
+        root.genreAlbums = offset > 0
+          ? Api.mergeUnique(root.genreAlbums, rows) : rows
+        root.checkSavedItems(rows)
+      }, { priority: "interactive" })
+  }
+
+  function loadMoreGenreAlbums() {
+    if (!discoverGenre || genreAlbumsLoading || genreAlbumsNext === "") return
+    var expected = genreSerial
+    var offset = Math.max(0, Math.floor(Number(genreAlbumsNext) || 0))
+    genreAlbumsLoading = true
+    requestGenreAlbumWindow(discoverGenre, offset, expected)
+  }
+
+  function clearGenreBrowse() {
+    genreSerial++
+    discoverGenre = ""
+    genreAlbums = []
+    genreAlbumsNext = ""
+    genreAlbumsLoading = false
   }
 
   // Explore keeps the discovery role with Navidrome content: a random-album
@@ -2938,7 +2903,6 @@ Item {
     artistCatalogSerial++
     artistAlbumsLoading = false
     artistSongsLoading = false
-    artistPlaylistsLoading = false
     detailLoading = false
   }
 
@@ -3184,18 +3148,19 @@ Item {
   }
 
   // Playback rows are Subsonic songs. The v2 load body is built from the
+  // Playback rows are Subsonic songs. The v2 load body is built from the
   // visible list starting at the clicked row, so Next walks the displayed
   // order exactly as before. Context rows (album/playlist/artist) have no
   // server-side context to hand over: their full list is fetched first, then
   // queued from the top.
-  function playItem(item, sourceItems, contextUri, successMessage, explicitRadio) {
+  function playItem(item, sourceItems, successMessage) {
     localPlaybackStopped = false
     var playbackSerial = ++radioSerial
     if (item && item.kind === "context") {
       playContextItem(item, successMessage, playbackSerial)
       return
     }
-    var load = Api.playbackLoadBodyV2(item, sourceItems, contextUri,
+    var load = Api.playbackLoadBodyV2(item, sourceItems,
       item ? item.resumeMs : 0)
     if (!load) {
       fail("This song cannot be played")
@@ -3525,7 +3490,7 @@ Item {
   function resumeLastPlayed() {
     var candidate = resumeCandidate
     if (!Api.resumePlaybackAvailable(hasMedia, candidate)) return false
-    playItem(candidate.item, null, "",
+    playItem(candidate.item, null,
       "Resuming " + String(candidate.item.name || ""))
     return true
   }
@@ -3846,15 +3811,6 @@ Item {
     followedArtists = []
     followedArtistsLoaded = false
     followedArtistsNext = ""
-    savedShows = []
-    savedShowsLoaded = false
-    savedShowsNext = ""
-    savedEpisodes = []
-    savedEpisodesLoaded = false
-    savedEpisodesNext = ""
-    savedAudiobooks = []
-    savedAudiobooksLoaded = false
-    savedAudiobooksNext = ""
     playlistItems = []
     playlistItemsNext = ""
     playlistItemsError = ""
@@ -3917,6 +3873,12 @@ Item {
     discoverRequestsPending = 0
     discoverRequestsFailed = 0
     discoverMessage = ""
+    genreSerial++
+    discoverGenre = ""
+    genreAlbums = []
+    genreAlbumsNext = ""
+    genreAlbumsLoading = false
+    trackTruthSerial++
     detailSerial++
     detailItem = null
     detailItems = []
@@ -3932,18 +3894,10 @@ Item {
     artistSongs = []
     artistSongsNext = ""
     artistSongsLoading = false
-    artistPlaylists = []
-    artistPlaylistsNext = ""
-    artistPlaylistsLoading = false
-    artistThisIsPlaylist = null
-    artistThisIsLoading = false
     playlistsLoading = false
     savedTracksLoading = false
     savedAlbumsLoading = false
     followedArtistsLoading = false
-    savedShowsLoading = false
-    savedEpisodesLoading = false
-    savedAudiobooksLoading = false
     playlistItemsLoading = false
     playlistActionBusy = false
     playlistConversionBusy = false

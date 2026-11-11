@@ -538,11 +538,10 @@ TestCase {
 
   function test_searchScope_tracksTheOpenAreaAndSearchMode() {
     var artist = Api.searchScope("detail", {
-      id: "artist-id", uri: "spotify:artist:artist-id",
-      type: "artist", name: "Björk"
+      id: "artist-id", type: "artist", name: "Björk"
     }, null, "recent", "tracks")
     verify(artist.available)
-    compare(artist.key, "detail:spotify:artist:artist-id")
+    compare(artist.key, "detail:artist:artist-id")
     compare(artist.label, "Björk")
     compare(artist.mode, "artist")
 
@@ -560,6 +559,9 @@ TestCase {
       "Starred")
     compare(Api.searchScope("library", null, null, "recent", "albums").label,
       "Saved albums")
+    compare(Api.searchScope("library", null, null, "recent", "tracks").label,
+      "Starred")
+    verify(!Api.searchScope("library", null, null, "recent", "shows").available)
     verify(!Api.searchScope("search", null, null, "recent", "tracks").available)
     verify(!Api.searchScope("devices", null, null, "recent", "tracks").available)
   }
@@ -968,9 +970,15 @@ TestCase {
     compare(Api.repeatModeLabel("track"), "This song")
     compare(Api.repeatModeLabel("context"), "All")
     compare(Api.searchTypeLabel("track"), "Songs")
-    compare(Api.searchTypeLabel("audiobook"), "Books")
+    compare(Api.searchTypeLabel("album"), "Albums")
+    compare(Api.searchTypeLabel("artist"), "Artists")
+    compare(Api.searchTypeLabel("playlist"), "Playlists")
+    // Podcast-family labels are gone with their library tabs; an unknown
+    // type degrades to the generic label.
+    compare(Api.searchTypeLabel("audiobook"), "results")
     compare(Api.spotifyTypeLabel("track"), "Song")
     compare(Api.spotifyTypeLabel("playlist"), "Playlist")
+    compare(Api.spotifyTypeLabel("show"), "Library item")
   }
 
   function test_backendLoadFieldsV2_mapsSubsonicSongs() {
@@ -1069,7 +1077,7 @@ TestCase {
       { kind: "context", title: "Ignored" },
       { kind: "item", id: "c", title: "Three", duration: 210 }
     ]
-    compare(JSON.stringify(Api.playbackLoadBodyV2(rows[1], rows, "")),
+    compare(JSON.stringify(Api.playbackLoadBodyV2(rows[1], rows, 0)),
       JSON.stringify({
         songs: [
           { id: "b", title: "Two" },
@@ -1081,14 +1089,39 @@ TestCase {
     // A resume offset in milliseconds rides along for the clicked song; a
     // lone item without the list still loads; unusable requests return null.
     var solo = { kind: "item", id: "solo", title: "Solo", resumeMs: 9000 }
-    compare(JSON.stringify(Api.playbackLoadBodyV2(solo, [solo], "", 9000)),
+    compare(JSON.stringify(Api.playbackLoadBodyV2(solo, [solo], 9000)),
       JSON.stringify({
         songs: [{ id: "solo", title: "Solo" }],
         play: true,
         position_ms: 9000
       }))
-    compare(Api.playbackLoadBodyV2(rows[2], rows, ""), null)
-    compare(Api.playbackLoadBodyV2(null, rows, ""), null)
+    // A clicked row that is not list-identical is placed by its saved key.
+    var repeated = Api.playbackLoadBodyV2(
+      { kind: "item", id: "a", title: "One", resumeMs: 0 },
+      [{ kind: "item", id: "x", title: "X" },
+       { kind: "item", id: "a", title: "One" }], 0)
+    compare(JSON.stringify(repeated.songs), JSON.stringify([
+      { id: "a", title: "One" }, { id: "x", title: "X" }]))
+    compare(Api.playbackLoadBodyV2(rows[2], rows, 0), null)
+    compare(Api.playbackLoadBodyV2(null, rows, 0), null)
+  }
+
+  function test_playbackContextOffsetPosition_matchesBySavedKey() {
+    var rows = [
+      { kind: "item", type: "track", id: "tr-1" },
+      { kind: "item", type: "track", id: "tr-2" },
+      { kind: "item", type: "track", id: "tr-1" }
+    ]
+    // Row identity first, then the type:id key; duplicates keep the first
+    // occurrence. A row without a usable id never matches.
+    compare(Api.playbackContextOffsetPosition(rows[0], rows), 0)
+    compare(Api.playbackContextOffsetPosition(
+      { kind: "item", type: "track", id: "tr-1" }, rows), 0)
+    compare(Api.playbackContextOffsetPosition(
+      { kind: "item", type: "track", id: "tr-2" }, rows), 1)
+    compare(Api.playbackContextOffsetPosition(
+      { kind: "context", type: "album", id: "tr-1" }, rows), -1)
+    compare(Api.playbackContextOffsetPosition(null, rows), -1)
   }
 
   function test_currentPlaybackDeviceWorksBeforeDeviceListLoads() {
@@ -1345,6 +1378,17 @@ TestCase {
     compare(merged.length, 3)
     compare(merged[0].uri, "spotify:track:a")
     compare(merged[2].uri, "spotify:track:c")
+    // Canonical Subsonic rows dedupe on the type:id saved key.
+    var canonical = Api.mergeUnique([
+      { kind: "item", type: "track", id: "tr-1", uri: "navidrome:track:tr-1" },
+      { kind: "context", type: "album", id: "al-1", uri: "navidrome:album:al-1" }
+    ], [
+      { kind: "item", type: "track", id: "tr-1", uri: "navidrome:track:tr-1" },
+      { kind: "context", type: "album", id: "al-2", uri: "navidrome:album:al-2" }
+    ])
+    compare(canonical.length, 3)
+    compare(canonical[0].id, "tr-1")
+    compare(canonical[2].id, "al-2")
   }
 
   function test_redact_coversHeadersFormsUrlsAndJson() {
@@ -1772,22 +1816,20 @@ TestCase {
   }
 
   function test_resumePlaybackAvailable_needsIdleReceiverAndCandidate() {
-    var candidate = { item: { uri: "navidrome:album:rec", name: "x" } }
+    var candidate = { item: { id: "al-rec", name: "x" } }
     compare(Api.resumePlaybackAvailable(false, candidate), true)
     compare(Api.resumePlaybackAvailable(true, candidate), false)
     compare(Api.resumePlaybackAvailable(false, null), false)
     compare(Api.resumePlaybackAvailable(false, { item: null }), false)
-    compare(Api.resumePlaybackAvailable(false, { item: { uri: "" } }), false)
+    compare(Api.resumePlaybackAvailable(false, { item: { id: "" } }), false)
   }
 
   function test_playbackVisibleOrder_followsFiltersAndSorts() {
     // Subsonic playback is always the displayed list; a filter or a
     // non-default sort is exactly the display the user asked for.
-    verify(Api.playbackUsesVisibleOrder("", "miles", "default"))
-    verify(Api.playbackUsesVisibleOrder("", "", "name"))
-    verify(!Api.playbackUsesVisibleOrder("", "", "default"))
-    compare(Api.playbackContextForView("", "", "default"), "")
-    compare(Api.playbackContextForView("", "miles", "default"), "")
+    verify(Api.playbackUsesVisibleOrder("miles", "default"))
+    verify(Api.playbackUsesVisibleOrder("", "name"))
+    verify(!Api.playbackUsesVisibleOrder("", "default"))
     compare(Api.visibleOrderPlaybackMessage(12), "Playing the displayed order")
     verify(Api.visibleOrderPlaybackMessage(114).indexOf("100 items") >= 0)
     compare(Api.PLAYBACK_URI_LIMIT, 100)
@@ -1876,6 +1918,9 @@ TestCase {
     compare(refRow.type, "track")
     compare(refRow.subtitle, "Miles Davis")
     compare(refRow.durationMs, 54000)
+    // A SongRef carries no star truth: the field stays undefined so
+    // checkSavedItems never records a guess as server state.
+    compare(refRow.starred, undefined)
     verify(Api.subsonicSongRefRow({ title: "no id" }) === null)
   }
 

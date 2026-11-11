@@ -14,7 +14,11 @@ Item {
   property var sourceItems: []
   property string filterText: ""
   property string sortKey: "default"
-  property string contextUri: ""
+  // Identity key of the backing collection (Api.savedKeyFor of the playlist /
+  // album header, "" when the list has no single owner). It is not a uri:
+  // playlist identity, occurrence matching, and the restore scroll keys all
+  // use the type:id key now.
+  property string contextKey: ""
   property bool showFilter: true
   property bool showSort: showFilter
   property bool showQueue: true
@@ -57,9 +61,7 @@ Item {
 
   readonly property var visibleItems: Api.filteredSorted(sourceItems, filterText, sortKey)
   readonly property bool playbackUsesVisibleOrder: Api.playbackUsesVisibleOrder(
-    contextUri, filterText, sortKey)
-  readonly property string playbackContextUri: Api.playbackContextForView(
-    contextUri, filterText, sortKey)
+    filterText, sortKey)
   readonly property var sortKeys: ["default", "name", "artist", "album", "duration",
     "date", "date-asc"]
   readonly property bool canReorder: allowReorder && !reorderBusy
@@ -68,13 +70,13 @@ Item {
   readonly property var dragItem: dragSourceIndex >= 0
     && dragSourceIndex < visibleItems.length ? visibleItems[dragSourceIndex] : null
 
-  signal activated(var item, var sourceItems, string contextUri)
+  signal activated(var item, var sourceItems)
   signal opened(var item)
   signal queued(var item)
   signal playlistRequested(var item)
   signal saveToggled(var item)
   signal contextRequested(var item, real sceneX, real sceneY, int index,
-    var sourceItems, string contextUri, string playbackContextUri)
+    var sourceItems, string contextKey)
   signal reorderRequested(int sourceIndex, int destinationIndex)
   signal loadMoreRequested()
   signal viewStateChanged(string filterText, string sortKey, real contentY)
@@ -136,8 +138,7 @@ Item {
       x: point.x,
       y: point.y,
       items: visibleItems,
-      uri: contextUri,
-      playbackUri: playbackContextUri
+      key: contextKey
     }
   }
 
@@ -449,7 +450,7 @@ Item {
           }
         }
         onActivated: function(item) {
-          root.activated(item, root.visibleItems, root.playbackContextUri)
+          root.activated(item, root.visibleItems)
         }
         onOpenRequested: function(item) { root.opened(item) }
         onArtistRequested: function(item) { root.opened(item) }
@@ -459,7 +460,7 @@ Item {
         onSaveRequested: function(item) { root.saveToggled(item) }
         onContextRequested: function(item, sceneX, sceneY) {
           root.contextRequested(item, sceneX, sceneY, index,
-            root.visibleItems, root.contextUri, root.playbackContextUri)
+            root.visibleItems, root.contextKey)
         }
         onReorderDragStarted: function(sceneY) {
           root.beginReorder(index, sceneY)
