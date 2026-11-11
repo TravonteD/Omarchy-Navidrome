@@ -47,7 +47,7 @@ omarchy restart shell
 ```
 
 The cleanup deliberately leaves unrelated software alone, including any other
-Omarchy plugin such as Omasing.
+Omarchy plugin.
 
 ## What carries over
 

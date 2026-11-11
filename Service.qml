@@ -18,7 +18,6 @@ Item {
 
   property var shell: null
   property var manifest: null
-  property var pluginRegistry: null
 
   readonly property string pluginId: manifest && manifest.id
     ? String(manifest.id) : "quickshell.navidrome"
@@ -49,7 +48,8 @@ Item {
     scrollSpeed: "1",
     maxBarTextWidth: "240",
     fixedBarWidth: "Off",
-    audioQuality: "320 kbps"
+    audioFormat: "source",
+    audioMaxBitRate: "0"
   })
   property var settings: Api.shallowCopy(defaultSettingValues)
 
@@ -85,12 +85,15 @@ Item {
   // between songs of different lengths. Meaningless without a cap.
   readonly property bool fixedBarWidth: maxBarTextWidth > 0
     && String(settings.fixedBarWidth || "Off") === "On"
-  readonly property int bitrateKbps: {
-    var quality = String(settings.audioQuality || "320 kbps")
-    return quality.indexOf("96") === 0 ? 96
-      : (quality.indexOf("160") === 0 ? 160 : 320)
-  }
-  readonly property string audioQuality: bitrateKbps + " kbps"
+  // The Navidrome transcode choice: the /rest/stream format ("source" keeps
+  // the file's own format) and a kbps cap (0 = no cap). Both are written to
+  // backend.conf [global] format/max_bit_rate by the DaemonManager config
+  // writer; a running engine re-reads them the next time it starts (usually
+  // the next time playback begins after the engine has idled out).
+  readonly property string audioFormat: Api.normalizedAudioFormat(
+    settings.audioFormat)
+  readonly property int audioMaxBitRate: Api.normalizedAudioMaxBitRate(
+    settings.audioMaxBitRate)
   property var searchHistory: []
   property var sessionState: ({})
   property bool sessionFileReady: false
@@ -155,24 +158,14 @@ Item {
   readonly property var currentLyricsSong: Api.lyricsSong(currentTrackId,
     title, artist, album, lengthSeconds, artUrl, positionSeconds)
   readonly property bool lyricsAvailable: showLyrics && currentLyricsSong !== null
-  readonly property string lyricsPluginId: "stappmus.lyrics"
-  readonly property string lyricsPluginUrl: "https://github.com/stappmus/Omasing.git"
-  readonly property string lyricsPluginAvailability: {
-    var plugins = pluginRegistry && pluginRegistry.installedPlugins
-      ? pluginRegistry.installedPlugins : ({})
-    var installed = !!plugins[lyricsPluginId]
-    var enabled = installed && pluginRegistry
-      && typeof pluginRegistry.inBar === "function"
-      && pluginRegistry.inBar(lyricsPluginId)
-    return Api.optionalPluginState(installed, enabled)
-  }
-  property bool lyricsPluginBusy: false
-  property string lyricsPluginOperation: ""
-  property string lyricsPluginError: ""
-  property string lyricsPluginRequestSurface: ""
-  property var pendingLyricsSong: null
-  property int lyricsPluginLaunchAttempts: 0
-  property double lyricsPluginInstallStartedAt: 0
+  // Built-in lyrics (getLyricsBySongId): the only fetch driver is the panel's
+  // lyrics surface being open — no periodic timers, no fetches while closed,
+  // and a refetch only when the current track id changes while it is open.
+  property bool lyricsSurfaceOpen: false
+  property int lyricsSerial: 0
+  property string lyricsFetchedFor: ""
+  property var lyricsData: null
+  property string lyricsError: ""
   readonly property bool shuffle: hasLocalPlayer && activePlayer.shuffleSupported
     ? activePlayer.shuffle === true : false
   readonly property string repeatMode: mprisRepeatMode()
@@ -351,11 +344,11 @@ Item {
   // socket path sends it.
   property var pendingPlaybackLoad: null
   property string pendingPlaybackMessage: ""
-  property var pendingPlaybackRadio: null
   property int pendingPlaybackSerial: 0
+  // playbackSerial: one generation counter guarding playback loads (the
+  // Spotify-era "radio" name survives only because every load passes
+  // through it).
   property int radioSerial: 0
-  property var lastRadioPlaylist: null
-  readonly property bool lastRadioPlaying: !!lastRadioPlaylist && playing
   property bool localActivationRequested: false
   property int localSocketWaitAttempts: 0
   property bool loginFlowActive: false
@@ -363,9 +356,6 @@ Item {
   readonly property int cacheLimit: 200
 
   signal operationFailed(string reason)
-  signal radioPlaylistReady(var playlist)
-  signal lyricsPluginPromptRequested(string surface, string availability)
-  signal lyricsPluginOpened(string surface)
 
   function loginProgressText() {
     if (daemonManager.setupBusy) return "Preparing playback on this computer"
@@ -390,7 +380,7 @@ Item {
     var keys = ["deviceName", "idleShutdownMinutes", "showMiniPlayer",
       "showVinylRecord", "shortcutPlayer", "shortcutHints", "showLyrics", "showArtwork", "showTrackTitle", "showArtistName",
       "showPausedTrack", "scrollBarText", "scrollSpeed", "maxBarTextWidth",
-      "fixedBarWidth", "audioQuality"]
+      "fixedBarWidth", "audioFormat", "audioMaxBitRate"]
     for (var i = 0; i < keys.length; i++) {
       var key = keys[i]
       if (source[key] !== undefined) next[key] = source[key]
@@ -416,9 +406,9 @@ Item {
     if (Number(next.maxBarTextWidth) === 0) next.scrollBarText = "Off"
     next.fixedBarWidth = String(next.fixedBarWidth || "Off") === "On" ? "On" : "Off"
     if (Number(next.maxBarTextWidth) === 0) next.fixedBarWidth = "Off"
-    var quality = String(next.audioQuality || "320 kbps")
-    next.audioQuality = quality.indexOf("96") === 0 ? "96 kbps"
-      : (quality.indexOf("160") === 0 ? "160 kbps" : "320 kbps")
+    next.audioFormat = Api.normalizedAudioFormat(next.audioFormat)
+    next.audioMaxBitRate = String(Api.normalizedAudioMaxBitRate(
+      next.audioMaxBitRate))
     return next
   }
 
@@ -426,8 +416,9 @@ Item {
     var previousDeviceName = deviceName
     var next = normalizedSettings(values)
     if (JSON.stringify(next) !== JSON.stringify(settings)) settings = next
-    // The backend re-reads device_name/bitrate when the next playback start
-    // writes its configuration (DaemonManager.configureDeviceName).
+    // The engine re-reads device_name/format/max_bit_rate when it next
+    // starts (the config writer runs on every settings change; the config is
+    // read once per engine process).
     void previousDeviceName
   }
 
@@ -472,7 +463,6 @@ Item {
     }
     sessionFileReady = true
     reconcileSessionPersistence()
-    resumeLyricsInstallIntent()
   }
 
   function scheduleSessionSave() {
@@ -534,7 +524,6 @@ Item {
   function syncSettings() {
     applySettings(configuredEntry() || {})
     reconcileSessionPersistence()
-    resumeLyricsInstallIntent()
   }
 
   // The Navidrome stream engine publishes its own MPRIS player; match it by
@@ -588,176 +577,67 @@ Item {
     else statusClearTimer.stop()
   }
 
-  function requestLyrics(surface) {
-    if (!currentLyricsSong) return "unavailable"
-    lyricsPluginRequestSurface = String(surface || "")
-    pendingLyricsSong = currentLyricsSong
-    lyricsPluginError = ""
-    lyricsPluginLaunchAttempts = 0
-    if (lyricsPluginAvailability === "ready") {
-      launchLyricsPlugin()
-      return "opening"
-    }
-    lyricsPluginPromptRequested(lyricsPluginRequestSurface,
-      lyricsPluginAvailability)
-    return lyricsPluginAvailability
+  // ------ built-in lyrics (getLyricsBySongId) --------------------------------
+
+  // The panel owns the surface: openLyrics()/the popup call
+  // setLyricsSurfaceOpen(), and this side owns the fetch discipline. A fetch
+  // happens only while the surface is open (never for a closed view, never
+  // on a timer), respects the same optional-content master switch as
+  // artwork, and refetches only when the current track id changes while the
+  // surface stays open. In-flight answers are discarded by the serial when
+  // the surface closes.
+  function setLyricsSurfaceOpen(open) {
+    var value = open === true
+    if (lyricsSurfaceOpen === value) return
+    lyricsSurfaceOpen = value
+    if (value) requestLyricsForCurrentTrack(false)
+    else lyricsSerial++
   }
 
-  function pendingLyricsInstall() {
-    var pending = sessionState && sessionState.pendingLyricsInstall
-    return pending && typeof pending === "object" ? pending : null
+  // A lyrics fetch needs an open surface on a visible panel, a playing
+  // Subsonic song, and the optional-content switch on (artwork off means no
+  // optional content fetches at all — getLyricsBySongId is a server read of
+  // the same kind).
+  function canFetchLyrics() {
+    return lyricsSurfaceOpen && uiVisible && showLyrics && artworkEnabled
+      && authManager.loggedIn && currentLyricsSong !== null
   }
 
-  function persistLyricsInstallIntent() {
-    if (!pendingLyricsSong) return
-    var state = Api.shallowCopy(sessionState)
-    state.pendingLyricsInstall = Api.lyricsInstallIntent(pendingLyricsSong,
-      lyricsPluginRequestSurface, Date.now())
-    persistSession(state)
+  function lyricsUnavailableReason() {
+    if (currentLyricsSong === null) return "Play a song to see its lyrics."
+    if (!showLyrics) return "The lyrics button is turned off in Settings."
+    if (!artworkEnabled) return "Lyrics are unavailable while artwork is turned off in Settings."
+    if (!authManager.loggedIn) return "Connect to Navidrome to load lyrics."
+    return ""
   }
 
-  function clearLyricsInstallIntent() {
-    if (!pendingLyricsInstall()) return
-    persistSession(Api.sessionWithoutLyricsInstall(sessionState))
-  }
-
-  function confirmLyricsPlugin(surface) {
-    if (lyricsPluginBusy) return false
-    if (surface) lyricsPluginRequestSurface = String(surface)
-    if (!pendingLyricsSong) pendingLyricsSong = currentLyricsSong
-    if (!pendingLyricsSong) {
-      lyricsPluginError = "Play a song first, then try lyrics again."
-      return false
-    }
-    lyricsPluginError = ""
-
-    if (lyricsPluginAvailability === "ready") {
-      lyricsPluginLaunchAttempts = 0
-      launchLyricsPlugin()
-      return true
-    }
-
-    var command = Api.optionalPluginSetupCommand(lyricsPluginAvailability,
-      lyricsPluginId, lyricsPluginUrl)
-    if (!command.length) {
-      lyricsPluginError = "Omasing could not be prepared for installation."
-      return false
-    }
-    lyricsPluginOperation = lyricsPluginAvailability
-    lyricsPluginBusy = true
-    persistLyricsInstallIntent()
-
-    // Adding a plugin writes into ~/.config/omarchy/plugins, which reloads
-    // the shell and would kill a child Process before enable finishes.
-    // Detach the add and resume from the saved intent after reload.
-    if (lyricsPluginAvailability === "missing") {
-      lyricsPluginInstallStartedAt = Date.now()
-      Quickshell.execDetached(command)
-      lyricsPluginInstallPoll.restart()
-      return true
-    }
-
-    lyricsPluginSetupProcess.command = command
-    lyricsPluginSetupProcess.running = true
-    return true
-  }
-
-  function resumeLyricsInstallIntent() {
-    var intent = pendingLyricsInstall()
-    if (!intent) return
-    if (!Api.lyricsInstallIntentIsFresh(intent, Date.now(), 180000)) {
-      clearLyricsInstallIntent()
-      return
-    }
-    if (!pendingLyricsSong) pendingLyricsSong = intent.song
-    if (!lyricsPluginRequestSurface)
-      lyricsPluginRequestSurface = String(intent.surface || "")
-
-    if (lyricsPluginAvailability === "ready") {
-      lyricsPluginInstallPoll.stop()
-      lyricsPluginBusy = false
-      lyricsPluginError = ""
-      lyricsPluginLaunchAttempts = 0
-      clearLyricsInstallIntent()
-      launchLyricsPlugin()
-      return
-    }
-
-    if (lyricsPluginBusy || lyricsPluginSetupProcess.running
-        || lyricsPluginInstallPoll.running)
-      return
-
-    if (lyricsPluginAvailability === "disabled") {
-      confirmLyricsPlugin(lyricsPluginRequestSurface)
-      return
-    }
-
-    lyricsPluginBusy = true
-    lyricsPluginOperation = "missing"
-    lyricsPluginInstallStartedAt = Number(intent.startedAt) || Date.now()
-    lyricsPluginInstallPoll.restart()
-  }
-
-  function finishLyricsPluginInstallWatch() {
-    if (lyricsPluginAvailability === "ready") {
-      lyricsPluginBusy = false
-      lyricsPluginError = ""
-      lyricsPluginLaunchAttempts = 0
-      clearLyricsInstallIntent()
-      launchLyricsPlugin()
-      return true
-    }
-    if (lyricsPluginAvailability === "disabled") {
-      lyricsPluginBusy = false
-      confirmLyricsPlugin(lyricsPluginRequestSurface)
-      return true
-    }
-    if (Date.now() - lyricsPluginInstallStartedAt < 90000) return false
-    lyricsPluginBusy = false
-    lyricsPluginError = "Omasing could not be installed. Check your network and try again."
-    clearLyricsInstallIntent()
-    lyricsPluginPromptRequested(lyricsPluginRequestSurface,
-      lyricsPluginAvailability)
-    return true
-  }
-
-  function cancelLyricsPlugin(surface) {
-    if (lyricsPluginBusy) return
-    if (surface && String(surface) !== lyricsPluginRequestSurface) return
-    lyricsPluginInstallPoll.stop()
-    lyricsPluginRequestSurface = ""
-    pendingLyricsSong = null
-    lyricsPluginError = ""
-    clearLyricsInstallIntent()
-  }
-
-  function launchLyricsPlugin() {
-    if (!pendingLyricsSong || lyricsPluginLaunchProcess.running) return
-    lyricsPluginLaunchAttempts++
-    lyricsPluginLaunchProcess.command = ["/usr/bin/omarchy-shell",
-      lyricsPluginId, "lyrics", JSON.stringify(pendingLyricsSong)]
-    lyricsPluginLaunchProcess.running = true
-  }
-
-  function finishLyricsPluginLaunch(exitCode) {
-    if (Number(exitCode) === 0) {
-      var openedSurface = lyricsPluginRequestSurface
-      pendingLyricsSong = null
-      lyricsPluginRequestSurface = ""
-      lyricsPluginError = ""
-      lyricsPluginLaunchAttempts = 0
-      lyricsPluginOpened(openedSurface)
-      return
-    }
-    if (lyricsPluginLaunchAttempts < 20) {
-      lyricsPluginLaunchRetry.restart()
-      return
-    }
-    var detail = String(lyricsPluginLaunchStderr.text || "").trim()
-    lyricsPluginError = safeError(detail
-      || "Omasing is installed, but its lyrics window could not be opened.")
-    lyricsPluginPromptRequested(lyricsPluginRequestSurface,
-      lyricsPluginAvailability)
+  function requestLyricsForCurrentTrack(force) {
+    if (!canFetchLyrics()) return
+    var id = String(currentLyricsSong.id)
+    if (force !== true && lyricsFetchedFor === id) return
+    var expected = ++lyricsSerial
+    lyricsFetchedFor = id
+    lyricsData = null
+    lyricsError = ""
+    subsonicApi.request("getLyricsBySongId", Subsonic.lyricsParams(id),
+      function(result) {
+        if (expected !== root.lyricsSerial) return
+        if (!result || result.ok !== true) {
+          lyricsData = null
+          // Error 70 ("not found") is the normal "this song has no stored
+          // lyrics" answer: an empty surface, not a failure.
+          if (result && result.errorCode === 70) {
+            lyricsData = Subsonic.emptyLyrics()
+            lyricsError = ""
+          } else {
+            lyricsError = String(result && result.errorMessage
+              || "Lyrics could not be loaded")
+          }
+          return
+        }
+        lyricsError = ""
+        lyricsData = Subsonic.parseLyricsBySongId(result.data)
+      }, { priority: "interactive" })
   }
 
   function noteActivity() {
@@ -930,22 +810,11 @@ Item {
     return playlists
   }
 
-  function validRadioPlaylist(value) {
-    return !!value && value.type === "playlist" && !!value.id && !!value.uri
-  }
-
-  function restoreLastRadioPlaylist(value) {
-    if (!lastRadioPlaylist && validRadioPlaylist(value))
-      lastRadioPlaylist = value
-  }
-
-  function rememberRadioPlaylist(value) {
-    if (!validRadioPlaylist(value)) return
-    lastRadioPlaylist = value
-    var state = Api.shallowCopy(sessionState)
-    state.lastRadioPlaylist = value
-    persistSession(state)
-  }
+  // Spotify's "last radio" persistence died with the Web API: a saved
+  // server-side radio playlist and its session key are gone. Internet radio
+  // in the Navidrome design is the getInternetRadioStations source in
+  // Explore (see the stations block below), and track radio
+  // (getSimilarSongs2) needs server-side Last.fm, so it is not offered.
 
   // Opening a panel surface refreshes the login-driven state only then; the
   // widget on the bar and local MPRIS controls stay request-free. Navidrome
@@ -2124,14 +1993,69 @@ Item {
     genreAlbumsLoading = false
   }
 
+  // ------ internet radio stations (Explore) -------------------------------------
+
+  // getInternetRadioStations is a source alongside albums in Explore. The
+  // stations are external streams, not library songs, so their rows carry
+  // only identity (id/name) and the stream/home-page URLs — no artist,
+  // album, cover, star, or saved-track identity, and they never enter the
+  // Subsonic stream engine's queue.
+  property var radioStations: []
+  property bool radioStationsLoaded: false
+  property bool radioStationsLoading: false
+
+  function requestRadioStations(expectedData, expectedDiscover, callback) {
+    subsonicApi.request("getInternetRadioStations", {}, function(result) {
+      if (expectedData !== root.dataSerial
+          || expectedDiscover !== root.discoverSerial) {
+        if (typeof callback === "function") callback()
+        return
+      }
+      root.radioStationsLoading = false
+      if (result && result.ok === true) {
+        root.radioStations = Subsonic.parseInternetRadioStations(result.data)
+        if (typeof callback === "function") callback()
+        return
+      }
+      // A missing/failed station read only empties the section; the album
+      // and genre surfaces still load.
+      root.radioStations = []
+      if (typeof callback === "function") callback()
+    }, { priority: "interactive" })
+  }
+
+  function loadRadioStations() {
+    if (radioStationsLoading) return
+    var expectedData = dataSerial
+    var expectedDiscover = ++discoverSerial
+    radioStationsLoading = true
+    requestRadioStations(expectedData, expectedDiscover)
+  }
+
+  // Playing a station is deferred on purpose. The stream engine
+  // (backend/src/stream.rs) builds only /rest/stream URLs for library song
+  // ids — an internet-radio streamUrl is an arbitrary external address the
+  // engine cannot open, and this single-engine design has no second playback
+  // path (jukeboxControl plays through the server's own hardware and stays
+  // out of scope). Stations therefore stay visible and labeled in Explore
+  // while a play action reports the typed limitation instead of faking
+  // playback. When the engine grows external-stream support, this becomes
+  // the one place to hand the stream URL over.
+  function playRadioStation(station) {
+    var name = String(station && station.name || "that station")
+    fail("“" + name + "” cannot play yet: the local engine streams library "
+      + "songs only, not internet radio streams")
+  }
+
   // Explore keeps the discovery role with Navidrome content: a random-album
-  // window and the genre list. The genre scan machinery from
-  // FilterScanController stays for the genre browser (view pass).
+  // window, the genre list, and the internet radio stations. The genre scan
+  // machinery from FilterScanController stays for the genre browser.
   function finishDiscoverRequest(error) {
     if (error) discoverRequestsFailed++
     discoverRequestsPending = Math.max(0, discoverRequestsPending - 1)
     if (discoverRequestsPending > 0) return
     discoverLoaded = true
+    radioStationsLoaded = true
     checkSavedItems(discoverAlbums)
     if (!discoverAlbums.length) {
       discoverMessage = discoverRequestsFailed > 0
@@ -2147,7 +2071,8 @@ Item {
     discoverLoaded = false
     discoverMessage = ""
     discoverRequestsFailed = 0
-    discoverRequestsPending = 2
+    discoverRequestsPending = 3
+    radioStationsLoading = true
     subsonicApi.request("getAlbumList2",
       Subsonic.albumList2Params("random", 30, 0), function(result) {
         if (expectedData !== root.dataSerial
@@ -2171,6 +2096,9 @@ Item {
         ? Subsonic.parseGenres(result.data) : []
       root.finishDiscoverRequest(null)
     }, { priority: "interactive" })
+    requestRadioStations(expectedData, expectedDiscover, function() {
+      root.finishDiscoverRequest(null)
+    })
   }
 
   // The live queue is engine-owned; its honest QML-side source is the
@@ -2275,7 +2203,7 @@ Item {
   function clearPendingPlayback(keepActivation) {
     pendingPlaybackLoad = null
     pendingPlaybackMessage = ""
-    pendingPlaybackRadio = null
+
     pendingPlaybackSerial = 0
     if (keepActivation !== true) localActivationRequested = false
   }
@@ -2368,7 +2296,7 @@ Item {
     void anchorItem
     pendingPlaybackLoad = load
     pendingPlaybackMessage = String(successMessage || "")
-    pendingPlaybackRadio = null
+
     pendingPlaybackSerial = playbackSerial
     localActivationRequested = true
     noteActivity()
@@ -2843,6 +2771,13 @@ Item {
     discoverRequestsPending = 0
     discoverRequestsFailed = 0
     discoverMessage = ""
+    radioStations = []
+    radioStationsLoaded = false
+    radioStationsLoading = false
+    lyricsSerial++
+    lyricsFetchedFor = ""
+    lyricsData = null
+    lyricsError = ""
     genreSerial++
     discoverGenre = ""
     genreAlbums = []
@@ -2888,14 +2823,20 @@ Item {
     if (sleepMode === "track" && sleepTrackUri && currentUri
         && currentUri !== sleepTrackUri) finishSleepTimer()
   }
+  onCurrentTrackIdChanged: {
+    // An open lyrics surface follows the song; a closed one never fetches.
+    if (lyricsSurfaceOpen) requestLyricsForCurrentTrack(true)
+  }
   onCurrentTrackItemUriChanged: syncCurrentTrackSaved(false)
-  onLyricsPluginAvailabilityChanged: resumeLyricsInstallIntent()
   onShellChanged: settingsSync.restart()
   onUiVisibleChanged: {
     if (uiVisible) {
       ensureVisibleLocalReceiver()
       syncCurrentTrackSaved(true)
       updateSleepCountdown()
+      // An open lyrics surface that was hidden mid-fetch resumes cleanly;
+      // a closed one still never fetches.
+      if (lyricsSurfaceOpen) requestLyricsForCurrentTrack(false)
     }
   }
   onFullyConnectedChanged: {
@@ -2991,51 +2932,6 @@ Item {
       if (!root.sessionFileReady) sessionFile.reload()
       else if (root.sessionFileDirty) root.flushSessionFile()
     }
-  }
-
-  Timer {
-    id: lyricsPluginLaunchRetry
-    interval: 250
-    repeat: false
-    onTriggered: root.launchLyricsPlugin()
-  }
-
-  Timer {
-    id: lyricsPluginInstallPoll
-    interval: 400
-    repeat: true
-    onTriggered: if (root.finishLyricsPluginInstallWatch()) stop()
-  }
-
-  Process {
-    id: lyricsPluginSetupProcess
-    running: false
-    command: []
-    stdout: StdioCollector { id: lyricsPluginSetupStdout; waitForEnd: true }
-    stderr: StdioCollector { id: lyricsPluginSetupStderr; waitForEnd: true }
-    onExited: function(exitCode) {
-      root.lyricsPluginBusy = false
-      if (Number(exitCode) === 0) {
-        root.lyricsPluginOperation = ""
-        root.lyricsPluginError = ""
-        root.lyricsPluginLaunchAttempts = 0
-        lyricsPluginLaunchRetry.restart()
-        return
-      }
-      var detail = String(lyricsPluginSetupStderr.text
-        || lyricsPluginSetupStdout.text || "").trim()
-      root.lyricsPluginError = root.safeError(detail
-        || "Omasing could not be installed.")
-    }
-  }
-
-  Process {
-    id: lyricsPluginLaunchProcess
-    running: false
-    command: []
-    stdout: StdioCollector { waitForEnd: true }
-    stderr: StdioCollector { id: lyricsPluginLaunchStderr; waitForEnd: true }
-    onExited: function(exitCode) { root.finishLyricsPluginLaunch(exitCode) }
   }
 
   Timer {
@@ -3154,7 +3050,8 @@ Item {
     id: daemonManager
     pluginDir: root.pluginDir
     deviceName: root.deviceName
-    bitrateKbps: root.bitrateKbps
+    audioFormat: root.audioFormat
+    audioMaxBitRate: root.audioMaxBitRate
     mprisPresent: root.hasLocalPlayer
   }
 

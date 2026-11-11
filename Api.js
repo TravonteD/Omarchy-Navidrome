@@ -86,6 +86,37 @@ function normalizedScrollSpeed(value) {
   return Math.round(Math.max(0.25, Math.min(3, speed)) * 4) / 4
 }
 
+// The Navidrome transcode choice exposed as two settings: the /rest/stream
+// `format` ("source" = keep the file's own format) and a bounded `maxBitRate`
+// cap in kbps ("0" = no cap). These lists must match the backend's config
+// validation exactly — backend/src/config.rs checks format against
+// backend/src/stream.rs FORMATS ("" plus the same six suffixes) and accepts
+// any maxBitRate an integer within u16, while the UI only ever offers this
+// bounded cap list.
+var AUDIO_FORMATS = ["source", "mp3", "flac", "wav", "ogg", "opus", "aac"]
+var AUDIO_MAX_BIT_RATES = [0, 64, 96, 128, 192, 320]
+
+function normalizedAudioFormat(value) {
+  var format = String(value === undefined || value === null
+    ? "source" : value).trim()
+  return AUDIO_FORMATS.indexOf(format) >= 0 ? format : "source"
+}
+
+function normalizedAudioMaxBitRate(value) {
+  var rate = Math.floor(Number(value))
+  if (!isFinite(rate)) return 0
+  return AUDIO_MAX_BIT_RATES.indexOf(rate) >= 0 ? rate : 0
+}
+
+// Cycle through the option list and wrap; used by the settings buttons.
+function cycledChoice(list, value) {
+  var options = Array.isArray(list) ? list : []
+  if (!options.length) return value
+  var index = options.indexOf(value)
+  return options[(index + 1 + options.length) % options.length]
+}
+
+
 function timestampIsFresh(timestamp, now, lifetimeMs) {
   var checkedAt = Number(timestamp)
   var current = Number(now)
@@ -482,8 +513,7 @@ function playbackLoadBodyV2(item, sourceItems, resumeMs) {
 // MediaCollection, the panel views) renders these without caring which
 // endpoint produced them. Identity is the `savedKeyFor` key (`type:id`);
 // row `uri` remains only as an app-local token (`navidrome:<type>:<id>`)
-// for the few consumers that want a URI-shaped string (the persisted
-// last-radio playlist identity in Service). Panel
+// for the few consumers that want a URI-shaped string. Panel
 // and MediaCollection identity plumbing (context menus, playlist identity,
 // occurrence matching, restore keys) compare the saved key, never uris.
 // Service builds v2 load bodies from `id` alone and never reads row uris.
@@ -937,8 +967,8 @@ function currentPlaybackTrack(trackId, title, artist, album, coverUrl,
   }
 }
 
-// The interim Omasing handoff receives the plain Subsonic song id; the
-// built-in Navidrome lyrics provider (package 6) replaces the handoff.
+// The built-in lyrics surface receives the plain Subsonic song id plus the
+// playback metadata it needs to title the view and place synced lines.
 function lyricsSong(trackId, title, artist, album, duration, coverUrl,
     positionSeconds) {
   var id = String(trackId || "").trim()
@@ -959,47 +989,9 @@ function lyricsSong(trackId, title, artist, album, duration, coverUrl,
   }
 }
 
-function optionalPluginState(installed, enabled) {
-  if (installed !== true) return "missing"
-  return enabled === true ? "ready" : "disabled"
-}
-
-// Installation runs non-interactively only after the app's own confirmation
-// prompt. Keep the repository and plugin id as separate argv entries so no
-// user-controlled text is ever interpreted by a shell.
-function optionalPluginSetupCommand(state, pluginId, repositoryUrl) {
-  var availability = String(state || "")
-  var id = String(pluginId || "").trim()
-  var url = String(repositoryUrl || "").trim()
-  // Use the absolute binary so a Quickshell Process/execDetached does not
-  // depend on the shell's PATH. --yes keeps add non-interactive.
-  if (availability === "missing" && url)
-    return ["/usr/bin/omarchy", "plugin", "add", url, "--enable", "--yes"]
-  if (availability === "disabled" && id)
-    return ["/usr/bin/omarchy", "plugin", "enable", id, "--section", "center"]
-  return []
-}
-
-function lyricsInstallIntent(song, surface, now) {
-  if (!song || typeof song !== "object") return null
-  return {
-    song: song,
-    surface: String(surface || ""),
-    startedAt: Number(now) || Date.now()
-  }
-}
-
-function lyricsInstallIntentIsFresh(intent, now, lifetimeMs) {
-  if (!intent || typeof intent !== "object" || !intent.song) return false
-  return timestampIsFresh(intent.startedAt, now,
-    lifetimeMs === undefined ? 180000 : lifetimeMs)
-}
-
-function sessionWithoutLyricsInstall(session) {
-  var next = shallowCopy(session)
-  delete next.pendingLyricsInstall
-  return next
-}
+// The lyrics surface is built in now (getLyricsBySongId through SubsonicApi):
+// no optional plugin, no install intent, and nothing plugin-related to
+// persist. lyricsSong above stays the single metadata gate for the surface.
 
 var SESSION_STATE_LIMIT = 16000
 

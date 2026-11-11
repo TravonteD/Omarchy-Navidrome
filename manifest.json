@@ -43,7 +43,8 @@
       "scrollSpeed": "1",
       "maxBarTextWidth": "240",
       "fixedBarWidth": "Off",
-      "audioQuality": "320 kbps",
+      "audioFormat": "source",
+      "audioMaxBitRate": "0",
       "showArtwork": "On"
     },
     "schema": [
@@ -118,7 +119,7 @@
           "Off"
         ],
         "defaultValue": "On",
-        "description": "Show the Omasing lyrics button in the player and mini-player. When off, Ctrl+Shift+L is inactive too."
+        "description": "Show the lyrics button in the player and mini-player. When off, Ctrl+Shift+L is inactive too."
       },
       {
         "key": "showTrackTitle",
@@ -189,16 +190,35 @@
         "description": "When on, the bar label always reserves the maximum width while a track is shown, so neighbouring widgets do not shift between songs. Unavailable while the width is unlimited."
       },
       {
-        "key": "audioQuality",
+        "key": "audioFormat",
         "type": "enum",
-        "label": "Local playback quality",
+        "label": "Stream format",
         "options": [
-          "96 kbps",
-          "160 kbps",
-          "320 kbps"
+          "source",
+          "mp3",
+          "flac",
+          "wav",
+          "ogg",
+          "opus",
+          "aac"
         ],
-        "defaultValue": "320 kbps",
-        "description": "Takes effect the next time playback starts."
+        "defaultValue": "source",
+        "description": "Transcode target the Navidrome server streams in. Source keeps the file's own format; any other value makes the server transcode. Applies the next time the local engine starts."
+      },
+      {
+        "key": "audioMaxBitRate",
+        "type": "enum",
+        "label": "Bit rate cap",
+        "options": [
+          "0",
+          "64",
+          "96",
+          "128",
+          "192",
+          "320"
+        ],
+        "defaultValue": "0",
+        "description": "Maximum stream bit rate in kbps; 0 means no cap. Applies the next time the local engine starts."
       },
       {
         "key": "showArtwork",

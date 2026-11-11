@@ -294,39 +294,35 @@ TestCase {
     compare(Api.currentPlaybackTrack(null, "Song", "Artist", "", "", 0), null)
   }
 
-  function test_optionalLyricsPluginRequiresConfirmationBeforeSetup() {
-    compare(Api.optionalPluginState(false, false), "missing")
-    compare(Api.optionalPluginState(true, false), "disabled")
-    compare(Api.optionalPluginState(true, true), "ready")
+  function test_audioQualitySettings_normalizeToTheNavidromeChoice() {
+    // Stream format: the six server transcode targets plus "source".
+    verify(Api.AUDIO_FORMATS.length === 7)
+    compare(Api.AUDIO_FORMATS.indexOf("source"), 0)
+    compare(Api.normalizedAudioFormat("source"), "source")
+    compare(Api.normalizedAudioFormat("mp3"), "mp3")
+    compare(Api.normalizedAudioFormat(" flac "), "flac")
+    compare(Api.normalizedAudioFormat(""), "source")
+    compare(Api.normalizedAudioFormat(undefined), "source")
+    compare(Api.normalizedAudioFormat("aiff"), "source")
+    compare(Api.normalizedAudioFormat("MP3"), "source")
 
-    compare(Api.optionalPluginSetupCommand("missing", "stappmus.lyrics",
-      "https://github.com/stappmus/Omasing.git"), [
-        "/usr/bin/omarchy", "plugin", "add",
-        "https://github.com/stappmus/Omasing.git", "--enable", "--yes"
-      ])
-    compare(Api.optionalPluginSetupCommand("disabled", "stappmus.lyrics",
-      "https://github.com/stappmus/Omasing.git"), [
-        "/usr/bin/omarchy", "plugin", "enable", "stappmus.lyrics",
-        "--section", "center"
-      ])
-    compare(Api.optionalPluginSetupCommand("ready", "stappmus.lyrics",
-      "https://github.com/stappmus/Omasing.git"), [])
+    // Bit-rate cap: the bounded UI list only.
+    verify(JSON.stringify(Api.AUDIO_MAX_BIT_RATES)
+      === JSON.stringify([0, 64, 96, 128, 192, 320]))
+    compare(Api.normalizedAudioMaxBitRate("0"), 0)
+    compare(Api.normalizedAudioMaxBitRate("192"), 192)
+    compare(Api.normalizedAudioMaxBitRate(320), 320)
+    compare(Api.normalizedAudioMaxBitRate(""), 0)
+    compare(Api.normalizedAudioMaxBitRate("not a number"), 0)
+    compare(Api.normalizedAudioMaxBitRate(160), 0)
+    compare(Api.normalizedAudioMaxBitRate(96.7), 96)
+    compare(Api.normalizedAudioMaxBitRate(160.9), 0)
 
-    var song = { id: "tr-one", title: "Song", artist: "Artist" }
-    var intent = Api.lyricsInstallIntent(song, "navidrome-panel-lyrics", 1000)
-    compare(intent.surface, "navidrome-panel-lyrics")
-    compare(intent.song.title, "Song")
-    verify(Api.lyricsInstallIntentIsFresh(intent, 1000, 180000))
-    verify(Api.lyricsInstallIntentIsFresh(intent, 180999, 180000))
-    verify(!Api.lyricsInstallIntentIsFresh(intent, 181000, 180000))
-    compare(Api.lyricsInstallIntent(null, "surface", 1000), null)
-    compare(Api.sessionWithoutLyricsInstall({
-      lastRadioPlaylist: "keep",
-      pendingLyricsInstall: intent
-    }).lastRadioPlaylist, "keep")
-    compare(Api.sessionWithoutLyricsInstall({
-      pendingLyricsInstall: intent
-    }).pendingLyricsInstall, undefined)
+    // Cycle buttons wrap through the option list.
+    compare(Api.cycledChoice(Api.AUDIO_MAX_BIT_RATES, 0), 64)
+    compare(Api.cycledChoice(Api.AUDIO_MAX_BIT_RATES, 320), 0)
+    compare(Api.cycledChoice(Api.AUDIO_FORMATS, "aac"), "source")
+    compare(Api.cycledChoice(Api.AUDIO_FORMATS, "nonsense"), "source")
   }
 
   function test_sessionRecord_roundTripsAndMigratesPluginSettings() {

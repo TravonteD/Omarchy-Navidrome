@@ -14,7 +14,10 @@ Item {
 
   property string pluginDir: ""
   property string deviceName: "Omarchy Navidrome"
-  property int bitrateKbps: 320
+  // The Navidrome transcode choice written to backend.conf [global]
+  // format/max_bit_rate. "source"/0 mean "keep the server's own format".
+  property string audioFormat: "source"
+  property int audioMaxBitRate: 0
   property string unitName: "omarchy-navidrome.service"
   property bool mprisPresent: false
 
@@ -131,9 +134,11 @@ Item {
       return
     }
     configurationPending = false
-    // The blank third line explicitly clears any legacy per-app sink choice.
-    // Omarchy's Audio panel remains the sole owner of desktop audio routing.
-    configurationInput = String(deviceName) + "\n" + String(bitrateKbps) + "\n"
+    // Three stdin lines: device name, stream format, bit-rate cap. There is
+    // no blank device line any more — the legacy per-app sink choice is
+    // dropped by the writer; Omarchy's Audio panel owns desktop routing.
+    configurationInput = String(deviceName) + "\n" + String(audioFormat)
+      + "\n" + String(audioMaxBitRate) + "\n"
     configurationBusy = true
     configWriter.command = [pluginDir + "/scripts/configure-backend.sh"]
     configWriter.running = true
@@ -152,7 +157,8 @@ Item {
   }
 
   onDeviceNameChanged: requestConfiguration()
-  onBitrateKbpsChanged: requestConfiguration()
+  onAudioFormatChanged: requestConfiguration()
+  onAudioMaxBitRateChanged: requestConfiguration()
   onPluginDirChanged: {
     if (!pluginDir) return
     checkRequirements()
@@ -183,7 +189,7 @@ Item {
       if (exitCode === 3) {
         root.startAfterConfiguration = false
         root.busy = false
-        root.lastError = "Playback settings contain an invalid device name or quality"
+        root.lastError = "Playback settings contain an invalid device name, format, or quality"
         return
       }
       if (exitCode !== 0 && exitCode !== 4)

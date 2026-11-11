@@ -852,6 +852,134 @@ function restoreLoadPlan(playQueue, bookmarks, maxSongs) {
   return null
 }
 
+// ------ lyrics (getLyricsBySongId) ---------------------------------------------
+
+// getLyricsBySongId parameters: the song id plus the optional OpenSubsonic
+// sync-window refinements (agent, fromMs, toMs). A call without an id is
+// rejected so empty lyrics requests never hit the wire.
+function lyricsParams(id, options) {
+  var key = id === null || id === undefined ? "" : String(id)
+  if (key === "") return null
+  var params = { id: key }
+  var source = options && typeof options === "object" ? options : ({})
+  var agent = text(source.agent).trim()
+  if (agent !== "") params.agent = agent
+  var from = Number(source.fromMs)
+  if (source.fromMs !== null && source.fromMs !== undefined
+      && isFinite(from) && from >= 0) {
+    params.fromMs = String(Math.round(from))
+  }
+  var to = Number(source.toMs)
+  if (source.toMs !== null && source.toMs !== undefined
+      && isFinite(to) && to >= 0) {
+    params.toMs = String(Math.round(to))
+  }
+  return params
+}
+
+function emptyLyrics() {
+  return { synced: false, lines: [], plain: "" }
+}
+
+// One lyrics line: `start` in milliseconds, null when the line carries no
+// timing. Empty lines are kept (instrumental gaps are meaningful); a line
+// with no value at all is dropped.
+function normalizeLyricsLine(node) {
+  if (!node || typeof node !== "object") return null
+  if (node.value === null || node.value === undefined) return null
+  var value = String(node.value)
+  var start = null
+  if (node.start !== null && node.start !== undefined && node.start !== "") {
+    var parsed = Number(node.start)
+    start = isFinite(parsed) ? Math.max(0, Math.floor(parsed)) : null
+  }
+  return { start: start, value: value }
+}
+
+// getLyricsBySongId → {synced, lines, plain}. Handles the OpenSubsonic
+// structured lyrics (flat `lyrics.line` lists and nested `structure`/
+// `structures` containers alike) and the legacy plain-text fallback
+// (`lyrics.value` with embedded newlines). `synced` is true only when the
+// server flagged the lyrics and every line carries a usable start, so the
+// view can always trust it for the highlight. Anything missing or malformed
+// parses to the empty result — never an error, never a throw.
+function parseLyricsBySongId(data) {
+  var node = data && typeof data === "object" ? data.lyrics : null
+  if (!node || typeof node !== "object") return emptyLyrics()
+  // OpenSubsonic structured lyrics: one `line` list per `structure`.
+  var groups = []
+  var direct = listOf(node, "line", normalizeLyricsLine)
+  if (direct.length) {
+    groups.push(direct)
+  } else {
+    var containers = []
+    if (node.structure !== null && node.structure !== undefined) {
+      containers = node.structure instanceof Array
+        ? node.structure : [node.structure]
+    } else if (node.structures !== null && node.structures !== undefined) {
+      containers = node.structures instanceof Array
+        ? node.structures : [node.structures]
+    }
+    for (var s = 0; s < containers.length; s++) {
+      var lines = listOf(containers[s], "line", normalizeLyricsLine)
+      if (lines.length) groups.push(lines)
+    }
+  }
+  if (groups.length) {
+    var lines = []
+    for (var g = 0; g < groups.length; g++) {
+      lines = lines.concat(groups[g])
+    }
+    var plain = []
+    for (var i = 0; i < lines.length; i++) plain.push(lines[i].value)
+    // `synced` is the contract the view can act on: the server flagged the
+    // lyrics AND every line carries a usable start. A flagged timeline with
+    // missing or malformed timings degrades to plain rendering instead of a
+    // half-synced highlight.
+    var allTimed = lines.length > 0
+    for (var t = 0; t < lines.length; t++) {
+      if (lines[t].start === null) allTimed = false
+    }
+    return {
+      synced: strictTrue(node.synced) && allTimed,
+      lines: lines,
+      plain: plain.join("\n")
+    }
+  }
+  // Legacy plain-text lyrics: `{"lyrics": {"value": "line\nline"}}`.
+  var value = typeof node.value === "string" ? node.value : ""
+  if (value === "") return emptyLyrics()
+  var plainLines = []
+  var raw = value.split("\n")
+  for (var v = 0; v < raw.length; v++) {
+    plainLines.push({ start: null, value: raw[v] })
+  }
+  return { synced: false, lines: plainLines, plain: value }
+}
+
+// ------ internet radio stations -------------------------------------------------
+
+// getInternetRadioStations → normalized station rows. A station is an
+// external stream, never a library song: it keeps its streamUrl and
+// homePageUrl and carries no artist/album/cover identity.
+function normalizeRadioStation(node) {
+  if (!hasId(node)) return null
+  var streamUrl = text(node.streamUrl).trim()
+  if (streamUrl === "") return null
+  return {
+    id: String(node.id),
+    name: text(node.name),
+    streamUrl: streamUrl,
+    homePageUrl: text(node.homePageUrl)
+  }
+}
+
+function parseInternetRadioStations(data) {
+  var node = data && typeof data === "object"
+    ? data.internetRadioStations : null
+  return listOf(node, "station", normalizeRadioStation)
+}
+
 // ------ artwork URLs -----------------------------------------------------------
 
 // Full getCoverArt URL, built over the pinned-salt request builder. Null is

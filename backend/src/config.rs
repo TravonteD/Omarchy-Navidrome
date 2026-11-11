@@ -242,6 +242,21 @@ mod tests {
         fs::remove_dir(dir).unwrap();
     }
 
+    // The QML settings surface and scripts/configure-backend.sh offer exactly
+    // the FORMATS list (source is written as "source" and mapped to "" by
+    // omission). Every entry must keep validating so the settings never
+    // produce an invalid_configuration engine failure.
+    #[test]
+    fn every_offered_stream_format_validates() {
+        for format in FORMATS {
+            let (path, dir) = write_config(&format!("[global]\nformat=\"{format}\""));
+            let config = BackendConfig::load(&path).unwrap();
+            assert_eq!(config.format, *format);
+            fs::remove_file(&path).unwrap();
+            fs::remove_dir(dir).unwrap();
+        }
+    }
+
     #[test]
     fn scrobbling_defaults_on_and_can_be_disabled() {
         let (path, dir) = write_config("[global]\nformat=\"mp3\"");

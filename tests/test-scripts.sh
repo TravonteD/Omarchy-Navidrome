@@ -125,28 +125,65 @@ grep -q '^source-build:' "$release_runtime/backend-origin"
 mkdir -p "$test_root/config/omarchy-navidrome"
 cp -- "$source_root/config/backend.conf" "$test_root/config/omarchy-navidrome/backend.conf"
 printf '%s\n' 'device = "legacy_output"' >>"$test_root/config/omarchy-navidrome/backend.conf"
-printf '%s\n%s\n' "Desk speakers" 320 |
+printf '%s\n%s\n%s\n' "Desk speakers" source 320 |
   XDG_CONFIG_HOME="$test_root/config" "$source_root/scripts/configure-backend.sh"
 grep -qx 'device_name = "Desk speakers"' "$test_root/config/omarchy-navidrome/backend.conf"
-grep -qx 'bitrate = 320' "$test_root/config/omarchy-navidrome/backend.conf"
 grep -qx 'no_audio_cache = false' "$test_root/config/omarchy-navidrome/backend.conf"
 grep -qx 'max_cache_size = 1000000000' "$test_root/config/omarchy-navidrome/backend.conf"
 ! grep -q '^device[[:space:]]*=' "$test_root/config/omarchy-navidrome/backend.conf"
 grep -qx 'autoplay = true' "$test_root/config/omarchy-navidrome/backend.conf"
 
+# "source" and a 0 cap mean "the server's own format": the keys are removed
+# and the backend defaults stand.
+printf '%s\n%s\n%s\n' "Desk speakers" source 0 |
+  XDG_CONFIG_HOME="$test_root/config" "$source_root/scripts/configure-backend.sh"
+grep -qx 'device_name = "Desk speakers"' "$test_root/config/omarchy-navidrome/backend.conf"
+! grep -q '^format[[:space:]]*=' "$test_root/config/omarchy-navidrome/backend.conf"
+! grep -q '^max_bit_rate[[:space:]]*=' "$test_root/config/omarchy-navidrome/backend.conf"
+! grep -q '^device[[:space:]]*=' "$test_root/config/omarchy-navidrome/backend.conf"
+
 printf '%s\n' "Renamed speakers" |
   XDG_CONFIG_HOME="$test_root/config" "$source_root/scripts/configure-backend.sh"
 grep -qx 'device_name = "Renamed speakers"' "$test_root/config/omarchy-navidrome/backend.conf"
-grep -qx 'bitrate = 320' "$test_root/config/omarchy-navidrome/backend.conf"
+! grep -q '^format[[:space:]]*=' "$test_root/config/omarchy-navidrome/backend.conf"
 ! grep -q '^device[[:space:]]*=' "$test_root/config/omarchy-navidrome/backend.conf"
 
-printf '%s\n%s\n\n' "Desk speakers" 96 |
+printf '%s\n%s\n%s\n' "Desk speakers" flac 192 |
   XDG_CONFIG_HOME="$test_root/config" "$source_root/scripts/configure-backend.sh"
-grep -qx 'bitrate = 96' "$test_root/config/omarchy-navidrome/backend.conf"
+grep -qx 'format = "flac"' "$test_root/config/omarchy-navidrome/backend.conf"
+grep -qx 'max_bit_rate = 192' "$test_root/config/omarchy-navidrome/backend.conf"
 ! grep -q '^device[[:space:]]*=' "$test_root/config/omarchy-navidrome/backend.conf"
+
+# Going back to source/0 removes the keys again so backend defaults win.
+printf '%s\n%s\n%s\n' "Desk speakers" opus 64 |
+  XDG_CONFIG_HOME="$test_root/config" "$source_root/scripts/configure-backend.sh"
+grep -qx 'format = "opus"' "$test_root/config/omarchy-navidrome/backend.conf"
+grep -qx 'max_bit_rate = 64' "$test_root/config/omarchy-navidrome/backend.conf"
+printf '%s\n%s\n%s\n' "Desk speakers" source 0 |
+  XDG_CONFIG_HOME="$test_root/config" "$source_root/scripts/configure-backend.sh"
+! grep -q '^format[[:space:]]*=' "$test_root/config/omarchy-navidrome/backend.conf"
+! grep -q '^max_bit_rate[[:space:]]*=' "$test_root/config/omarchy-navidrome/backend.conf"
 
 set +e
 printf '%s\n' 'invalid"name' |
+  XDG_CONFIG_HOME="$test_root/config" "$source_root/scripts/configure-backend.sh"
+invalid_status=$?
+set -e
+[[ $invalid_status -eq 3 ]]
+
+# The format list must match backend/src/config.rs validation exactly; a
+# rejected format or cap is a typed exit 3, and the file is left untouched.
+set +e
+printf '%s\n%s\n%s\n' "Desk speakers" aiff 192 |
+  XDG_CONFIG_HOME="$test_root/config" "$source_root/scripts/configure-backend.sh"
+invalid_status=$?
+set -e
+[[ $invalid_status -eq 3 ]]
+
+# The maxBitRate list is the bounded UI set, a subset of what the backend
+# accepts; anything else is rejected.
+set +e
+printf '%s\n%s\n%s\n' "Desk speakers" mp3 160 |
   XDG_CONFIG_HOME="$test_root/config" "$source_root/scripts/configure-backend.sh"
 invalid_status=$?
 set -e
@@ -660,11 +697,12 @@ jq -e '.version == "0.1.0"
   and (.barWidget.schema[] | select(.key == "showLyrics").defaultValue) == "On"
   and .barWidget.defaults.maxBarTextWidth == "240"
   and (.barWidget.schema[] | select(.key == "maxBarTextWidth").defaultValue) == "240"
-  and .barWidget.defaults.audioQuality == "320 kbps"
-  and (.barWidget.schema[] | select(.key == "audioQuality").defaultValue) == "320 kbps"' \
+  and .barWidget.defaults.audioFormat == "source"
+  and (.barWidget.schema[] | select(.key == "audioFormat").defaultValue) == "source"
+  and .barWidget.defaults.audioMaxBitRate == "0"
+  and (.barWidget.schema[] | select(.key == "audioMaxBitRate").defaultValue) == "0"' \
   "$source_root/manifest.json" >/dev/null
 grep -qx 'section=left' "$source_root/scripts/install-local.sh"
-grep -qx 'bitrate = 320' "$source_root/config/backend.conf"
 grep -qx 'no_audio_cache = false' "$source_root/config/backend.conf"
 grep -qx 'max_cache_size = 1000000000' "$source_root/config/backend.conf"
 ! grep -q 'Conflicts=' "$source_root/systemd/omarchy-navidrome.service"

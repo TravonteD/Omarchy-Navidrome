@@ -861,4 +861,142 @@ TestCase {
     compare(plan.offset_index, 1)
     compare(plan.position_ms, 1000)
   }
+
+  function test_lyricsParams_rejectsEmptyIdsAndCarriesOptionalWindows() {
+    verify(Subsonic.lyricsParams("") === null)
+    verify(Subsonic.lyricsParams(null) === null)
+    verify(Subsonic.lyricsParams(undefined) === null)
+    compare(Subsonic.lyricsParams("tr-9"), {id: "tr-9"})
+    compare(Subsonic.lyricsParams(42), {id: "42"})
+    compare(Subsonic.lyricsParams("tr-9", {agent: "audio"}), {
+      id: "tr-9", agent: "audio"
+    })
+    compare(Subsonic.lyricsParams("tr-9", {
+      agent: "audio", fromMs: 1200.4, toMs: 95000
+    }), {id: "tr-9", agent: "audio", fromMs: "1200", toMs: "95000"})
+    // Negative and malformed windows are omitted, never coerced.
+    compare(Subsonic.lyricsParams("tr-9", {fromMs: -5, toMs: "x"}), {id: "tr-9"})
+    compare(Subsonic.lyricsParams("tr-9", {agent: "  "}), {id: "tr-9"})
+  }
+
+  function test_parseLyricsBySongId_readsStructuredSyncedLines() {
+    var parsed = Subsonic.parseLyricsBySongId({
+      lyrics: {
+        displayArtist: "Artist", displayTitle: "Song", provider: "internal",
+        synced: true,
+        line: [
+          {start: 0, value: "First line"},
+          {start: 4000, value: "Second line"},
+          {start: "8200", value: "Third line"}
+        ]
+      }
+    })
+    compare(parsed.synced, true)
+    compare(parsed.lines.length, 3)
+    compare(parsed.lines[0].start, 0)
+    compare(parsed.lines[0].value, "First line")
+    compare(parsed.lines[1].start, 4000)
+    compare(parsed.lines[2].start, 8200)
+    compare(parsed.plain, "First line\nSecond line\nThird line")
+  }
+
+  function test_parseLyricsBySongId_acceptsNestedStructuresAndSingleNode() {
+    // The OpenSubsonic containers may arrive nested (structure(s)/line(s))
+    // and as single nodes instead of arrays; both flatten in order.
+    var parsed = Subsonic.parseLyricsBySongId({
+      lyrics: {
+        synced: true,
+        structure: [
+          {line: [{start: 0, value: "A"}, {start: 1000, value: "B"}]},
+          {line: {start: 2000, value: "C"}}
+        ]
+      }
+    })
+    compare(parsed.synced, true)
+    compare(parsed.lines.length, 3)
+    compare(parsed.plain, "A\nB\nC")
+
+    parsed = Subsonic.parseLyricsBySongId({
+      lyrics: {
+        synced: false,
+        structures: {line: [{value: "only"}]}
+      }
+    })
+    compare(parsed.lines.length, 1)
+    compare(parsed.lines[0].start, null)
+    compare(parsed.lines[0].value, "only")
+    compare(parsed.synced, false)
+  }
+
+  function test_parseLyricsBySongId_fallsBackToPlainValueLyrics() {
+    // Legacy getLyrics shape: one `value` string with embedded newlines.
+    var parsed = Subsonic.parseLyricsBySongId({
+      lyrics: {value: "plain one\n\nplain two"}
+    })
+    compare(parsed.synced, false)
+    compare(parsed.lines.length, 3)
+    for (var i = 0; i < parsed.lines.length; i++)
+      compare(parsed.lines[i].start, null)
+    compare(parsed.lines[0].value, "plain one")
+    compare(parsed.lines[1].value, "")
+    compare(parsed.lines[2].value, "plain two")
+    compare(parsed.plain, "plain one\n\nplain two")
+  }
+
+  function test_parseLyricsBySongId_isDefensiveAboutHostileShapes() {
+    var hostile = [null, undefined, "text", 42, {}, {lyrics: null},
+      {lyrics: "plain string"}, {lyrics: {}}, {lyrics: {line: null}},
+      {lyrics: {line: [null, {}, {value: ""}]}},
+      {lyrics: {synced: true, line: [{start: "not a number", value: "x"}]}},
+      {lyrics: {synced: true, line: [{start: -50, value: "neg"}]}},
+      {lyrics: {structure: [null, {}]}}]
+    for (var i = 0; i < hostile.length; i++) {
+      var parsed = Subsonic.parseLyricsBySongId(hostile[i])
+      // A surviving line keeps the shape contract; everything else is empty.
+      for (var j = 0; j < parsed.lines.length; j++) {
+        verify(typeof parsed.lines[j].value === "string")
+        verify(parsed.lines[j].start === null || parsed.lines[j].start >= 0)
+      }
+    }
+    // A synced line with a malformed start loses the timing, not the text.
+    parsed = Subsonic.parseLyricsBySongId({
+      lyrics: {synced: true, line: [{start: "not a number", value: "x"}]}})
+    compare(parsed.lines.length, 1)
+    compare(parsed.lines[0].start, null)
+    compare(parsed.lines[0].value, "x")
+    // A negative start clamps to zero.
+    parsed = Subsonic.parseLyricsBySongId({
+      lyrics: {synced: true, line: [{start: -50, value: "neg"}]}})
+    compare(parsed.lines[0].start, 0)
+  }
+
+  function test_parseInternetRadioStations_normalizesExternalStreamRows() {
+    var stations = Subsonic.parseInternetRadioStations({
+      internetRadioStations: {station: [
+        {
+          id: 7, name: "SomaFM Groove Salad",
+          streamUrl: "https://somafm.com/groovesalad128.pls",
+          homePageUrl: "https://somafm.com/groovesalad/"
+        },
+        {id: "9", name: "Local relay", streamUrl: "http://10.0.0.5:8000/radio.mp3"},
+        {name: "No id"},
+        {id: "11"},
+        {id: "12", name: "No stream url"}
+      ]}})
+    compare(stations.length, 2)
+    compare(stations[0].id, "7")
+    compare(stations[0].name, "SomaFM Groove Salad")
+    compare(stations[0].streamUrl, "https://somafm.com/groovesalad128.pls")
+    compare(stations[0].homePageUrl, "https://somafm.com/groovesalad/")
+    compare(stations[1].id, "9")
+    compare(stations[1].homePageUrl, "")
+  }
+
+  function test_parseInternetRadioStations_isDefensive() {
+    var hostile = [null, undefined, {}, {internetRadioStations: null},
+      {internetRadioStations: {station: []}},
+      {internetRadioStations: {station: [null, "text"]}}]
+    for (var i = 0; i < hostile.length; i++)
+      compare(Subsonic.parseInternetRadioStations(hostile[i]).length, 0)
+  }
 }

@@ -83,7 +83,8 @@ Item {
   property real draftMaxBarTextWidth: 240
   // Disclosure state for the width slider; deliberately not persisted.
   property bool barTextWidthExpanded: false
-  property string draftAudioQuality: "320 kbps"
+  property string draftAudioFormat: "source"
+  property string draftAudioMaxBitRate: "0"
   property var contextItem: null
   property var contextSourceItems: []
   // Identity key of the collection the context menu was opened from
@@ -98,7 +99,6 @@ Item {
 
   readonly property string pluginId: manifest && manifest.id
     ? String(manifest.id) : "quickshell.navidrome"
-  readonly property string lyricsRequestKey: "navidrome-panel-lyrics"
   readonly property color foreground: Commons.Color.foreground
   readonly property color background: Commons.Color.background
   readonly property color accent: Commons.Color.accent
@@ -127,7 +127,7 @@ Item {
     && artistSearchText.trim() !== ""
   readonly property bool shortcutsBlocked: mediaContextMenu.opened
     || playlistPicker.opened || createPlaylistPopup.opened || sleepPopup.opened
-    || shortcutHelpPopup.opened || lyricsInstallPopup.opened
+    || shortcutHelpPopup.opened || lyricsPopup.opened
   readonly property bool shortcutHintsEnabled: service
     ? service.shortcutHintsEnabled : true
   readonly property bool typingInField: {
@@ -212,7 +212,8 @@ Item {
     draftScrollSpeed = service.scrollSpeed
     draftMaxBarTextWidth = service.maxBarTextWidth
     draftFixedBarWidth = service.fixedBarWidth
-    draftAudioQuality = service.audioQuality
+    draftAudioFormat = service.audioFormat
+    draftAudioMaxBitRate = String(service.audioMaxBitRate)
   }
 
   function saveSettings(showStatus) {
@@ -234,7 +235,8 @@ Item {
       scrollSpeed: Api.normalizedScrollSpeed(draftScrollSpeed),
       maxBarTextWidth: Api.normalizedMaxBarTextWidth(draftMaxBarTextWidth),
       fixedBarWidth: draftFixedBarWidth ? "On" : "Off",
-      audioQuality: draftAudioQuality
+      audioFormat: draftAudioFormat,
+      audioMaxBitRate: draftAudioMaxBitRate
     }
     service.persistSettings(values)
     syncDraftSettings()
@@ -245,10 +247,26 @@ Item {
     saveSettings(false)
   }
 
-  function cycleAudioQuality() {
-    draftAudioQuality = draftAudioQuality === "96 kbps" ? "160 kbps"
-      : (draftAudioQuality === "160 kbps" ? "320 kbps" : "96 kbps")
+  function cycleAudioFormat() {
+    draftAudioFormat = Api.cycledChoice(Api.AUDIO_FORMATS, draftAudioFormat)
     persistDraftSettings()
+  }
+
+  function cycleAudioMaxBitRate() {
+    draftAudioMaxBitRate = String(Api.cycledChoice(Api.AUDIO_MAX_BIT_RATES,
+      Api.normalizedAudioMaxBitRate(draftAudioMaxBitRate)))
+    persistDraftSettings()
+  }
+
+  function audioFormatLabel() {
+    var format = Api.normalizedAudioFormat(draftAudioFormat)
+    if (format === "source") return "Source"
+    return format.toUpperCase()
+  }
+
+  function audioMaxBitRateLabel() {
+    var rate = Api.normalizedAudioMaxBitRate(draftAudioMaxBitRate)
+    return rate === 0 ? "No cap" : rate + " kbps"
   }
 
   function cycleShortcutPlayer() {
@@ -257,12 +275,6 @@ Item {
       : (draftShortcutPlayer === "Full player"
         ? "Mini player" : "Omarchy Music app")
     persistDraftSettings()
-  }
-
-  function audioQualityLabel() {
-    if (draftAudioQuality === "96 kbps") return "Standard · 96 kbps"
-    if (draftAudioQuality === "320 kbps") return "Very high · 320 kbps"
-    return "High · 160 kbps"
   }
 
   function scrollSpeedLabel() {
@@ -346,8 +358,8 @@ Item {
   }
 
   function dismissTransientPopup() {
-    if (lyricsInstallPopup.opened && (!service || !service.lyricsPluginBusy)) {
-      lyricsInstallPopup.close()
+    if (lyricsPopup.opened) {
+      lyricsPopup.close()
       return true
     }
     if (shortcutHelpPopup.opened) {
@@ -461,7 +473,6 @@ Item {
   function restoreUiState(restoreDetail) {
     if (!service) return
     var state = service.sessionState || ({})
-    service.restoreLastRadioPlaylist(state.lastRadioPlaylist)
     searchText = String(state.searchText || service.searchQuery || "")
     searchType = Api.SEARCH_TYPES.indexOf(String(state.searchType || "")) >= 0
       ? String(state.searchType) : "track"
@@ -533,8 +544,7 @@ Item {
         ? service.detailRememberedItemCount : 0,
       selectedPlaylist: selected,
       selectedPlaylistId: selected ? selected.id : restoredPlaylistId,
-      selectedPlaylistItemCount: selectedItemCount,
-      lastRadioPlaylist: service.lastRadioPlaylist
+      selectedPlaylistItemCount: selectedItemCount
     })
   }
 
@@ -1039,6 +1049,12 @@ Item {
           && service.discoverGenre !== "") actions.push("list-genres")
       if (currentTab === "discover" && service
           && service.discoverGenre !== "") actions.push("genre-clear")
+      // Internet radio station rows in Explore (play is a typed deferral).
+      if (currentTab === "discover" && service
+          && service.discoverGenre === "" && service.radioStations.length) {
+        for (var r = 0; r < service.radioStations.length; r++)
+          actions.push("radio-row-" + r)
+      }
       if (collection && collection.hasMore) actions.push("more")
       if (collection && collection.filterScanAvailable) actions.push("filter-scan")
     }
@@ -1229,7 +1245,6 @@ Item {
     if (action === "nav-home") chooseTab("home")
     else if (action === "nav-search") { chooseTab("search"); focusSearch() }
     else if (action === "nav-discover") chooseTab("discover")
-    else if (action === "nav-radio") openLastRadio()
     else if (action === "nav-queue") chooseTab("queue")
     else if (action === "nav-library") chooseTab("library")
     else if (action === "nav-playlists") chooseTab("playlists")
@@ -1269,6 +1284,10 @@ Item {
     else if (action === "lyrics") openLyrics()
     else if (action === "sleep") sleepPopup.open()
     else if (action === "volume") toggleMute()
+    else if (action.indexOf("radio-row-") === 0 && service) {
+      var station = service.radioStations[Math.floor(Number(action.substring(10)) || 0)]
+      if (station) service.playRadioStation(station)
+    }
     else if (action.indexOf("home-") === 0) homeType = action.substring(5)
     else if (action.indexOf("library-") === 0) {
       libraryType = action.substring(8)
@@ -1506,7 +1525,7 @@ Item {
       return handleContextMenuKey(event)
 
     if (createPlaylistPopup.opened || playlistPicker.opened
-        || shortcutHelpPopup.opened || lyricsInstallPopup.opened)
+        || shortcutHelpPopup.opened || lyricsPopup.opened)
       return false
 
     if (unifiedSearchField.activeFocus && tabbing) {
@@ -1644,7 +1663,7 @@ Item {
       { section: "PLAYBACK", action: "Play or pause", keys: "Space" },
       { action: "Previous track", keys: "Ctrl+Left" },
       { action: "Next track", keys: "Ctrl+Right" },
-      { action: "Open lyrics in Omasing", keys: "Ctrl+Shift+L" },
+      { action: "Open lyrics", keys: "Ctrl+Shift+L" },
       { action: "Mute or restore volume", keys: "M" },
       { action: "Toggle shuffle", keys: "Ctrl+S" },
       { action: "Cycle repeat", keys: "Ctrl+R" },
@@ -1855,8 +1874,8 @@ Item {
 
   function openLyrics() {
     if (!service || !service.lyricsAvailable) return
-    var result = service.requestLyrics(lyricsRequestKey)
-    if (result !== "opening") lyricsInstallPopup.open()
+    if (lyricsPopup.opened) return
+    lyricsPopup.open()
   }
 
   function open(payloadJson) {
@@ -1904,6 +1923,9 @@ Item {
       if (currentTab === "search" && Api.searchNeedsLoad(searchText,
           service.searchResultQuery, service.searchLoadedTypes[searchType]))
         service.search(searchText, searchType)
+      // The mini player hands over a lyrics request: open the built-in
+      // lyrics surface once the panel is up.
+      if (payload.lyrics === true) Qt.callLater(function() { root.openLyrics() })
     }
     Qt.callLater(function() {
       focusScope.forceActiveFocus()
@@ -1967,23 +1989,12 @@ Item {
     syncUnifiedSearchField()
   }
 
-  function openLastRadio() {
-    if (!service || !service.lastRadioPlaylist) return
-    chooseTab("playlists")
-    service.openPlaylist(service.lastRadioPlaylist)
-  }
-
   function primaryNavigationItems() {
     var items = [
       { id: "home", label: "Home", icon: "󰎆" },
       { id: "search", label: "Search", icon: "󰍉" },
       { id: "discover", label: "Explore", icon: "󰲸" }
     ]
-    if (service && service.lastRadioPlaylist) items.push({
-      id: "radio",
-      label: service.lastRadioPlaying ? "Current radio" : "Last radio",
-      icon: "󰎆"
-    })
     items.push({ id: "queue", label: "Queue", icon: "󰐕" })
     return items
   }
@@ -1998,12 +2009,6 @@ Item {
       { id: "playlists", label: "Playlists", icon: "󱁐" },
       { id: "setup", label: "Settings", icon: "󰒓" }
     ]
-  }
-
-  function radioNavigationSelected() {
-    return currentTab === "playlists" && service && service.lastRadioPlaylist
-      && service.selectedPlaylist
-      && String(service.selectedPlaylist.id) === String(service.lastRadioPlaylist.id)
   }
 
   function updateLoginGate() {
@@ -2049,10 +2054,6 @@ Item {
     target: root.service
     ignoreUnknownSignals: true
     function onPlaylistsChanged() { root.restorePlaylistSelection() }
-    function onRadioPlaylistReady(playlist) {
-      if (!playlist || !root.service) return
-      root.openLastRadio()
-    }
   }
 
   function pageComponent() {
@@ -2358,24 +2359,30 @@ Item {
     }
   }
 
+  // Built-in lyrics surface (getLyricsBySongId). The service fetches only
+  // while this popup is open; opening it hands the flag over and closing it
+  // releases the fetch. The highlight rides the MPRIS position property, so
+  // no timer of its own ever runs for a closed surface.
   Popup {
-    id: lyricsInstallPopup
+    id: lyricsPopup
     parent: window.contentItem
     x: Math.max(Style.space(8), (window.width - width) / 2)
     y: Math.max(Style.space(8), (window.height - height) / 2)
-    width: Math.min(Style.space(400), window.width - Style.space(32))
-    height: lyricsInstallContent.implicitHeight + padding * 2
+    width: Math.min(Style.space(480), window.width - Style.space(32))
+    height: Math.min(window.height - Style.space(32),
+      Math.max(Style.space(220), lyricsContent.implicitHeight + padding * 2))
     padding: Style.space(10)
     modal: true
+    dim: false
     focus: true
-    closePolicy: root.service && root.service.lyricsPluginBusy
-      ? Popup.NoAutoClose
-      : Popup.CloseOnEscape | Popup.CloseOnPressOutside
+    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
 
-    onOpened: root.disarmEscapeClose()
+    onOpened: {
+      root.disarmEscapeClose()
+      if (root.service) root.service.setLyricsSurfaceOpen(true)
+    }
     onClosed: {
-      if (root.service && !root.service.lyricsPluginBusy)
-        root.service.cancelLyricsPlugin(root.lyricsRequestKey)
+      if (root.service) root.service.setLyricsSurfaceOpen(false)
       Qt.callLater(function() { focusScope.forceActiveFocus() })
     }
 
@@ -2385,25 +2392,132 @@ Item {
       borderSpec: root.popupBorderSpec
     }
 
-    contentItem: LyricsInstallPrompt {
-      id: lyricsInstallContent
+    contentItem: Column {
+      id: lyricsContent
       width: parent.width
-      service: root.service
-      foreground: root.foreground
-      muted: root.muted
-      surfaceKey: root.lyricsRequestKey
-      onCanceled: lyricsInstallPopup.close()
-    }
-  }
+      spacing: Style.space(7)
 
-  Connections {
-    target: root.service
-    ignoreUnknownSignals: true
-    function onLyricsPluginPromptRequested(surface, availability) {
-      if (String(surface) === root.lyricsRequestKey) lyricsInstallPopup.open()
-    }
-    function onLyricsPluginOpened(surface) {
-      if (String(surface) === root.lyricsRequestKey) lyricsInstallPopup.close()
+      readonly property var lyrics: root.service ? root.service.lyricsData : null
+      readonly property bool loading: root.service && root.service.lyricsSurfaceOpen
+        && root.service.lyricsFetchedFor !== ""
+        && root.service.lyricsData === null && root.service.lyricsError === ""
+      readonly property bool synced: !!lyrics && lyrics.synced === true
+        && lyrics.lines.length > 0
+        && lyrics.lines[0].start !== null
+      readonly property var lines: !!lyrics ? lyrics.lines : []
+      // The active synced line comes from the MPRIS position binding; the
+      // engine updates it about once per second while playing.
+      readonly property int activeLineIndex: {
+        if (!synced) return -1
+        var positionMs = (root.service ? root.service.positionSeconds : 0) * 1000
+        var active = -1
+        for (var i = 0; i < lines.length; i++) {
+          if (lines[i].start === null) return -1
+          if (lines[i].start <= positionMs) active = i
+          else break
+        }
+        return active
+      }
+      onActiveLineIndexChanged: if (activeLineIndex >= 0)
+        lyricsScroller.followActiveLine()
+      readonly property string emptyText: {
+        if (loading) return "Loading lyrics…"
+        if (root.service && root.service.lyricsError !== "")
+          return root.service.lyricsError
+        if (root.service && root.service.lyricsUnavailableReason)
+          return root.service.lyricsUnavailableReason()
+        return "No lyrics are stored for this song."
+      }
+
+      Text {
+        width: parent.width
+        text: root.service && root.service.title
+          ? root.service.title : "Lyrics"
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.subtitle
+        font.bold: true
+        elide: Text.ElideRight
+      }
+
+      Text {
+        width: parent.width
+        text: root.service && root.service.artist ? root.service.artist : ""
+        visible: text !== ""
+        color: root.muted
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
+      }
+
+      PanelSeparator { width: parent.width; foreground: root.foreground }
+
+      Flickable {
+        id: lyricsScroller
+        width: parent.width
+        height: Math.min(
+          window.height - Style.space(190), Style.space(360))
+        contentWidth: width
+        contentHeight: lyricsLines.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+
+        onContentHeightChanged: if (lyricsContent.activeLineIndex >= 0)
+          followActiveLine()
+
+        function followActiveLine() {
+          var item = lyricsLinesRepeater.itemAt(lyricsContent.activeLineIndex)
+          if (!item) return
+          var target = item.y - height / 2 + item.height / 2
+          contentY = Math.max(0, Math.min(contentHeight - height, target))
+        }
+
+        Column {
+          id: lyricsLines
+          width: parent.width
+          spacing: Style.space(5)
+
+          Text {
+            width: parent.width
+            visible: lyricsContent.lines.length === 0
+            text: lyricsContent.emptyText
+            color: root.muted
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            wrapMode: Text.WordWrap
+          }
+
+          Repeater {
+            id: lyricsLinesRepeater
+            model: lyricsContent.lines
+
+            delegate: Text {
+              required property var modelData
+              required property int index
+              width: lyricsLines.width
+              text: modelData.value === "" ? " " : modelData.value
+              color: index === lyricsContent.activeLineIndex
+                ? root.accent : root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              font.bold: index === lyricsContent.activeLineIndex
+              opacity: lyricsContent.activeLineIndex < 0
+                || index === lyricsContent.activeLineIndex ? 1 : 0.7
+              wrapMode: Text.WordWrap
+            }
+          }
+        }
+      }
+
+      Text {
+        width: parent.width
+        visible: root.service && root.service.showLyrics && root.service.artworkEnabled
+          && lyricsContent.lines.length > 0
+        text: "Lyrics come from your Navidrome server."
+        color: root.muted
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+      }
     }
   }
 
@@ -2552,17 +2666,6 @@ Item {
         onClicked: {
           mediaContextMenu.close()
           root.activateMedia(root.contextItem, root.contextSourceItems)
-        }
-      }
-
-      ContextMenuButton {
-        contextAction: "ctx-radio"
-        visible: root.contextItem && root.contextItem.type === "track"
-        text: "Start track radio"
-        iconText: "󰎆"
-        onClicked: {
-          mediaContextMenu.close()
-          if (root.service) root.service.startRadio(root.contextItem)
         }
       }
 
@@ -3375,26 +3478,19 @@ Item {
 
                 Button {
                   required property var modelData
-                  readonly property bool radioEntry: modelData.id === "radio"
                   width: primaryNavigation.width
                   text: root.compactWidth ? "" : modelData.label
                   iconText: root.compactWidth ? "" : modelData.icon
                   foreground: root.foreground
-                  selected: radioEntry ? root.radioNavigationSelected()
-                    : root.currentTab === modelData.id
+                  selected: root.currentTab === modelData.id
                   leftAlign: !root.compactWidth
                   horizontalPadding: root.compactWidth
                     ? 0 : Style.spacing.controlPaddingX
                   focusable: false
                   hasCursor: root.cursorOn("sidebar", "nav-" + modelData.id)
-                  tooltipText: radioEntry && root.service && root.service.lastRadioPlaylist
-                    ? modelData.label + " · " + root.service.lastRadioPlaylist.name
-                    : root.shortcutHint(modelData.label,
-                      root.primaryNavigationShortcut(modelData.id))
-                  onClicked: {
-                    if (radioEntry) root.openLastRadio()
-                    else root.chooseTab(modelData.id)
-                  }
+                  tooltipText: root.shortcutHint(modelData.label,
+                    root.primaryNavigationShortcut(modelData.id))
+                  onClicked: root.chooseTab(modelData.id)
                   onHovered: function(on) {
                     if (on) root.setPanelCursor("sidebar", "nav-" + modelData.id)
                   }
@@ -4314,7 +4410,7 @@ Item {
                   glyphText: "󰎈"
                   foreground: root.foreground
                   hasCursor: root.cursorOn("footer", "lyrics")
-                  tooltipText: root.shortcutHint("Open lyrics in Omasing",
+                  tooltipText: root.shortcutHint("Open lyrics",
                     "Ctrl+Shift+L")
                   enabled: root.service && root.service.lyricsAvailable
                   onClicked: root.openLyrics()
@@ -4581,11 +4677,23 @@ Item {
       id: discoverRoot
       readonly property bool genreActive: root.service
         && root.service.discoverGenre !== ""
+      // Internet radio stations: an Explore source alongside albums, kept
+      // visually distinct from library rows (no save/queue/save-track
+      // actions — stations are not library songs).
+      readonly property var radioStations: root.service
+        ? root.service.radioStations : []
+      readonly property bool radioVisible: !genreActive
+        && radioStations.length > 0
+      readonly property real radioHeight: radioVisible
+        ? Math.min(Style.space(150),
+          radioStations.length * Style.space(36) + Style.space(26)) : 0
       // The two shelves share the page height once a genre is selected.
       readonly property real pageHeight: Math.max(0, parent.height
         - genreBar.height - parent.spacing)
       readonly property real shelfHeight: Math.max(40,
         (pageHeight - genreHeading.height - parent.spacing) / 2)
+      readonly property real albumShelfHeight: genreActive
+        ? shelfHeight : Math.max(40, pageHeight - radioHeight)
 
       function genreOptions() {
         var genres = root.service ? root.service.discoverGenres : []
@@ -4664,8 +4772,7 @@ Item {
         MediaCollection {
           id: randomAlbums
           width: parent.width
-          height: discoverRoot.genreActive
-            ? discoverRoot.shelfHeight : discoverRoot.pageHeight
+          height: discoverRoot.albumShelfHeight
           service: root.service
           sourceItems: root.service ? root.service.discoverAlbums : []
           filterText: root.discoverFilter
@@ -4693,6 +4800,56 @@ Item {
           }
           onViewStateChanged: function(filter, sort, y) {
             root.rememberScroll("discover", y)
+          }
+        }
+
+        Column {
+          id: radioSection
+          width: parent.width
+          height: discoverRoot.radioHeight
+          visible: discoverRoot.radioVisible
+          spacing: Style.space(5)
+
+          Text {
+            width: parent.width
+            text: "RADIO STATIONS"
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+          }
+
+          Text {
+            width: parent.width
+            text: "Live streams from your server. They are outside the library, so the local engine cannot play them yet."
+            color: root.muted
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+
+          Repeater {
+            model: discoverRoot.radioStations
+
+            delegate: Button {
+              required property var modelData
+              required property int index
+              width: radioSection.width
+              text: String(modelData.name || "Unnamed station")
+                + (String(modelData.homePageUrl || "") !== ""
+                  ? "  ·  " + String(modelData.homePageUrl) : "")
+              foreground: root.foreground
+              leftAlign: true
+              hasCursor: root.cursorOn("page", "radio-row-" + index)
+              tooltipText: "Station streams live radio; playing it is not supported by the local engine yet"
+              onClicked: {
+                if (root.service)
+                  root.service.playRadioStation(discoverRoot.radioStations[index])
+              }
+              onHovered: function(on) {
+                if (on) root.setPanelCursor("page", "radio-row-" + index)
+              }
+            }
           }
         }
 
@@ -6487,7 +6644,7 @@ Item {
                 foreground: root.foreground
                 selected: root.draftShowLyrics
                 tooltipText: root.draftShowLyrics
-                  ? "Show the Omasing lyrics button in the player and mini-player"
+                  ? "Show the lyrics button in the player and mini-player"
                   : "Hide the lyrics button and disable Ctrl+Shift+L"
                 onClicked: {
                   root.draftShowLyrics = !root.draftShowLyrics
@@ -6497,7 +6654,7 @@ Item {
 
               Text {
                 width: parent.width
-                text: "Hide the lyrics button if you do not use Omasing. Playback is unaffected, and the button returns whenever you turn this back on."
+                text: "Hide the lyrics button if you do not use it. Playback is unaffected, and the button returns whenever you turn this back on. Lyrics load from your Navidrome server."
                 color: root.muted
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall
@@ -6775,17 +6932,34 @@ Item {
               }
 
               Button {
-                text: "Audio quality · " + root.audioQualityLabel()
+                text: "Stream format · " + root.audioFormatLabel()
                 iconText: "󰎈"
                 foreground: root.foreground
-                tooltipText: "Change streaming quality"
-                onClicked: root.cycleAudioQuality()
+                tooltipText: "Cycle the Navidrome stream format"
+                onClicked: root.cycleAudioFormat()
+              }
+
+              Button {
+                text: "Bit rate cap · " + root.audioMaxBitRateLabel()
+                iconText: "󰋌"
+                foreground: root.foreground
+                tooltipText: "Cycle the maximum stream bit rate"
+                onClicked: root.cycleAudioMaxBitRate()
+              }
+
+              Text {
+                width: parent.width
+                text: "The server streams each song in the chosen format, capped at the chosen bit rate. Source with no cap plays every file exactly as it is stored. Both apply the next time the local engine starts — usually the next time playback begins."
+                color: root.muted
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                wrapMode: Text.WordWrap
               }
             }
 
             Text {
               width: parent.width
-              text: "While the player is open, the local engine stays up so media keys and the mini player keep working. After it closes, an empty engine sleeps at the idle timeout; paused media stays available to resume. Use 0 minutes to keep this computer available even while the player is closed. Device name and audio quality changes apply the next time local playback starts."
+              text: "While the player is open, the local engine stays up so media keys and the mini player keep working. After it closes, an empty engine sleeps at the idle timeout; paused media stays available to resume. Use 0 minutes to keep this computer available even while the player is closed."
               color: root.muted
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
@@ -6794,7 +6968,7 @@ Item {
 
             Text {
               width: parent.width
-              text: "Changes apply immediately. Device name and audio quality update the next time local playback starts."
+              text: "Changes apply immediately. Device name, stream format, and the bit rate cap update the next time the local engine starts."
               color: root.muted
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall

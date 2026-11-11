@@ -18,6 +18,24 @@ legacy `clientId` setting, and the Spotify-only benchmark comparator were
 deleted. The engine unit is the single playback runtime; the socket-first
 startup diagnostics and restart bounds carry over unchanged.
 
+Package 6 (11 November 2026): lyrics became built-in. `getLyricsBySongId`
+feeds a panel lyrics surface (synced-line highlight from the engine's MPRIS
+position, plain text otherwise) behind the existing `showLyrics` setting,
+hide-button, and Ctrl+Shift+L; the Omasing handoff machinery (optional-plugin
+install prompt, launch process, install intent persistence) is deleted, and
+the mini player's lyrics action now opens the full player's surface. Explore
+gains the `getInternetRadioStations` source with stations kept visually
+separate from library songs; playing one is a typed deferral — the stream
+engine builds `/rest/stream` URLs for library ids only and cannot open
+external stream addresses. The Spotify "last radio" playlist persistence and
+the track-radio context action are gone (similarity needs server-side
+Last.fm). The audio-quality setting grew into the Navidrome pair: stream
+format (source/mp3/flac/wav/ogg/opus/aac) and a bounded bit-rate cap
+(0/64/96/128/192/320), both validated against the backend's config exactly
+and written to `backend.conf` `[global]` `format`/`max_bit_rate` on every
+settings change; the legacy `bitrate` key is dropped from the shipped
+default config.
+
 ## 1.0.4 (unreleased, Spotify baseline)
 
 

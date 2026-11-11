@@ -27,7 +27,7 @@ omarchy plugin validate .
 qmllint -I /usr/share/omarchy/shell Api.js Subsonic.js AuthManager.qml \
   SubsonicApi.qml SearchController.qml FilterScanController.qml DaemonManager.qml BackendClient.qml Service.qml \
   BarWidget.qml PlaybackSlider.qml ArtistLinks.qml MediaByline.qml MediaRow.qml MediaCollection.qml \
-  ArtistSearchSection.qml LyricsInstallPrompt.qml RetryImage.qml ShortcutHint.qml \
+  ArtistSearchSection.qml RetryImage.qml ShortcutHint.qml \
   TransportButton.qml Panel.qml
 
 QT_QPA_PLATFORM=offscreen "$qml_test_runner" \
