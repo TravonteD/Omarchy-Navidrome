@@ -3428,7 +3428,7 @@ Item {
               OpticalGlyph {
                 width: root.compactWidth ? parent.width : Style.space(18)
                 height: parent.height
-                text: ""
+                text: "󰝚"
                 color: root.accent
                 fontFamily: root.fontFamily
                 fontSize: Style.font.iconLarge
@@ -4991,7 +4991,7 @@ Item {
               Text {
                 anchors.centerIn: parent
                 visible: detailArtwork.status !== Image.Ready
-                text: ""
+                text: "󰝚"
                 color: root.service && root.service.detailItem
                   ? root.muted
                   : root.accent
@@ -6088,7 +6088,7 @@ Item {
 
             Text {
               anchors.horizontalCenter: parent.horizontalCenter
-              text: ""
+              text: "󰝚"
               color: root.accent
               font.family: root.fontFamily
               font.pixelSize: Style.font.displayLarge
@@ -6143,7 +6143,7 @@ Item {
 
                   Text {
                     anchors.centerIn: parent
-                    text: root.fullyConnected ? "󰄬" : ""
+                    text: root.fullyConnected ? "󰄬" : "󰝚"
                     color: root.fullyConnected ? root.accent : root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.icon

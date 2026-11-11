@@ -504,7 +504,7 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.iconOnly ? "" : ""
+    text: root.iconOnly ? "󰝚" : ""
     hasVisualContent: true
     slotSize: Style.bar.iconSlot
     opticalSize: Style.bar.iconCanvas
@@ -543,7 +543,7 @@ BarWidget {
         anchors.verticalCenter: parent.verticalCenter
         width: Style.space(16)
         height: Style.space(16)
-        text: ""
+        text: "󰝚"
         color: button.foreground
         fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
         fontSize: Style.font.body
@@ -853,7 +853,7 @@ BarWidget {
             Text {
               anchors.centerIn: parent
               visible: popupArtwork.status !== Image.Ready
-              text: ""
+              text: "󰝚"
               color: root.foreground
               font.family: root.bar ? root.bar.fontFamily : Style.font.family
               font.pixelSize: Style.font.displayLarge
@@ -935,7 +935,7 @@ BarWidget {
             Text {
               anchors.centerIn: parent
               visible: popupRecordArtwork.status !== Image.Ready
-              text: ""
+              text: "󰝚"
               color: root.foreground
               font.family: root.bar ? root.bar.fontFamily : Style.font.family
               font.pixelSize: Style.font.displayLarge
