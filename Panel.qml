@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import Quickshell
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 
 import "Api.js" as Api
@@ -97,15 +98,15 @@ Item {
   readonly property string pluginId: manifest && manifest.id
     ? String(manifest.id) : "quickshell.navidrome"
   readonly property string lyricsRequestKey: "spotify-panel-lyrics"
-  readonly property color foreground: Color.foreground
-  readonly property color background: Color.background
-  readonly property color accent: Color.accent
-  readonly property color muted: Color.muted
+  readonly property color foreground: Commons.Color.foreground
+  readonly property color background: Commons.Color.background
+  readonly property color accent: Commons.Color.accent
+  readonly property color muted: Commons.Color.muted
   // In-panel popups have no blur behind them, so a translucent theme popup
   // colour is floored to stay readable over the list beneath.
   readonly property color popupBackground: Api.opaqueSurface(
-    Color.popups.background, 0.96)
-  readonly property var popupBorderSpec: Border.flat(Color.popups.border,
+    Commons.Color.popups.background, 0.96)
+  readonly property var popupBorderSpec: Border.flat(Commons.Color.popups.border,
     Math.max(1, Style.normalBorderWidth))
   readonly property int popupScrollbarGutter: Style.space(14)
   readonly property string fontFamily: Style.font.family
@@ -186,7 +187,7 @@ Item {
   readonly property var panelBar: QtObject {
     readonly property color foreground: root.foreground
     readonly property color background: root.background
-    readonly property color urgent: Color.urgent
+    readonly property color urgent: Commons.Color.urgent
     readonly property string fontFamily: root.fontFamily
     readonly property string position: "top"
     readonly property bool vertical: false
@@ -3848,10 +3849,10 @@ Item {
                 id: closeButton
                 anchors.verticalCenter: parent.verticalCenter
                 iconText: "󰅖"
-                foreground: root.escapeCloseArmed ? Color.urgent : root.foreground
+                foreground: root.escapeCloseArmed ? Commons.Color.urgent : root.foreground
                 bordered: root.escapeCloseArmed
                 borderSpec: root.escapeCloseArmed
-                  ? Border.flat(Color.urgent, Math.max(1, Style.normalBorderWidth))
+                  ? Border.flat(Commons.Color.urgent, Math.max(1, Style.normalBorderWidth))
                   : closeButton._borderSpec
                 tooltipText: root.escapeCloseArmed
                   ? "Press Esc again to close"
@@ -3874,10 +3875,10 @@ Item {
               height: implicitHeight
               visible: root.service && (root.service.lastError !== "" || root.service.statusMessage !== "")
               color: root.service && root.service.lastError !== ""
-                ? Style.selectedFillFor(root.foreground, Color.urgent)
+                ? Style.selectedFillFor(root.foreground, Commons.Color.urgent)
                 : Style.normalFillFor(root.foreground, root.accent)
               borderSpec: Border.controlSpec("normal", root.foreground,
-                root.service && root.service.lastError !== "" ? Color.urgent : root.accent)
+                root.service && root.service.lastError !== "" ? Commons.Color.urgent : root.accent)
               radius: Style.cornerRadius
 
               Text {
@@ -4130,8 +4131,8 @@ Item {
                       iconText: root.service && root.service.currentTrackSaved
                         ? "󰋑" : "󰋕"
                       iconSize: Style.font.body
-                      foreground: Color.urgent
-                      accent: Color.urgent
+                      foreground: Commons.Color.urgent
+                      accent: Commons.Color.urgent
                       enabled: root.service && root.service.currentTrackSaveAvailable
                       horizontalPadding: Style.space(4)
                       verticalPadding: Style.space(2)
@@ -4857,8 +4858,8 @@ Item {
                   ? "Saved" : "Save"
                 iconText: root.service && root.service.isSaved(root.service.detailItem)
                   ? "󰓎" : "󰋑"
-                foreground: Color.urgent
-                accent: Color.urgent
+                foreground: Commons.Color.urgent
+                accent: Commons.Color.urgent
                 focusable: false
                 hasCursor: root.cursorOn("page", "detail-save")
                 enabled: root.service && root.service.detailItem
@@ -5371,7 +5372,7 @@ Item {
             anchors.verticalCenter: parent.verticalCenter
             text: root.searchCooldownSeconds > 0 && root.service
               ? root.service.searchProgressText(root.searchClock) : searchRoot.errorText
-            color: Color.urgent
+            color: Commons.Color.urgent
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
             wrapMode: Text.WordWrap
@@ -6288,7 +6289,7 @@ Item {
               Text {
                 width: parent.width
                 text: root.connectionErrorText()
-                color: Color.urgent
+                color: Commons.Color.urgent
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall
                 wrapMode: Text.WordWrap
@@ -6420,7 +6421,7 @@ Item {
             Text {
               width: parent.width
               text: root.connectionErrorText()
-              color: Color.urgent
+              color: Commons.Color.urgent
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
               wrapMode: Text.WordWrap

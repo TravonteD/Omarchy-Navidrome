@@ -26,16 +26,25 @@ Validation after the rename:
   pass.
 - Python: 19 helper tests pass; script checks pass.
 
-Known pre-existing issue (verified identical on the unmodified upstream
-checkout at `e7371f3`, so not introduced by the port): the Quickshell app
-smoke step in `scripts/test-quickshell.sh` fails under the current Omarchy
-snapshot because `Color` singleton members are `undefined` in the copied
-test environment (`Unable to assign [undefined] to QColor`), which the
-smoke test treats as a hard failure. `Color.qml` exists in
-`/usr/share/omarchy/shell/Commons`; the failure pattern suggests the theme
-palette is not initialized outside a real shell session — an environment or
-shell API change since the 8 September validation run, worth a dedicated
-fix pass.
+Formerly failing gate step, now fixed (10 November 2026): the Quickshell app
+smoke step in `scripts/test-quickshell.sh` reported `Unable to assign
+[undefined] to QColor` because bare `Color` references in the plugin QML
+bound to Quickshell's own built-in global `Color` singleton (`QQuickColor`,
+a utility type with `rgba`/`blend`/`tint` members, no palette), shadowing the
+`qs.Commons` `Color` palette singleton — its `foreground`, `popups`, `bar`
+and friends are all `undefined`. Quickshell 0.3.2 resolves unqualified
+singleton names against the built-in set, so `import qs.Commons` alone is
+not enough; the first-party shell avoids this by importing qualified
+(`import qs.Commons as Commons` → `Commons.Color.*`) in every file. The
+plugin now follows the same convention (qualified imports and `Commons.Color`
+references in the seven affected QML files). Verified identical on the
+unmodified upstream checkout at `e7371f3`, so it was not introduced by the
+port; it reproduced standalone in a minimal test root with only
+`/usr/share/omarchy/shell/Commons` copied in, proving it was name
+shadowing rather than a missing theme initialization in the copied
+environment. No harness changes were needed and no stubs were introduced —
+the smoke test still boots the real Service/Panel against the real
+`/usr/share/omarchy/shell` imports, now warning-free.
 
 ## Package 1 — Navidrome API layer (in progress, 10 November 2026)
 

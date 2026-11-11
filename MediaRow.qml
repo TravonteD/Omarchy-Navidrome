@@ -1,5 +1,6 @@
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 
 import "Api.js" as Api
@@ -8,9 +9,9 @@ BorderSurface {
   id: root
 
   required property var itemData
-  property color foreground: Color.foreground
-  property color accent: Color.accent
-  property color muted: Color.muted
+  property color foreground: Commons.Color.foreground
+  property color accent: Commons.Color.accent
+  property color muted: Commons.Color.muted
   property string fontFamily: Style.font.family
   property bool selected: false
   property bool showPlay: true
@@ -267,8 +268,8 @@ BorderSurface {
         objectName: "media-row-save"
         visible: root.saveActionVisible
         iconText: "󰋑"
-        foreground: Color.urgent
-        accent: Color.urgent
+        foreground: Commons.Color.urgent
+        accent: Commons.Color.urgent
         tooltipText: "Save to library"
         horizontalPadding: Style.space(7)
         onClicked: root.saveRequested(root.itemData)
