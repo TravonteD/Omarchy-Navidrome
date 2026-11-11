@@ -12,60 +12,44 @@ resident helper process.
 
 Local playback state and ordinary controls use MPRIS. Starting playback on this
 computer uses the backend's private Unix socket (`load`, `add_to_queue`) when
-that process is running. Active playback on another Spotify Connect device
-comes from the Spotify Web API, refreshed while a UI is visible and at a slower
-rate while that device is playing. Fast `/me/player` polling is reserved for
-remote or unknown targets. Spotify data and other user actions also use the
-Web API.
+that process is running. All browsing, search, stars, and playlist verbs go
+through the Subsonic JSON API (protocol v2 below); there is no second, remote
+playback path.
 
 Local audio runs in the plugin-owned `omarchy-navidrome-backend` Rust process,
-supervised by a static systemd user unit that is never enabled at login. The
-backend embeds a commit-pinned librespot revision rather than duplicating its
-private-protocol implementation. It owns configuration, cache/authentication,
-MPRIS, lifecycle, and a stable private Unix-socket boundary. The app starts the
-unit whenever its full player or mini-player is open, when you play on this
-computer, or when you choose it in Devices. Once every player surface closes,
-it stops after the configured idle period; 0 keeps it available indefinitely.
-The distro `spotifyd` unit is retained as a non-running fallback; the two units
-conflict so they cannot claim the same Connect identity together.
+supervised by a static systemd user unit that is never enabled at login. It is
+the only playback runtime: it owns configuration, the audio cache, the Subsonic
+stream/scrobble client, MPRIS, lifecycle, and a stable private Unix-socket
+boundary. The app starts the unit whenever its full player or mini-player is
+open or when you play on this computer. Once every player surface closes, it
+stops after the configured idle period; 0 keeps it available indefinitely.
 
-The unit sets `PULSE_LATENCY_MSEC=30` only for local playback and caps
-librespot's private player runtime at two Tokio workers. The backend's own
-control runtime is single-threaded; keeping two player workers still allows
-network fetching, preloading, and blocking decoder work to overlap. Quickshell
+The unit sets `PULSE_LATENCY_MSEC=30` for local playback and caps the backend's
+tokio runtime at two workers so network fetching, preloading, and blocking
+decoder work can overlap while the control loop stays responsive. Quickshell
 interpolates MPRIS position locally, so the backend publishes one authoritative
 position update per second instead of four.
 
-MPRIS uses a PID-qualified instance bus name, as required by the server library.
-Quickshell discovers the backend by its `librespot` identity and desktop entry.
-This lets diagnostic instances coexist without replacing the supervised
-player's bus ownership or making the app lose local playback state.
-
-The pinned librespot revision also applies an endpoint-continuous 20 ms fade
-out/in around manual track replacement. Natural end-of-track gapless
-transitions, seeks, and passthrough are unchanged. This fixes both the queued
-tail and the smaller waveform discontinuity without changing PipeWire routing
-or speaker tuning.
+MPRIS uses a PID-qualified instance bus name (`OmarchyNavidrome.instance<pid>`),
+as required by the server library. Quickshell discovers the backend by its
+identity ("Omarchy Navidrome (navidrome-stream)") and desktop entry. This lets
+diagnostic instances coexist without replacing the supervised player's bus
+ownership or making the app lose local playback state.
 
 Volume sliders apply while the knob moves; the seek slider still commits on
-release so a drag cannot make the player re-buffer per frame. A drag emits a
-command per input event, so `Service` coalesces them: the first value is sent
-immediately and later ones are queued and flushed at a per-backend interval,
-`Api.volumeFlushInterval` — 80 ms for a local MPRIS property write, 250 ms for
-the rate-limited Web API, and 120 ms for Sonos. The queued value is only cleared
-once a backend accepts the command, so the position the knob was released at is
-always the one that lands. The optimistic slider value is held until the player
-reports it, and playback state is refetched once the drag settles rather than
-after every command.
+release so a drag cannot make the player re-buffer per frame. A drag emits an
+input event per move, so `Service` coalesces them: the first value is applied
+immediately and later ones are queued and flushed at an 80 ms interval
+(`Api.VOLUME_FLUSH_MS`). The queued value is only cleared once the player
+accepts it, so the position the knob was released at is always the one that
+lands. The optimistic slider value is held until the player reports it.
 
 ## Runtime requirements
 
 - Omarchy 4 with the Quickshell shell enabled
-- Spotify Premium
-- the exact-commit attested plugin backend, a local source build, or `spotifyd`
-  0.4.2 or newer as fallback
-- Omarchy base tools: `secret-tool`, `openssl`, `socat`, `xdg-open`, `wl-copy`,
-  `avahi-browse`, `systemctl`, and Python 3
+- a running Navidrome (Subsonic API 1.16.1) server and an account on it
+- the exact-commit attested plugin backend or a local source build
+- Omarchy base tools: `secret-tool`, `openssl`, `systemctl`, and Python 3
 
 The verified-release fast path also uses `curl` and GitHub CLI when available;
 neither is trusted as a bypass when provenance verification cannot complete.
@@ -83,8 +67,7 @@ same-release checksum alone is never accepted as provenance.
 
 If `gh` is unavailable or any download, checksum, identity, or attestation
 check fails, the artifact is not executed. Setup instead builds `Cargo.lock`
-from the reviewed source with the available Cargo when present, or offers the
-official Arch `spotifyd` package as the last-resort fallback. Configuration,
+from the reviewed source with the available Cargo when present. Configuration,
 verified downloads, local builds, and user units themselves need no privilege.
 
 Omarchy treats any write inside a plugin directory as a change to the plugin and
@@ -96,87 +79,32 @@ from reloading the plugin — and killing the build — mid-setup. A stale
 
 ## Authentication
 
-Web API access uses Spotify's Authorization Code with PKCE flow and the public
-application identity also used by `spotify-player` and ncspot. The fixed callback
-is `http://127.0.0.1:8989/login`. The playback backend performs its independent
-browser authorization on loopback port `8000`. Receivers that advertise the
-`accesstoken` or `authorization_code` token type use a separate, on-demand,
-streaming-only PKCE grant on port `8990`.
+Navidrome credentials are one set per install: the server base URL, a
+username, and the account password. The password is stored in GNOME Keyring
+through `scripts/keyring-store.sh` (secret on stdin only, never argv, never
+logs) under the fixed identity `service=quickshell-navidrome,
+kind=navidrome-credentials` as a single-line JSON payload
+`{v,url,username,password}`; the URL inside the payload is the server
+identity, so saving again for the same server overwrites in place and a
+different server replaces it. Reusable state lives only in the keyring and in
+the backend's process memory — credentials passed across the private socket
+are consumed and never re-logged.
 
-No client secret or Spotify password enters the plugin. OAuth refresh tokens
-are written to GNOME Keyring over stdin and separated by client identity.
-Reusable local-playback authorization is stored with owner-only permissions in
-`$XDG_STATE_HOME/omarchy-navidrome`; older credentials under `$XDG_CACHE_HOME`
-are accepted once and migrated so clearing disposable caches cannot deauthorize
-this computer. Player restore state (last tab, filters, search history, and
-similar) is written to `$XDG_STATE_HOME/omarchy-navidrome/session.json` so it
-does not pollute Omarchy's `shell.json`. Older copies kept as plugin settings
-are read once and removed from `shell.json` after that file is written.
-Short-lived access tokens and PKCE values remain in the shell process. OAuth
-state is checked, callback listeners bind explicitly to IPv4 loopback, API URLs
-are restricted to
-`https://api.spotify.com/v1`, and sensitive credential patterns are redacted
-before an error can reach the interface.
+Every Subsonic request uses token auth: `t = md5(password + salt)` with a
+fresh salt (>= 6 chars) per request, `c=omarchy-navidrome`, `f=json`. The
+QMD-side transport (`SubsonicApi.qml`) builds URLs through the tested
+`Subsonic.js` core, serializes mutating verbs, redacts diagnostics to
+endpoint names only, and maps typed error codes (40 wrong credentials, 41/42
+token rejection, 50 not authorized, 70 not found). The stream engine builds
+its own `stream`/`scrobble`/`getPlayQueue` URLs from the credentials it
+received via `configure_server`; they never appear in logs or state files.
 
-The app requests only the library, follow, listening-history, playlist,
-playback-position, and playback-control permissions used by visible features.
-It does not request profile or email permissions.
+Plain `http://` servers are allowed but flagged: the credential model keeps a
+`navidromeUrlInsecure` warning flag and the first-run setup prints a plain
+"connection is NOT private" warning. TLS validation is never bypassed.
 
-The Spotify account grant unlocks search, library, and remote control. Local
-playback remains a separate approval. The full player and mini-player stay
-usable after the account connects, even while that second step is unfinished.
-
-## Local Spotify Connect
-
-New playback keeps Spotify's currently active device. An explicit
-choice in the Devices view takes priority, and the app's local device is used
-only when no active target is available. Restricted active devices are kept as
-the target rather than silently moving playback locally; Spotify may reject the
-new selection when it does not allow Web API control. The app can perform a
-one-shot `_spotify-connect._tcp` lookup for nearby receivers omitted from
-Spotify's device response. It also resolves opaque Web API device names against
-the matching locally advertised alias. For ordinary receivers, the helper
-re-encrypts local playback's owner-only reusable credential for the receiver's
-ephemeral ZeroConf key. Access-token receivers such as JBL receive the
-short-lived streaming token as the ZeroConf blob, with a device-scoped mint
-and the reusable credential as fallbacks; authorization-code receivers such
-as Sonos receive a receiver-scoped code exchanged from that grant.
-It then waits for Spotify to report the genuine device before transferring
-playback when needed. It never asks for or stores the user's password.
-
-An album or playlist in its unfiltered Original order starts Spotify's native
-context, preserving the complete server-side collection. Sorting or filtering
-switches row, context-menu, and collection-level playback to the displayed URI
-sequence instead. Spotify accepts at most 100 URIs in one custom play request,
-so the interface reports that limit when a longer visible sequence is started.
-
-Once a restricted Sonos is active, the Web API rejects its player commands.
-The app therefore resolves that same receiver on the LAN and sends fixed UPnP
-AVTransport or RenderingControl actions for play, pause, previous, next, seek,
-shuffle/repeat mode, and volume. Targets still come only from validated local
-Spotify Connect discovery. Discovery also reads the current Sonos master volume
-from RenderingControl because Spotify's `volume_percent` field is nullable; the
-UI remembers that value and updates it immediately after a volume command. The
-helper drops any command issued while an earlier one is still running, so a
-volume drag checks `controlBusy` and retries the queued value instead of losing
-it. When playback has moved elsewhere, a local Play wake is attempted first;
-the OAuth activation flow remains the fallback for a Sonos that has actually
-lost its Spotify session. Receiver discovery and requests are retried briefly
-because Sonos can sleep its endpoint during a handoff.
-
-The current-playback response is also merged into the device list. This matters
-for models that Spotify omits from `/me/player/devices`, or whose active device
-id is null. A matching nearby receiver is recognized by name and type in that
-case. Restricted devices remain visible with their current item. Controls stay
-disabled unless the app has a supported local-control path such as Sonos.
-
-Spotify changed development-mode endpoints and fields in 2026. This client uses
-`/playlists/{id}/items`, `/me/library`, and search limits of 10. Some non-owned
-playlist contents are no longer returned. Artist pages use artist-scoped catalog
-search for the two ranked release/song columns because Spotify removed the
-artist-top-tracks endpoint. Followed-playlist conversion fetches every available
-page before creating a private copy, writes items in batches of 100, and removes
-the original from the library only after all writes succeed.
+The `formPost` (and, when advertised, `apiKey`) OpenSubsonic extensions are
+feature-detected optimizations, not requirements.
 
 ## Local development
 
@@ -197,8 +125,7 @@ To install only the playback integration:
 ./scripts/setup.sh
 ```
 
-Neither path enables or starts a playback unit at login. Pass
-`--install-spotifyd` only when a distro fallback is also wanted.
+Neither path enables or starts a playback unit at login.
 
 ## Verification
 
@@ -227,22 +154,13 @@ cd "$HOME" && "$HOME/.config/omarchy/plugins/quickshell.navidrome/scripts/uninst
 ```
 
 This removes the plugin and all plugin-owned services, binaries, config, state,
-caches, sockets, backups, and keyring entries. See the README's
+caches, sockets, backups, and keyring entries (including the stored Navidrome
+credential set and the pre-port Spotify-era refresh tokens). See the README's
 **Remove it completely** section for the equivalent commands and legacy
-keybinding check. The `spotifyd` package remains installed because another
-client may use it.
-
-Remove that package separately only when it was installed solely for this app:
-
-```bash
-omarchy pkg drop spotifyd
-```
+keybinding check.
 
 ## Upstream projects
 
 - [Omarchy](https://github.com/basecamp/omarchy)
-- [spotifyd](https://github.com/Spotifyd/spotifyd)
-- [librespot](https://github.com/librespot-org/librespot)
-- [spotify-player](https://github.com/aome510/spotify-player)
-- [ncspot](https://github.com/hrkfdn/ncspot)
-- [Spotify Web API](https://developer.spotify.com/documentation/web-api)
+- [Navidrome](https://www.navidrome.org)
+- [OpenSubsonic API](https://opensubsonic.netlify.app/docs/api-reference/)

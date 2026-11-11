@@ -98,7 +98,7 @@ Item {
 
   readonly property string pluginId: manifest && manifest.id
     ? String(manifest.id) : "quickshell.navidrome"
-  readonly property string lyricsRequestKey: "spotify-panel-lyrics"
+  readonly property string lyricsRequestKey: "navidrome-panel-lyrics"
   readonly property color foreground: Commons.Color.foreground
   readonly property color background: Commons.Color.background
   readonly property color accent: Commons.Color.accent
@@ -298,23 +298,23 @@ Item {
   }
 
   function connectionButtonText() {
-    if (!service) return "Spotify unavailable"
+    if (!service) return "Omarchy Navidrome is unavailable"
     if (service.loginBusy) return service.loginProgress + "…"
     if (fullyConnected) return "Connected"
     if (accountConnected && !service.daemon.playbackReady)
       return "Set up playback"
     if (accountConnected) return "Finish playback setup"
     if (!service.daemon.playbackReady) return "Set up and continue"
-    return "Continue with Spotify"
+    return "Connect Navidrome"
   }
 
   function connectionHeadline() {
-    if (!service) return "Spotify is unavailable"
+    if (!service) return "Omarchy Navidrome is unavailable"
     if (service.daemon.setupBusy) return "Setting up playback"
     if (fullyConnected) return "You're connected"
     if (accountConnected) return "Account connected"
-    if (!service.daemon.playbackReady) return "One quick setup, then Spotify"
-    return "Continue with Spotify"
+    if (!service.daemon.playbackReady) return "One quick setup, then music"
+    return "Connect your Navidrome server"
   }
 
   function connectionErrorText() {
@@ -327,8 +327,6 @@ Item {
     if (!service.daemon.requirementsChecked) return "Checking playback support…"
     if (service.daemon.setupBusy) return "Preparing playback on this computer…"
     if (!service.daemon.playbackReady) return "A quick one-time setup is needed"
-    if (!service.daemon.credentialsChecked) return "Checking your Spotify connection…"
-    if (!service.daemon.credentialsAvailable) return "Ready for Spotify sign-in"
     if (service.daemon.running) return "Active on this computer"
     return "Ready — starts automatically when you play music"
   }
@@ -493,7 +491,7 @@ Item {
     restoredDetailItemCount = Api.normalizedPlaylistRestoreCount(
       state.detailItemCount)
     var restoredTab = String(state.tab || "home")
-    if (["home", "discover", "search", "library", "playlists", "detail", "queue", "devices", "setup"]
+    if (["home", "discover", "search", "library", "playlists", "detail", "queue", "setup"]
         .indexOf(restoredTab) >= 0) currentTab = restoredTab
     if (restoreDetail !== false && currentTab === "detail" && state.detailItem) {
       var sameDetail = service.detailItem
@@ -1002,7 +1000,7 @@ Item {
     if (service && service.lyricsAvailable) actions.push("lyrics")
     if (service && service.lengthSeconds > 0 && service.playbackControllable)
       actions.push("seek")
-    actions.push("devices", "sleep")
+    actions.push("sleep")
     if (service && service.volumeSupported) actions.push("volume")
     return actions
   }
@@ -1269,7 +1267,6 @@ Item {
     else if (action === "next" && service) service.next()
     else if (action === "repeat" && service) service.cycleRepeat()
     else if (action === "lyrics") openLyrics()
-    else if (action === "devices") chooseTab("devices")
     else if (action === "sleep") sleepPopup.open()
     else if (action === "volume") toggleMute()
     else if (action.indexOf("home-") === 0) homeType = action.substring(5)
@@ -1631,11 +1628,10 @@ Item {
       { action: "Toggle current area / everywhere", keys: "Ctrl+F or / again" },
       { action: "Leave search", keys: "Esc" },
       { section: "NAVIGATION", action: "Go back", keys: "Alt+Left" },
-      { action: "Leave Settings or Devices", keys: "Esc" },
+      { action: "Leave Settings", keys: "Esc" },
       { action: "Open Settings", keys: "Ctrl+," },
       { action: "Open Home", keys: "Alt+Shift+H" },
       { action: "Open Queue", keys: "Alt+Shift+Q" },
-      { action: "Open Devices", keys: "Alt+Shift+D" },
       { action: "Open the current artist", keys: "Ctrl+Shift+A" },
       { action: "Open the current album", keys: "Ctrl+Shift+B" },
       { action: "Move between sidebar, search, the song list, and the player", keys: "Tab / F6" },
@@ -1881,7 +1877,7 @@ Item {
       universalSearchActive = false
       artistSearchText = ""
       detailFilter = ""
-    } else if (["home", "discover", "search", "library", "playlists", "queue", "devices", "setup"].indexOf(requestedTab) >= 0)
+    } else if (["home", "discover", "search", "library", "playlists", "queue", "setup"].indexOf(requestedTab) >= 0)
       currentTab = requestedTab
     if (accountConnected) {
       openedForLogin = false
@@ -2000,7 +1996,6 @@ Item {
       { id: "queue", label: "Queue", icon: "󰐕" },
       { id: "library", label: "Your Library", icon: "󰋑" },
       { id: "playlists", label: "Playlists", icon: "󱁐" },
-      { id: "devices", label: "Devices", icon: "󰋋" },
       { id: "setup", label: "Settings", icon: "󰒓" }
     ]
   }
@@ -2030,10 +2025,10 @@ Item {
     }
   }
 
-  // Track the combined service state directly. During the first login, the
-  // Web API token and spotifyd credential finish in separate event turns;
-  // listening only to those nested objects can miss the final combined edge
-  // while the panel loader is being remapped by the browser.
+  // Track the combined service state directly. During the first sign-in,
+  // the keyring load and the backend readiness finish in separate event
+  // turns; listening only to those nested objects can miss the final
+  // combined edge while the panel loader is being remapped.
   onShortcutHintsEnabledChanged: if (!shortcutHintsEnabled) clearShortcutMode()
   onCurrentTabChanged: {
     root.rememberCurrentContentTab()
@@ -2070,7 +2065,6 @@ Item {
     if (currentTab === "playlists") return playlistsPage
     if (currentTab === "detail") return detailPage
     if (currentTab === "queue") return queuePage
-    if (currentTab === "devices") return devicesPage
     return searchPage
   }
 
@@ -2082,7 +2076,6 @@ Item {
     if (currentTab === "library") return "Your Library"
     if (currentTab === "playlists") return "Playlists"
     if (currentTab === "queue") return "Queue"
-    if (currentTab === "devices") return "Devices"
     if (currentTab === "setup") return "Settings"
     if (currentTab === "detail") {
       if (artistScopedSearchActive) return "Search in " + service.detailItem.name
@@ -2102,13 +2095,12 @@ Item {
     if (currentTab === "library") return "Starred songs, albums and artists"
     if (currentTab === "playlists") return "Your playlists"
     if (currentTab === "queue") return "What plays next"
-    if (currentTab === "devices") return "Playback on this computer"
     if (currentTab === "setup") return "Account, playback and app preferences"
     if (currentTab === "detail") {
       if (artistScopedSearchActive)
         return "Songs and albums matching “" + artistSearchText.trim() + "”"
       return service && service.detailItem
-        ? Api.spotifyTypeLabel(service.detailItem.type) : "Library item"
+        ? Api.mediaTypeLabel(service.detailItem.type) : "Library item"
     }
     return "Songs, artists, albums and playlists"
   }
@@ -3162,14 +3154,6 @@ Item {
         }
       }
       Shortcut {
-        sequence: "Alt+Shift+D"
-        enabled: root.accountConnected && !root.shortcutsBlocked
-        onActivated: {
-          root.latchShortcutMode(sequence)
-          root.chooseTab("devices")
-        }
-      }
-      Shortcut {
         sequence: "Ctrl+Shift+A"
         enabled: root.accountConnected && !root.shortcutsBlocked
           && root.service && root.service.currentArtistContextAvailable
@@ -3364,7 +3348,7 @@ Item {
                 }
                 Text {
                   width: parent.width
-                  text: "for Spotify"
+                  text: "for Navidrome"
                   color: root.muted
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -3858,8 +3842,7 @@ Item {
 
             Row {
               id: unifiedSearchBar
-              visible: root.currentTab !== "login" && root.currentTab !== "devices"
-                && root.currentTab !== "setup"
+              visible: root.currentTab !== "login" && root.currentTab !== "setup"
               anchors.left: parent.left
               anchors.right: parent.right
               anchors.top: statusBanner.visible ? statusBanner.bottom : pageHeader.bottom
@@ -4375,7 +4358,7 @@ Item {
                   maximum: Math.max(1, root.service ? root.service.lengthSeconds : 1)
                   step: 5
                   sourceValue: root.service ? root.service.positionSeconds : 0
-                  sourcePending: root.service && root.service.pendingRemoteSeek !== null
+                  sourcePending: false
                   acknowledgeTolerance: 2
                   contextKey: root.service
                     ? root.service.currentUri + "|" + root.service.playbackDeviceName : ""
@@ -4421,18 +4404,6 @@ Item {
               Row {
                 width: parent.width
                 spacing: Style.space(5)
-
-                Button {
-                  iconText: "󰋋"
-                  foreground: root.foreground
-                  hasCursor: root.cursorOn("footer", "devices")
-                  tooltipText: root.shortcutHint("Devices", "Alt+Shift+D")
-                  onClicked: root.chooseTab("devices")
-                  onHovered: function(on) {
-                    if (on) root.setPanelCursor("footer", "devices")
-                  }
-                  KeyHint { region: "footer"; action: "devices"; sequences: ["Alt+Shift+D"] }
-                }
 
                 Button {
                   iconText: "󰔛"
@@ -5938,200 +5909,6 @@ Item {
   }
 
   Component {
-    id: devicesPage
-
-    Item {
-      ScrollView {
-        id: devicesScroll
-        anchors.fill: parent
-        clip: true
-        ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
-
-        Column {
-          width: devicesScroll.availableWidth
-          spacing: Style.space(9)
-
-          Row {
-            width: parent.width
-            spacing: Style.space(8)
-
-            Text {
-              width: Math.max(80, parent.width - deviceRefresh.width - parent.spacing)
-              text: "Choose where your music plays. This computer and nearby Spotify Connect devices appear here."
-              color: root.muted
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-              wrapMode: Text.WordWrap
-            }
-
-            Button {
-              id: deviceRefresh
-              text: root.service && root.service.devicesLoading ? "Loading…" : "Refresh"
-              iconText: "󰑐"
-              foreground: root.foreground
-              enabled: root.service && !root.service.devicesLoading
-                && !root.service.deviceActivationBusy
-              onClicked: root.service.loadDevices(null, undefined, true)
-            }
-          }
-
-          Button {
-            text: "Stop playback on this computer"
-            iconText: "󰓛"
-            foreground: root.foreground
-            visible: root.service && root.service.daemon.running
-            enabled: root.service && !root.service.daemon.busy
-            onClicked: root.service.stopEngine()
-          }
-
-          Button {
-            text: "Start this computer"
-            iconText: "󰓃"
-            foreground: root.foreground
-            visible: root.service && root.service.fullyConnected
-              && !root.service.daemon.running
-            enabled: root.service && !root.service.daemon.busy
-            onClicked: if (root.service) root.service.startEngine()
-          }
-
-          Text {
-            width: parent.width
-            visible: root.service && root.service.devicesLoading
-              && root.service.devices.length === 0
-            text: "Looking for speakers and this computer…"
-            color: root.muted
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
-            wrapMode: Text.WordWrap
-          }
-
-          Text {
-            text: "AVAILABLE DEVICES"
-            color: root.foreground
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            font.bold: true
-          }
-
-          Text {
-            width: parent.width
-            text: "A nearby speaker may take a moment to connect the first time you choose it."
-            color: root.muted
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
-            wrapMode: Text.WordWrap
-          }
-
-          Repeater {
-            model: root.service ? root.service.devices : []
-
-            delegate: BorderSurface {
-            id: deviceRow
-            required property var modelData
-            width: devicesScroll.availableWidth
-            implicitHeight: Style.space(58)
-            height: implicitHeight
-            radius: Style.cornerRadius
-            color: modelData.id === (root.service ? root.service.selectedDeviceId : "")
-              ? Style.selectedFillFor(root.foreground, root.accent)
-              : (deviceHover.hovered ? Style.hoverFillFor(root.foreground, root.accent) : "transparent")
-            borderSpec: modelData.active
-              ? Border.controlSpec("selected", root.foreground, root.accent) : Border.none()
-
-            HoverHandler { id: deviceHover }
-            MouseArea {
-              anchors.fill: parent
-              enabled: (!deviceRow.modelData.restricted
-                || deviceRow.modelData.activationRequired) && root.service
-                && !root.service.deviceActivationBusy
-              cursorShape: enabled ? Qt.PointingHandCursor : Qt.ForbiddenCursor
-              onClicked: if (root.service) root.service.selectDevice(deviceRow.modelData.id, true)
-            }
-
-            Row {
-              anchors.fill: parent
-              anchors.margins: Style.space(9)
-              spacing: Style.space(10)
-
-              Text {
-                anchors.verticalCenter: parent.verticalCenter
-                text: deviceRow.modelData.type.toLowerCase() === "computer" ? "󰟀" : "󰋋"
-                color: deviceRow.modelData.active ? root.accent : root.muted
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.iconLarge
-              }
-
-              Column {
-                width: Math.max(40, parent.width - Style.space(150))
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: Style.space(2)
-
-                Text {
-                  width: parent.width
-                  text: deviceRow.modelData.name
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
-                  font.bold: deviceRow.modelData.active
-                  elide: Text.ElideRight
-                }
-                Text {
-                  width: parent.width
-                  text: deviceRow.modelData.type
-                    + (deviceRow.modelData.description ? " · " + deviceRow.modelData.description : "")
-                    + (deviceRow.modelData.local ? " · this computer" : "")
-                    + (deviceRow.modelData.localDiscovery ? " · nearby" : "")
-                    + (deviceRow.modelData.restricted
-                      ? (deviceRow.modelData.active
-                        ? (root.service && root.service.sonosControlAvailable
-                          ? " · local controls" : " · limited controls")
-                        : " · unavailable") : "")
-                  color: root.muted
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  elide: Text.ElideRight
-                }
-              }
-
-              Text {
-                anchors.verticalCenter: parent.verticalCenter
-                text: root.service && root.service.deviceActivationBusy
-                    && deviceRow.modelData.id === root.service.selectedDeviceId ? "Connecting"
-                  : (deviceRow.modelData.active ? "Active"
-                    : (deviceRow.modelData.activationRequired ? "Available"
-                      : Math.round(deviceRow.modelData.volumePercent) + "%"))
-                color: deviceRow.modelData.active ? root.accent : root.muted
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                font.bold: true
-              }
-            }
-          }
-          }
-
-          Text {
-            width: parent.width
-            visible: root.service && root.service.devicesLoaded
-              && root.service.devices.length === 0
-            text: "No Spotify Connect devices are available right now. Make sure the device is online, then refresh."
-            color: root.muted
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
-            wrapMode: Text.WordWrap
-          }
-
-          Item { width: 1; height: Style.space(4) }
-        }
-      }
-
-      FastScrollHandler {
-        parent: devicesScroll.contentItem
-        flickable: devicesScroll.contentItem
-      }
-    }
-  }
-
-  Component {
     id: loginPage
 
     Item {
@@ -6171,7 +5948,7 @@ Item {
             Text {
               width: parent.width
               horizontalAlignment: Text.AlignHCenter
-              text: "Your music, library, playlists, and Spotify Connect devices — at home in Omarchy."
+              text: "Your music, library, and playlists — at home in Omarchy."
               color: root.muted
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
@@ -6230,7 +6007,7 @@ Item {
                     font.bold: true
                   }
                   Text {
-                    text: root.service ? root.service.loginProgress : "Spotify is unavailable"
+                    text: root.service ? root.service.loginProgress : "Omarchy Navidrome is unavailable"
                     color: root.fullyConnected
                       ? root.accent : root.muted
                     font.family: root.fontFamily
@@ -6241,7 +6018,7 @@ Item {
 
               Text {
                 width: parent.width
-                text: "Two short steps. First connect your Spotify account so you can browse. Then approve playback on this computer if you want to listen here."
+                text: "Two short steps. First connect your Navidrome server so you can browse. Then set up playback on this computer if you want to listen here."
                 color: root.muted
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
@@ -6263,10 +6040,10 @@ Item {
                   }
                   Text {
                     text: root.service && root.service.auth.loggedIn
-                      ? "Your Spotify account is connected"
+                      ? "Your Navidrome server is connected"
                       : (root.service && root.service.auth.loginBusy
-                        ? "Connecting your Spotify account…"
-                        : "Your Spotify account and library")
+                        ? "Connecting to your Navidrome server…"
+                        : "Your Navidrome server and library")
                     color: root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall
@@ -6276,17 +6053,17 @@ Item {
                 Row {
                   spacing: Style.space(7)
                   Text {
-                    text: root.service && root.service.daemon.credentialsAvailable ? "󰄬" : "󰓃"
-                    color: root.service && root.service.daemon.credentialsAvailable
+                    text: root.service && root.service.daemon.playbackReady ? "\uF864" : "\uF503"
+                    color: root.service && root.service.daemon.playbackReady
                       ? root.accent : root.muted
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.body
                   }
                   Text {
-                    text: root.service && root.service.daemon.credentialsAvailable
-                      ? "Playback on this computer is connected"
-                      : (root.service && root.service.daemon.authenticationBusy
-                        ? "Connecting playback on this computer…"
+                    text: root.service && root.service.daemon.playbackReady
+                      ? "Playback on this computer is ready"
+                      : (root.service && root.service.daemon.setupBusy
+                        ? "Preparing playback on this computer…"
                         : "Playback on this computer")
                     color: root.foreground
                     font.family: root.fontFamily
@@ -6349,7 +6126,7 @@ Item {
           Text {
             width: parent.width
             horizontalAlignment: Text.AlignHCenter
-            text: "Your password is entered only on Spotify's own page. Omarchy Navidrome never sees it."
+            text: "Your password is verified directly against your Navidrome server and stored in your keyring. Omarchy Navidrome never logs it."
             color: root.muted
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -6386,7 +6163,7 @@ Item {
             spacing: Style.space(7)
 
             Text {
-              text: "SPOTIFY ACCOUNT"
+              text: "NAVIDROME SERVER"
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -6394,7 +6171,7 @@ Item {
             }
             Text {
               width: parent.width
-              text: "Connect Spotify to search, browse your library, manage playlists, and listen on this computer or another Spotify Connect device."
+              text: "Connect your Navidrome server to search, browse your library, manage playlists, and listen on this computer."
               color: root.muted
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
@@ -6412,14 +6189,12 @@ Item {
                 id: accountStatus
                 anchors.fill: parent
                 anchors.margins: Style.space(8)
-                text: !root.service ? "Spotify is unavailable"
+                text: !root.service ? "Omarchy Navidrome is unavailable"
                   : (root.service.loginBusy ? root.service.loginProgress + "…"
                   : (root.fullyConnected ? "Connected and ready to play"
                   : (root.service.auth.loggedIn
-                    ? "Spotify is connected · playback needs approval"
-                    : (root.service.daemon.credentialsAvailable
-                      ? "Playback is ready · Spotify needs approval"
-                      : "Not connected"))))
+                    ? "Navidrome is connected · playback setup remains"
+                    : "Not connected")))
                 color: root.fullyConnected ? root.accent : root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
@@ -6458,8 +6233,7 @@ Item {
                 text: "Log out"
                 iconText: "󰍃"
                 foreground: root.foreground
-                visible: root.service && (root.service.auth.loggedIn
-                  || root.service.daemon.credentialsAvailable)
+                visible: root.service && root.service.auth.loggedIn
                 enabled: root.service && !root.service.loginBusy
                   && !root.service.daemon.busy
                 onClicked: root.service.logout()
@@ -6494,7 +6268,7 @@ Item {
             }
             Text {
               width: parent.width
-              text: "A lightweight background player starts only when you need it, works with Omarchy's media controls, and appears in Spotify Connect as this computer."
+              text: "A lightweight background player starts only when you need it and works with Omarchy's media controls."
               color: root.muted
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
@@ -6553,7 +6327,7 @@ Item {
             }
 
             Text {
-              text: "SPOTIFY CONNECT"
+              text: "IDENTITY"
               color: root.muted
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -6821,7 +6595,7 @@ Item {
                   selected: root.draftShowPausedTrack
                   tooltipText: root.draftShowPausedTrack
                     ? "Keep the configured title and artist visible while paused"
-                    : "Show only the Spotify icon while paused"
+                    : "Show only the plain bar icon while paused"
                   onClicked: {
                     root.draftShowPausedTrack = !root.draftShowPausedTrack
                     root.persistDraftSettings()
@@ -7011,7 +6785,7 @@ Item {
 
             Text {
               width: parent.width
-              text: "This computer stays visible in Spotify Connect while the player is open. After it closes, an empty receiver sleeps at the idle timeout; paused media stays available to resume. Use 0 minutes to keep this computer available even while the player is closed. Device name and audio quality changes apply the next time local playback starts."
+              text: "While the player is open, the local engine stays up so media keys and the mini player keep working. After it closes, an empty engine sleeps at the idle timeout; paused media stays available to resume. Use 0 minutes to keep this computer available even while the player is closed. Device name and audio quality changes apply the next time local playback starts."
               color: root.muted
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall

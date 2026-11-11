@@ -330,12 +330,12 @@ fn track_id_for(id: &str) -> TrackId {
     if track_id.is_empty() {
         track_id = "track".to_string();
     }
-    TrackId::try_from(format!("/com/github/QuickshellSpotify/track/{track_id}"))
+    TrackId::try_from(format!("/com/github/OmarchyNavidrome/track/{track_id}"))
         .unwrap_or(TrackId::NO_TRACK)
 }
 
 fn bus_name_suffix(process_id: u32) -> String {
-    format!("OmarchySpotify.instance{process_id}")
+    format!("OmarchyNavidrome.instance{process_id}")
 }
 
 #[cfg(test)]
@@ -365,6 +365,6 @@ mod tests {
 
     #[test]
     fn mpris_name_is_unique_and_has_a_valid_non_numeric_component() {
-        assert_eq!(bus_name_suffix(42), "OmarchySpotify.instance42");
+        assert_eq!(bus_name_suffix(42), "OmarchyNavidrome.instance42");
     }
 }

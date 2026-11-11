@@ -87,6 +87,5 @@ the build.
 
 See [the protocol reference](../docs/BACKEND_PROTOCOL.md) for the
 compatibility contract and [release process](../docs/RELEASING.md) for the
-release requirements. The legacy `omarchy-navidrome-spotifyd.service` remains
-installable as a fallback and conflicts with the primary unit so two local
-receivers cannot run accidentally with the same device identity.
+release requirements. The plugin's supervised backend unit is the only
+playback runtime; it is started on demand and never enabled at login.

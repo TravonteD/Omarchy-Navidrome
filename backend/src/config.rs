@@ -142,7 +142,7 @@ impl BackendConfig {
 }
 
 pub fn default_config_path() -> PathBuf {
-    config_home().join("omarchy-navidrome/spotifyd.conf")
+    config_home().join("omarchy-navidrome/backend.conf")
 }
 
 pub fn default_socket_path() -> PathBuf {
@@ -164,7 +164,7 @@ fn default_cache_root() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .unwrap_or_else(|| PathBuf::from(".cache"))
-        .join("spotifyd")
+        .join("omarchy-navidrome")
 }
 
 fn default_credentials_root() -> PathBuf {
@@ -200,14 +200,14 @@ mod tests {
             fastrand::u64(..)
         ));
         fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("spotifyd.conf");
+        let path = dir.join("backend.conf");
         let mut file = fs::File::create(&path).unwrap();
         file.write_all(contents.as_bytes()).unwrap();
         (path, dir)
     }
 
     #[test]
-    fn reads_existing_spotifyd_shape() {
+    fn reads_existing_config_shape() {
         let (path, dir) = write_config(
             "[global]\ndevice_name=\"Test Device\"\nbackend=\"pulseaudio\"\nbitrate=320\nautoplay=true\nno_audio_cache=false\nmax_cache_size=42",
         );

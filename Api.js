@@ -2,35 +2,7 @@
 
 .import "Subsonic.js" as Subsonic
 
-var API_BASE = "https://api.spotify.com/v1"
-var TOKEN_URL = "https://accounts.spotify.com/api/token"
-var AUTH_URL = "https://accounts.spotify.com/authorize"
-
-// Deliberately omit profile and email scopes. The remaining scopes correspond
-// directly to visible library, history, playlist, and playback controls.
-var SCOPES = [
-  "user-library-read",
-  "user-library-modify",
-  "user-follow-read",
-  "user-follow-modify",
-  "user-read-recently-played",
-  "user-read-playback-position",
-  "user-top-read",
-  "playlist-read-private",
-  "playlist-read-collaborative",
-  "playlist-modify-private",
-  "playlist-modify-public",
-  "user-read-playback-state",
-  "user-modify-playback-state"
-]
-
 var SEARCH_TYPES = ["track", "artist", "album", "playlist"]
-
-// spotifyd's software mixer maps its normalized volume over a 60 dB
-// logarithmic range. Convert that control to a cubic slider over the same
-// range, matching the gentler taper used by common desktop audio mixers.
-// Zero remains a true mute in both directions.
-var SPOTIFYD_CUBIC_FLOOR = 0.1
 
 function clampUnit(value) {
   return Math.max(0, Math.min(1, Number(value) || 0))
@@ -40,50 +12,6 @@ function normalizeVolumePercent(value) {
   if (value === null || value === undefined || value === "") return null
   var volume = Number(value)
   return isFinite(volume) ? Math.max(0, Math.min(100, volume)) : null
-}
-
-function spotifydVolumeToSlider(value) {
-  var volume = clampUnit(value)
-  if (volume <= 0) return 0
-  var cubicRoot = Math.pow(10, volume - 1)
-  return clampUnit((cubicRoot - SPOTIFYD_CUBIC_FLOOR)
-    / (1 - SPOTIFYD_CUBIC_FLOOR))
-}
-
-function sliderToSpotifydVolume(value) {
-  var slider = clampUnit(value)
-  if (slider <= 0) return 0
-  var cubicRoot = SPOTIFYD_CUBIC_FLOOR
-    + (1 - SPOTIFYD_CUBIC_FLOOR) * slider
-  return clampUnit(1 + Math.log(cubicRoot) / Math.LN10)
-}
-
-function encode(value) {
-  return encodeURIComponent(String(value === undefined || value === null ? "" : value))
-}
-
-function queryString(values) {
-  if (!values) return ""
-  var pairs = []
-  var keys = Object.keys(values).sort()
-  for (var i = 0; i < keys.length; i++) {
-    var key = keys[i]
-    var value = values[key]
-    if (value === undefined || value === null || value === "") continue
-    if (Array.isArray(value)) value = value.join(",")
-    pairs.push(encode(key) + "=" + encode(value))
-  }
-  return pairs.join("&")
-}
-
-function appendQuery(path, values) {
-  var query = queryString(values)
-  if (!query) return String(path || "")
-  return String(path || "") + (String(path || "").indexOf("?") >= 0 ? "&" : "?") + query
-}
-
-function formBody(values) {
-  return queryString(values)
 }
 
 function shallowCopy(value) {
@@ -202,13 +130,6 @@ function arrayValues(values) {
   return result
 }
 
-function safeApiUrl(path) {
-  var value = String(path || "")
-  if (value.charAt(0) === "/") return API_BASE + value
-  if (value === API_BASE || value.indexOf(API_BASE + "/") === 0) return value
-  return ""
-}
-
 function redact(value) {
   var text = String(value || "")
   text = text.replace(/(authorization\s*:\s*bearer\s+)[^\s]+/ig, "$1<redacted>")
@@ -220,168 +141,37 @@ function redact(value) {
   return text
 }
 
-function responseError(status, payload, fallback) {
-  var message = ""
-  if (payload && typeof payload === "object") {
-    if (typeof payload.error === "object" && payload.error) {
-      message = payload.error.message || payload.error.status || ""
-      if (payload.error.reason && String(payload.error.reason) !== String(message))
-        message += (message ? " (" : "") + String(payload.error.reason) + (message ? ")" : "")
-    }
-    else if (typeof payload.error === "string")
-      message = payload.error_description || payload.error
-    else
-      message = payload.message || ""
-  }
-  if (!message) message = fallback || "Spotify could not complete this request"
-  return redact(message)
-}
-
-function rateLimitSuffix(retryAfter) {
-  var seconds = Number(String(retryAfter || "").trim())
-  if (!isFinite(seconds) || seconds <= 0) return ""
-  seconds = Math.max(1, Math.round(seconds))
-  return ". Try again in " + seconds + (seconds === 1 ? " second" : " seconds") + "."
-}
-
-function rateLimitMessage(retryAfter) {
-  var suffix = rateLimitSuffix(retryAfter)
-  return suffix ? "Spotify is busy" + suffix
-    : "Spotify is busy. Try again in a moment."
-}
-
-var API_MAX_IN_FLIGHT = 2
-var API_MAX_RATE_LIMIT_RETRIES = 4
-
-function rateLimitRetryMs(retryAfter, attempt) {
-  var value = String(retryAfter || "").trim()
-  var seconds = Number(value)
-  if (!value || !isFinite(seconds) || seconds < 0) return 10000
-  var headerMs = Math.round(seconds * 1000)
-  var retry = Math.max(0, Math.floor(Number(attempt) || 0))
-  var backoffMs = 1000 * Math.pow(2, retry)
-  // Spotify often 429s again if we retry at exactly Retry-After, especially
-  // when the header is 1 second. Cap our backoff, never the server delay.
-  return Math.max(1000, headerMs, Math.min(30000, backoffMs)) + 400
-}
-
-function shouldRetryRateLimit(retriesSoFar) {
-  return (Number(retriesSoFar) || 0) < API_MAX_RATE_LIMIT_RETRIES
-}
-
-function apiInFlightLimit(restricted) {
-  return restricted === true ? 1 : API_MAX_IN_FLIGHT
-}
-
-function responseRetryAfter(xhr) {
-  if (!xhr || typeof xhr.getResponseHeader !== "function") return ""
-  var value = xhr.getResponseHeader("Retry-After")
-  if (!value) value = xhr.getResponseHeader("retry-after")
-  return value ? String(value) : ""
-}
-
-function apiRequestIsMutating(method) {
-  var value = String(method || "GET").toUpperCase()
-  return value !== "GET" && value !== "HEAD"
-}
-
-function apiJobPriority(job) {
-  if (!job) return 0
-  if (apiRequestIsMutating(job.method)) return 2
-  return String(job.priority || "") === "interactive" ? 1 : 0
-}
-
-function enqueueApiJob(queue, job) {
-  var next = arrayValues(queue)
-  if (!job) return next
-  var priority = apiJobPriority(job)
-  var index = 0
-  while (index < next.length && apiJobPriority(next[index]) >= priority) index++
-  next.splice(index, 0, job)
-  return next
-}
-
-function dequeueApiJob(queue) {
-  var next = arrayValues(queue)
-  while (next.length) {
-    var job = next.shift()
-    if (!job || (job.handle && job.handle.aborted === true)) continue
-    return { job: job, queue: next }
-  }
-  return { job: null, queue: next }
-}
-
-function apiCooldownMs(now, until) {
-  var wait = (Number(until) || 0) - (Number(now) || 0)
-  return wait > 0 ? Math.ceil(wait) : 0
-}
-
-function nextRateLimitedUntil(now, retryAfter, currentUntil, attempt) {
-  var proposed = (Number(now) || 0) + rateLimitRetryMs(retryAfter, attempt)
-  var existing = Number(currentUntil) || 0
-  return proposed > existing ? proposed : existing
-}
-
 function playlistOwnedByUser(playlist, userId) {
   var user = String(userId || "")
   return !!playlist && !!user && String(playlist.ownerId || "") === user
 }
 
-function playlistItemsHiddenByApi(status, owned, collaborative, knownUser) {
-  if (owned === true || collaborative === true || knownUser !== true) return false
-  var code = Number(status) || 0
-  return code === 403 || code === 200
-}
-
-function playlistItemsHiddenMessage() {
-  return "Spotify does not expose the contents of this playlist unless you own or collaborate on it. You can still play it as a Spotify context."
-}
-
-function playlistItemsEmptyMessage(playlist, itemCount, error, status, userId) {
+// Subsonic playlists are always readable by the owner; a non-owner simply
+// sees the playlist listed without editable actions. An empty list after a
+// successful load means the server returned no entries.
+function playlistItemsEmptyMessage(playlist, itemCount, error) {
   if (!playlist) return ""
   var count = Number(itemCount) || 0
-  var owned = playlistOwnedByUser(playlist, userId)
-  var collaborative = !!(playlist && playlist.collaborative === true)
-  var knownUser = String(userId || "") !== ""
-  if (error) {
-    if (playlistItemsHiddenByApi(status, owned, collaborative, knownUser))
-      return playlistItemsHiddenMessage()
-    return "Couldn't load this playlist. Try again in a moment."
-  }
+  if (error) return "Couldn't load this playlist. Try again in a moment."
   if (count > 0) return ""
-  if (playlistItemsHiddenByApi(200, owned, collaborative, knownUser))
-    return playlistItemsHiddenMessage()
   return "This playlist has no visible items."
 }
 
-// While a player surface is open, keep this computer registered as a Spotify
-// Connect receiver. The configured idle timeout begins only after every player
-// surface closes.
+// While a player surface is open, keep the local engine running so the mini
+// player and media keys keep working. The configured idle timeout begins
+// only after every player surface closes.
 function visibleLocalReceiverAction(uiVisible, fullyConnected, running, busy) {
   if (uiVisible !== true || fullyConnected !== true) return "idle"
   if (busy === true) return "wait"
-  if (running === true) return "refresh"
+  if (running === true) return "idle"
   return "start"
 }
-
 // A paused item is still an active media session: keep its MPRIS metadata and
 // resume controls alive after the UI closes. Only an empty/stopped receiver is
 // eligible for the configured background shutdown timeout.
 function idleShutdownShouldRun(daemonRunning, hasMedia, uiVisible, idleMinutes) {
   return daemonRunning === true && hasMedia !== true && uiVisible !== true
     && Number(idleMinutes) > 0
-}
-
-function remotePlaybackPollShouldRun(loggedIn, loading, uiVisible, useRemote,
-    playing) {
-  if (loggedIn !== true || loading === true) return false
-  if (uiVisible === true) return true
-  return useRemote === true && playing === true
-}
-
-function remotePlaybackPollInterval(uiVisible, useRemote, hasLocal) {
-  return uiVisible === true && (useRemote === true || hasLocal !== true)
-    ? 5000 : 15000
 }
 
 function normalizedShortcutPlayer(value) {
@@ -501,7 +291,7 @@ function searchTypeLabel(type) {
   return typeLabel(type, true)
 }
 
-function spotifyTypeLabel(type) {
+function mediaTypeLabel(type) {
   return typeLabel(type, false)
 }
 
@@ -522,16 +312,7 @@ function searchNeedsLoad(query, activeQuery, typeLoaded) {
 }
 
 var VOLUME_FLUSH_MS = 80
-var VOLUME_FLUSH_REMOTE_MS = 250
-var VOLUME_FLUSH_SONOS_MS = 120
 var SLIDER_VOLUME_ACK_TOLERANCE = 0.04
-
-function volumeFlushInterval(target) {
-  var backend = String(target || "").trim().toLowerCase()
-  if (backend === "remote") return VOLUME_FLUSH_REMOTE_MS
-  if (backend === "sonos") return VOLUME_FLUSH_SONOS_MS
-  return VOLUME_FLUSH_MS
-}
 
 function nextVolume(current, delta) {
   return clampUnit((Number(current) || 0) + (Number(delta) || 0))
@@ -574,12 +355,10 @@ function seekPosition(position, delta, length) {
 // optional: empty strings, an empty artists list, and 0 duration are all
 // legal and simply mean the UI has nothing better to show.
 //
-// Subsonic song durations are whole seconds; interim callers still hand over
-// Spotify-shaped rows whose durationMs/duration_ms are already milliseconds.
-// Trust the explicit millisecond fields first; a bare `duration` value below
-// 10000 is treated as seconds (a real song is never longer than that in ms
-// naming, and never that short in seconds), anything at or above it as
-// already-converted milliseconds.
+// Subsonic song durations are whole seconds. Trust the explicit millisecond
+// fields first; a bare `duration` value below 10000 is treated as seconds (a
+// real song is never longer than that in ms naming, and never that short in
+// seconds), anything at or above it as already-converted milliseconds.
 function backendSongDurationMsV2(item) {
   var source = item || {}
   var ms = Math.floor(Number(source.duration_ms) || 0)
@@ -612,14 +391,12 @@ function backendSongArtistsV2(item) {
 }
 
 // Map one UI row to a protocol v2 SongRef. Subsonic fields are the primary
-// source; interim Spotify-shaped rows degrade to their closest field (uri ->
-// track id, name -> title, artist -> artists) so the transport boundary keeps
-// accepting today's lists until the Subsonic data model lands in package 5.
+// source; title/artist degrade to their closest row field (name -> title,
+// artist -> artists) so rows without normalized fields still stream.
 // Rows without any usable id return null and are dropped by the caller.
 function backendSongRefV2(item) {
   if (!item || typeof item !== "object") return null
   var id = String(item.id === undefined || item.id === null ? "" : item.id).trim()
-  if (!id) id = spotifyTrackId(item.uri)
   if (!id) return null
   var song = { id: id }
   var title = String(item.title !== undefined && item.title !== null
@@ -660,11 +437,10 @@ function backendLoadFieldsV2(items, options) {
   return fields
 }
 
-// Interim bridge (package 5 replaces it with Subsonic rows end to end): turn
-// a play request into a v2 load body. The visible list becomes the engine's
-// queue starting at the clicked row, mirroring playbackBody's wrap-around so
-// Next reaches the list's end the same way the Spotify play endpoint did.
-// A resume offset in milliseconds is honored for a row loaded mid-song.
+// Turn a play request into a v2 load body. The visible list becomes the
+// engine's queue starting at the clicked row (wrapping around), so Next
+// reaches the list's end the way the displayed order runs. A resume offset in
+// milliseconds is honored for a row loaded mid-song.
 function playbackLoadBodyV2(item, sourceItems, resumeMs) {
   if (!item || typeof item !== "object") return null
   // Playback must start somewhere: a clicked row with no usable id (a pure
@@ -706,9 +482,8 @@ function playbackLoadBodyV2(item, sourceItems, resumeMs) {
 // MediaCollection, the panel views) renders these without caring which
 // endpoint produced them. Identity is the `savedKeyFor` key (`type:id`);
 // row `uri` remains only as an app-local token (`navidrome:<type>:<id>`)
-// for the few consumers that want a URI-shaped string: the persisted
-// last-radio playlist identity in Service (session state and the remote
-// playback context check) and the interim Spotify-shaped row shims. Panel
+// for the few consumers that want a URI-shaped string (the persisted
+// last-radio playlist identity in Service). Panel
 // and MediaCollection identity plumbing (context menus, playlist identity,
 // occurrence matching, restore keys) compare the saved key, never uris.
 // Service builds v2 load bodies from `id` alone and never reads row uris.
@@ -1004,7 +779,7 @@ function subsonicSearchPage(items, nextOffset, windowSize) {
 function subsonicSearchGroups(results, type, art, windowSize, offset) {
   var parsed = results && typeof results === "object"
     ? results : { artists: [], albums: [], songs: [] }
-  var groups = searchGroups({}, 128)
+  var groups = searchGroups()
   var wanted = normalizedSearchType(type)
   var nextOffset = Math.max(0, Math.floor(Number(offset) || 0))
     + Math.max(1, Math.floor(Number(windowSize) || 1))
@@ -1092,138 +867,6 @@ function idleMediaText(current, item, key, fallback) {
   return String(fallback || "")
 }
 
-// Preserve Spotify's current playback target unless the user explicitly chose
-// another device in this app. The local spotifyd player is only the fallback
-// when Spotify has no active device. Keeping a restricted device here avoids
-// silently moving playback locally; Spotify can report the unsupported action.
-function preferredPlaybackDevice(devices, selectedId, explicitSelection, currentDevice) {
-  var values = Array.isArray(devices) ? devices : []
-  var key = String(selectedId || "")
-  if (explicitSelection && key) {
-    for (var i = 0; i < values.length; i++)
-      if (String(values[i].id || "") === key && values[i].restricted !== true)
-        return values[i]
-  }
-  var current = currentDevice || null
-  if (current && current.active === true) {
-    for (var j = 0; j < values.length; j++)
-      if (playbackDevicesMatch(values[j], current))
-        return values[j]
-    return current
-  }
-  for (var k = 0; k < values.length; k++)
-    if (values[k].active === true)
-      return values[k]
-  for (var l = 0; l < values.length; l++)
-    if (values[l].local === true && values[l].restricted !== true && values[l].id)
-      return values[l]
-  return null
-}
-
-// Keep an active remote receiver untouched, but remember an active local
-// receiver as the implicit selection so the UI and subsequent playback agree.
-function automaticLocalPlaybackDevice(selectedId, preferredDevice, localDevice) {
-  if (String(selectedId || "")) return null
-  var current = preferredDevice || null
-  if (current && current.active === true && current.local !== true) return null
-  var candidate = current && current.local === true ? current : (localDevice || null)
-  return candidate && candidate.local === true && candidate.id
-      && candidate.restricted !== true ? candidate : null
-}
-
-// Freeze the chosen receiver for this playback intent. A missing ID remains
-// valid for hardware players exposed only through current playback.
-function playbackTargetDeviceId(device, explicitSelection) {
-  var item = device || null
-  if (!item) return ""
-  return String(item.id || "")
-}
-
-function isLocalPlaybackDevice(device, configuredName, runtimeName, knownId) {
-  var item = device || {}
-  var id = String(item.id || "")
-  var rememberedId = String(knownId || "")
-  if (id && rememberedId && id === rememberedId) return true
-  var name = String(item.sourceName || item.name || "")
-  var configured = String(configuredName || "")
-  var runtime = String(runtimeName || "")
-  return !!name && (name === configured || (!!runtime && name === runtime))
-}
-
-// Spotify may expose an active hardware player through /me/player while
-// omitting it from /me/player/devices (Sonos is a common example). Device ids
-// are authoritative when both endpoints provide one; otherwise fall back to
-// the user-visible name and device type.
-function playbackDevicesMatch(left, right) {
-  var first = left || {}
-  var second = right || {}
-  var firstId = String(first.id || "")
-  var secondId = String(second.id || "")
-  if (firstId && secondId) return firstId === secondId
-  var firstName = String(first.name || first.sourceName || "").trim().toLowerCase()
-  var secondName = String(second.name || second.sourceName || "").trim().toLowerCase()
-  if (!firstName || firstName !== secondName) return false
-  var firstType = String(first.type || "").trim().toLowerCase()
-  var secondType = String(second.type || "").trim().toLowerCase()
-  return !firstType || !secondType || firstType === secondType
-}
-
-function pendingRemoteDeviceMatches(pending, device, now) {
-  if (!pending || !pending.device || !device) return false
-  var expiresAt = Number(pending.expiresAt)
-  var current = Number(now)
-  if (!isFinite(expiresAt) || !isFinite(current) || current >= expiresAt)
-    return false
-  return playbackDevicesMatch(pending.device, device)
-}
-
-function playbackPositionAt(positionSeconds, receivedAt, playing, now) {
-  var value = Math.max(0, Number(positionSeconds) || 0)
-  var anchor = Number(receivedAt)
-  var current = Number(now)
-  if (playing === true && isFinite(anchor) && isFinite(current))
-    value += Math.max(0, current - anchor) / 1000
-  return value
-}
-
-// Spotify can briefly return the pre-command playback state after accepting a
-// seek. Keep the requested anchor until the active device reports a position
-// close enough to acknowledge it, or until the bounded grace period expires.
-function pendingRemoteSeekShouldHold(playback, pending, now) {
-  var state = playback || null
-  if (!state || !pendingRemoteDeviceMatches(pending, state.device, now))
-    return false
-  var currentUri = String((state.item && state.item.uri) || "")
-  var requestedUri = String(pending.uri || "")
-  if (!currentUri || (requestedUri && currentUri !== requestedUri)) return false
-
-  var reported = playbackPositionAt(state.progressSeconds, state.receivedAt,
-    state.playing, now)
-  var requested = playbackPositionAt(pending.positionSeconds,
-    pending.requestedAt, pending.playing, now)
-  return Math.abs(reported - requested) > 2
-}
-
-function displayedRemotePosition(playback, pending, now) {
-  var state = playback || {}
-  if (pendingRemoteSeekShouldHold(state, pending, now))
-    return playbackPositionAt(pending.positionSeconds, pending.requestedAt,
-      pending.playing, now)
-  return playbackPositionAt(state.progressSeconds, state.receivedAt,
-    state.playing, now)
-}
-
-// Volume has no timestamp in Spotify's response. An exact percentage is
-// therefore the acknowledgement; null or a different value remains stale for
-// the same bounded grace period.
-function pendingRemoteVolumeShouldHold(device, pending, now) {
-  if (!pendingRemoteDeviceMatches(pending, device, now)) return false
-  var requested = normalizeVolumePercent(pending.volumePercent)
-  var reported = normalizeVolumePercent((device || {}).volumePercent)
-  return requested !== null
-    && (reported === null || Math.abs(reported - requested) > 0.5)
-}
-
 function playbackSliderFeedbackComplete(sourceValue, pendingValue, sourcePending,
     elapsedMs, tolerance, minimumMs, timeoutMs) {
   var elapsed = Math.max(0, Number(elapsedMs) || 0)
@@ -1234,98 +877,6 @@ function playbackSliderFeedbackComplete(sourceValue, pendingValue, sourcePending
     - (Number(pendingValue) || 0))
   return elapsed >= minimum && sourcePending !== true
     && difference <= Math.max(0, Number(tolerance) || 0)
-}
-
-function spotifyConnectTokenType(value) {
-  var tokenType = String(value || "default").trim().toLowerCase()
-  return ["default", "accesstoken", "authorization_code"].indexOf(tokenType) >= 0
-    ? tokenType : "default"
-}
-
-function isSpotifyConnectDeviceId(value) {
-  return /^[A-Za-z0-9_.:-]{8,160}$/.test(String(value || ""))
-}
-
-// Some hardware receivers expose their device id as their Web API name. Local
-// ZeroConf discovery has the user-facing alias and can safely relabel the same
-// receiver because playbackDevicesMatch requires equal ids when both exist.
-function spotifyDeviceNameNeedsDiscovery(device) {
-  var item = device || {}
-  var name = String(item.name || "").trim()
-  var id = String(item.id || "").trim()
-  return !name || (!!id && name.toLowerCase() === id.toLowerCase())
-    || /^[a-f0-9]{40}$/i.test(name)
-}
-
-function playbackDeviceDisplayName(device, discoveredDevices) {
-  var item = device || {}
-  var receivers = Array.isArray(discoveredDevices) ? discoveredDevices : []
-  for (var i = 0; i < receivers.length; i++) {
-    var receiver = receivers[i]
-    if (!receiver || !playbackDevicesMatch(receiver, item)) continue
-    var discoveredName = String(receiver.name || "").trim()
-    if (discoveredName) return discoveredName
-  }
-  return String(item.name || "").trim()
-}
-
-function normalizePlaybackState(value, imageWidth) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null
-  var source = value
-  var rawDevice = source.device || null
-  var device = rawDevice && typeof rawDevice === "object" ? {
-    id: String(rawDevice.id || ""),
-    name: String(rawDevice.name || "Spotify device"),
-    type: String(rawDevice.type || "unknown"),
-    active: rawDevice.is_active === true,
-    restricted: rawDevice.is_restricted === true,
-    // Spotify explicitly permits this field to be null. Preserve that as
-    // "unknown" instead of making a missing reading look like a real mute.
-    volumePercent: normalizeVolumePercent(rawDevice.volume_percent),
-    supportsVolume: rawDevice.supports_volume === true
-  } : null
-  var item = source.item && typeof source.item === "object"
-    ? normalizeTrack(source.item, imageWidth || 192) : null
-  if (!device && !item) return null
-  return {
-    device: device,
-    item: item,
-    playing: source.is_playing === true,
-    progressSeconds: Math.max(0, Number(source.progress_ms) || 0) / 1000,
-    receivedAt: Date.now(),
-    repeatMode: ["off", "track", "context"].indexOf(String(source.repeat_state)) >= 0
-      ? String(source.repeat_state) : "off",
-    shuffle: source.shuffle_state === true,
-    contextUri: source.context && source.context.uri
-      ? String(source.context.uri) : "",
-    contextHref: source.context && source.context.href
-      ? String(source.context.href) : "",
-    contextType: source.context && source.context.type
-      ? String(source.context.type) : "",
-    disallows: source.actions && source.actions.disallows
-      && typeof source.actions.disallows === "object"
-      ? source.actions.disallows : ({})
-  }
-}
-
-function imageFor(images, targetWidth) {
-  if (!Array.isArray(images) || images.length === 0) return ""
-  var target = Math.max(1, Number(targetWidth) || 128)
-  var best = null
-  var bestScore = Number.MAX_VALUE
-  for (var i = 0; i < images.length; i++) {
-    var image = images[i]
-    if (!image || !image.url) continue
-    var width = Number(image.width) || target
-    // Prefer the smallest image that is still large enough. Undersized images
-    // get a larger penalty so artwork is not visibly upscaled.
-    var score = width >= target ? width - target : (target - width) * 4
-    if (score < bestScore) {
-      best = image
-      bestScore = score
-    }
-  }
-  return best ? String(best.url) : ""
 }
 
 function artistNames(artists) {
@@ -1362,36 +913,19 @@ function artistContextAvailable(mediaType, trackId, artists) {
     || String(trackId || "") !== "" || arrayValues(artists).length > 0
 }
 
-function spotifyTrackId(value) {
-  var match = String(value || "").match(
-    /(?:spotify:track:|spotify\/track\/|open\.spotify\.com\/track\/)([A-Za-z0-9]+)/)
-  return match ? match[1] : ""
-}
-
-// Playback from another Spotify Connect device already carries a normalized
-// item. Local spotifyd playback may expose only MPRIS metadata, so synthesize
-// the small track shape needed by library actions in that case. A matching
-// episode must not be mistaken for a track when spotifyd's object-path
-// fallback supplied its id.
-function currentPlaybackTrack(trackId, remoteTrack, title, artist, album,
-    coverUrl, durationSeconds, externalUrl) {
+// The engine's MPRIS metadata carries only strings, so the now-playing row is
+// synthesized from it: the id is the Subsonic song id the engine publishes as
+// xesam:url, and the uri is the app-local navidrome token. Library actions on
+// this row (star, context buttons) resolve ids through Subsonic reads.
+function currentPlaybackTrack(trackId, title, artist, album, coverUrl,
+    durationSeconds) {
   var id = String(trackId || "").trim()
   if (!id) return null
-
-  var remote = remoteTrack && typeof remoteTrack === "object"
-    ? remoteTrack : null
-  var remoteId = remote
-    ? String(remote.id || spotifyTrackId(remote.uri)).trim() : ""
-  if (remote && remoteId === id) {
-    if (String(remote.type || "track") !== "track") return null
-    if (remote.uri) return remote
-  }
-
   return {
     kind: "item",
     type: "track",
     id: id,
-    uri: "spotify:track:" + id,
+    uri: navidromeUri("track", id),
     name: String(title || "Untitled"),
     subtitle: String(artist || ""),
     album: String(album || ""),
@@ -1399,11 +933,12 @@ function currentPlaybackTrack(trackId, remoteTrack, title, artist, album,
     albumItem: null,
     parentContext: null,
     imageUrl: String(coverUrl || ""),
-    durationMs: Math.max(0, Number(durationSeconds) || 0) * 1000,
-    externalUrl: String(externalUrl || "")
+    durationMs: Math.max(0, Number(durationSeconds) || 0) * 1000
   }
 }
 
+// The interim Omasing handoff receives the plain Subsonic song id; the
+// built-in Navidrome lyrics provider (package 6) replaces the handoff.
 function lyricsSong(trackId, title, artist, album, duration, coverUrl,
     positionSeconds) {
   var id = String(trackId || "").trim()
@@ -1414,7 +949,7 @@ function lyricsSong(trackId, title, artist, album, duration, coverUrl,
   var songPosition = Math.max(0, Number(positionSeconds) || 0)
   if (songDuration > 0) songPosition = Math.min(songPosition, songDuration)
   return {
-    id: "spotify:track:" + id,
+    id: id,
     title: songTitle,
     artist: songArtist,
     album: String(album || "").trim(),
@@ -1776,13 +1311,12 @@ function searchEscapeAction(barVisible, searchFocused, queryText,
 function universalSearchVisible(tab, active) {
   var area = String(tab || "")
   return area === "search"
-    || (active === true && area !== "login" && area !== "devices"
-      && area !== "setup")
+    || (active === true && area !== "login" && area !== "setup")
 }
 
 function isUtilityTab(tab) {
   var area = String(tab || "")
-  return area === "setup" || area === "devices" || area === "login"
+  return area === "setup" || area === "login"
 }
 
 function rememberContentTab(tab) {
@@ -1790,11 +1324,11 @@ function rememberContentTab(tab) {
   return !area || isUtilityTab(area) ? "" : area
 }
 
-// Settings and Devices sit on top of the last real page. Esc returns there
-// and skips any intervening Settings/Devices visit so two Esc presses cannot
-// close the window from those menus.
+// Settings sits on top of the last real page. Esc returns there and skips
+// any intervening Settings visit so two Esc presses cannot close the window
+// from that menu.
 function previousContentTab(currentTab, lastContentTab) {
-  if (currentTab !== "setup" && currentTab !== "devices") return ""
+  if (currentTab !== "setup") return ""
   var previous = rememberContentTab(lastContentTab)
   return previous || "home"
 }
@@ -1922,21 +1456,12 @@ function comparablePlaylistTitle(value) {
 
 // Playlist search has no server verb in Subsonic (search3 covers artists,
 // albums, and songs), so the controller filters the loaded playlist list by
-// name. Matching ignores punctuation and case, the way the old Spotify
-// title comparisons did.
+// name. Matching ignores punctuation and case.
 function playlistMatchesTerm(playlist, term) {
   var expected = comparablePlaylistTitle(term)
   if (!expected) return true
   return comparablePlaylistTitle(playlist && playlist.name) === expected
     || comparablePlaylistTitle(playlist && playlist.name).indexOf(expected) >= 0
-}
-
-function albumKind(item) {
-  var source = item || {}
-  var type = String(source.album_type || source.album_group || "").toLowerCase()
-  if (type === "single") return Number(source.total_tracks) > 1 ? "EP / Single" : "Single"
-  if (type === "compilation") return "Compilation"
-  return type === "album" ? "Album" : "Release"
 }
 
 function playlistItemIds(items) {
@@ -1966,30 +1491,6 @@ function playlistBackingItems(contextPlaylist, selectedPlaylist, selectedItems,
   return []
 }
 
-// Spotify's insert_before index is measured against the playlist before the
-// selected range is removed. The UI works with the item's final index, so a
-// downward move needs to step over the source item once.
-function playlistReorderBody(sourceIndex, destinationIndex, itemCount, snapshotId) {
-  var sourceNumber = Number(sourceIndex)
-  var destinationNumber = Number(destinationIndex)
-  var countNumber = Number(itemCount)
-  if (!isFinite(sourceNumber) || !isFinite(destinationNumber) || !isFinite(countNumber))
-    return null
-  var source = Math.floor(sourceNumber)
-  var destination = Math.floor(destinationNumber)
-  var count = Math.floor(countNumber)
-  if (count < 2 || source < 0 || source >= count || destination < 0
-      || destination >= count || source === destination) return null
-  var body = {
-    range_start: source,
-    insert_before: source < destination ? destination + 1 : destination,
-    range_length: 1
-  }
-  var snapshot = String(snapshotId || "")
-  if (snapshot) body.snapshot_id = snapshot
-  return body
-}
-
 // Playlist payloads can contain unavailable entries that normalize out of the
 // visible list. Prefer the raw API position retained by Service in that case.
 function playlistPositionAt(items, index) {
@@ -2003,18 +1504,6 @@ function playlistPositionAt(items, index) {
   return explicitValue !== null && explicitValue !== undefined
     && isFinite(explicitPosition) && explicitPosition >= 0
     ? Math.floor(explicitPosition) : visibleIndex
-}
-
-function playlistReorderBodyForItems(items, sourceIndex, destinationIndex,
-    itemCount, snapshotId) {
-  var rows = Array.isArray(items) ? items : []
-  var sourcePosition = playlistPositionAt(rows, sourceIndex)
-  var destinationPosition = playlistPositionAt(rows, destinationIndex)
-  if (sourcePosition < 0 || destinationPosition < 0) return null
-  var requestedCount = Number(itemCount)
-  var count = isFinite(requestedCount) ? Math.floor(requestedCount) : rows.length
-  count = Math.max(count, rows.length, sourcePosition + 1, destinationPosition + 1)
-  return playlistReorderBody(sourcePosition, destinationPosition, count, snapshotId)
 }
 
 function reorderedPlaylistItemsAtPositions(items, sourcePosition,
@@ -2057,174 +1546,15 @@ function reorderedPlaylistItemsAtPositions(items, sourcePosition,
   return positioned
 }
 
-function normalizedArtists(artists, imageWidth) {
-  var sourceArtists = arrayValues(artists)
-  var rows = []
-  for (var i = 0; i < sourceArtists.length; i++) {
-    var source = sourceArtists[i] || {}
-    // Spotify's simplified artist object normally carries `type`, but some
-    // playlist and cached payloads omit it. Artist links should still work.
-    var artist = normalizeContext({
-      id: source.id,
-      uri: source.uri,
-      type: source.type || "artist",
-      name: source.name,
-      images: source.images,
-      external_urls: source.external_urls
-    }, imageWidth)
-    if (artist && artist.type === "artist") rows.push(artist)
-  }
-  return rows
-}
-
-function normalizeTrack(value, imageWidth, parentContext) {
-  var source = value || {}
-  var item = source.item || source.track || source.episode || source.chapter || source
-  if (!item || typeof item !== "object") return null
-  var album = item.album || {}
-  var type = String(item.type || "track")
-  if (["track", "episode", "chapter"].indexOf(type) === -1) return null
-  var subtitle = type === "episode"
-    ? String((item.show && item.show.name) || item.description || "Podcast")
-    : (type === "chapter"
-      ? String((item.audiobook && item.audiobook.name) || item.description || "Audiobook")
-      : artistNames(item.artists))
-  var images = type === "track" ? album.images : item.images
-  var albumItem = type === "track" && album && album.name
-    ? normalizeContext({
-      id: album.id,
-      uri: album.uri,
-      type: album.type || "album",
-      name: album.name,
-      artists: album.artists,
-      images: album.images,
-      release_date: album.release_date,
-      total_tracks: album.total_tracks,
-      external_urls: album.external_urls
-    }, imageWidth || 96) : null
-  if (!albumItem && type === "track" && parentContext && parentContext.type === "album")
-    albumItem = parentContext
-  var parentItem = type === "episode" && item.show
-    ? normalizeContext(item.show, imageWidth || 96)
-    : (type === "chapter" && item.audiobook
-      ? normalizeContext(item.audiobook, imageWidth || 96) : null)
-  if (!parentItem && parentContext
-      && ((type === "episode" && parentContext.type === "show")
-        || (type === "chapter" && parentContext.type === "audiobook")))
-    parentItem = parentContext
-  if ((type === "episode" || type === "chapter") && parentItem)
-    subtitle = String(parentItem.name || subtitle)
-  var resume = item.resume_point || {}
-  return {
-    kind: "item",
-    type: type,
-    id: String(item.id || ""),
-    uri: String(item.uri || ""),
-    name: String(item.name || "Untitled"),
-    subtitle: subtitle,
-    album: String(album.name || (albumItem && albumItem.name) || ""),
-    artists: normalizedArtists(item.artists, imageWidth || 96),
-    albumItem: albumItem,
-    parentContext: parentItem,
-    imageUrl: imageFor(images, imageWidth || 96)
-      || String((parentContext && parentContext.imageUrl) || ""),
-    durationMs: Number(item.duration_ms) || 0,
-    trackNumber: Number(item.track_number || item.chapter_number) || 0,
-    discNumber: Number(item.disc_number) || 0,
-    releaseDate: String(item.release_date || album.release_date || ""),
-    addedAt: String(source.added_at || ""),
-    playedAt: String(source.played_at || ""),
-    resumeMs: Math.max(0, Number(resume.resume_position_ms) || 0),
-    fullyPlayed: resume.fully_played === true,
-    explicit: item.explicit === true,
-    externalUrl: item.external_urls && item.external_urls.spotify
-      ? String(item.external_urls.spotify) : ""
-  }
-}
-
-function normalizeContext(value, imageWidth) {
-  var source = value || {}
-  var item = source.album || source.artist || source.playlist || source.show
-    || source.audiobook || source
-  var type = String(item.type || "")
-  if (["album", "artist", "playlist", "show", "audiobook"].indexOf(type) === -1) return null
-  var subtitle = ""
-  if (type === "album") {
-    var albumDetails = []
-    var albumArtists = artistNames(item.artists)
-    if (albumArtists) albumDetails.push(albumArtists)
-    albumDetails.push(albumKind(item))
-    if (item.release_date) albumDetails.push(String(item.release_date).slice(0, 4))
-    subtitle = albumDetails.join(" · ")
-  }
-  else if (type === "playlist") subtitle = String((item.owner && item.owner.display_name) || "Playlist")
-  else if (type === "artist") subtitle = "Artist"
-  else if (type === "show") subtitle = String(item.publisher || "Podcast")
-  else {
-    var authors = []
-    var sourceAuthors = Array.isArray(item.authors) ? item.authors : []
-    for (var a = 0; a < sourceAuthors.length; a++)
-      if (sourceAuthors[a] && sourceAuthors[a].name) authors.push(String(sourceAuthors[a].name))
-    subtitle = authors.length ? authors.join(", ") : String(item.publisher || "Audiobook")
-  }
-  var total = Number(item.total_tracks || item.total_episodes || item.total_chapters) || 0
-  if (type === "playlist") total = Number((item.items && item.items.total)
-    || (item.tracks && item.tracks.total)) || 0
-  return {
-    kind: "context",
-    type: type,
-    id: String(item.id || ""),
-    uri: String(item.uri || ""),
-    name: String(item.name || "Untitled"),
-    subtitle: subtitle,
-    description: String(item.description || ""),
-    artists: normalizedArtists(item.artists, imageWidth || 128),
-    imageUrl: imageFor(item.images, imageWidth || 128),
-    total: total,
-    releaseType: type === "album" ? String(item.album_type || item.album_group || "") : "",
-    releaseDate: String(item.release_date || ""),
-    ownerId: String((item.owner && (item.owner.account_id || item.owner.id)) || ""),
-    ownerName: String((item.owner && item.owner.display_name) || ""),
-    collaborative: item.collaborative === true,
-    public: item.public === true,
-    snapshotId: String(item.snapshot_id || ""),
-    addedAt: String(source.added_at || ""),
-    externalUrl: item.external_urls && item.external_urls.spotify
-      ? String(item.external_urls.spotify) : ""
-  }
-}
-
-function normalizePlaylist(value, imageWidth) {
-  var normalized = normalizeContext(value, imageWidth)
-  if (!normalized || normalized.type !== "playlist") return null
-  return normalized
-}
-
-function normalizePage(page, mapper) {
-  var source = page || {}
-  var values = Array.isArray(source.items) ? source.items : []
-  var items = []
-  for (var i = 0; i < values.length; i++) {
-    var mapped = mapper(values[i])
-    if (mapped) items.push(mapped)
-  }
-  return {
-    items: items,
-    next: safeApiUrl(source.next),
-    previous: safeApiUrl(source.previous),
-    total: Number(source.total) || items.length
-  }
-}
-
 // Playlist rows are loaded explicitly a page at a time. Keep every requested
-// page, including duplicate tracks, and let Spotify's continuation URL decide
-// when the collection is complete instead of applying the shared UI cache cap.
+// page, including duplicate tracks, instead of applying the shared UI cache
+// cap. `next` carries the following window offset ("": the list is complete).
 function playlistPageState(existing, incoming, append, next) {
   var current = arrayValues(existing)
   var page = arrayValues(incoming)
   return {
     items: append === true ? current.concat(page) : page,
-    next: safeApiUrl(next)
+    next: String(next || "")
   }
 }
 
@@ -2239,37 +1569,20 @@ function playlistRestorePending(itemCount, targetCount, loading, next) {
   var loaded = Math.max(0, Math.floor(Number(itemCount) || 0))
   var target = normalizedPlaylistRestoreCount(targetCount)
   if (target <= loaded) return false
-  return loading === true || safeApiUrl(next) !== ""
+  return loading === true || String(next || "") !== ""
 }
 
 function playlistRestoreShouldContinue(itemCount, targetCount, next) {
   return playlistRestorePending(itemCount, targetCount, false, next)
 }
 
-function searchTypeKey(type) {
-  var value = String(type || "track")
-  if (value === "artist") return "artists"
-  if (value === "album") return "albums"
-  if (value === "playlist") return "playlists"
-  return "tracks"
-}
-
-function normalizeSearchPage(payload, type, imageWidth) {
-  var key = searchTypeKey(type)
-  var page = payload && payload[key] ? payload[key] : {}
-  return normalizePage(page, function(value) {
-    return type === "track" || type === "episode"
-      ? normalizeTrack(value, imageWidth || 128)
-      : normalizeContext(value, imageWidth || 128)
-  })
-}
-
-function searchGroups(payload, imageWidth) {
+// The empty per-type page shape that search3 window merges build on:
+// one page per SEARCH_TYPES key, `next` the following window offset (a
+// string, "" when the window came back short), `total` the returned count.
+function searchGroups() {
   var result = ({})
-  for (var i = 0; i < SEARCH_TYPES.length; i++) {
-    var type = SEARCH_TYPES[i]
-    result[type] = normalizeSearchPage(payload, type, imageWidth || 128)
-  }
+  for (var i = 0; i < SEARCH_TYPES.length; i++)
+    result[SEARCH_TYPES[i]] = { items: [], next: "", total: 0 }
   return result
 }
 
@@ -2287,28 +1600,11 @@ function mergeSearchGroups(existing, incoming) {
     var nextPage = newGroups[type]
     result[type] = {
       items: mergeUnique(oldPage.items, nextPage.items),
-      next: nextPage.next,
-      previous: nextPage.previous,
+      next: String(nextPage.next || ""),
       total: Math.max(Number(oldPage.total) || 0, Number(nextPage.total) || 0)
     }
   }
   return result
-}
-
-function normalizeCursorPage(container, mapper) {
-  var page = container || {}
-  var values = Array.isArray(page.items) ? page.items : []
-  var items = []
-  for (var i = 0; i < values.length; i++) {
-    var mapped = mapper(values[i])
-    if (mapped) items.push(mapped)
-  }
-  return {
-    items: items,
-    next: safeApiUrl(page.next),
-    total: Number(page.total) || items.length,
-    after: String((page.cursors && page.cursors.after) || "")
-  }
 }
 
 function filteredSorted(items, filterText, sortKey) {
@@ -2436,8 +1732,8 @@ function millisecondsToClock(milliseconds) {
 }
 
 // Merge pages of canonical rows without duplicates. The stable key is the
-// type:id saved key; an interim Spotify-shaped row keeps working through its
-// uri/id fallback, and keyless rows pass through untouched.
+// type:id saved key (with a uri/id fallback for rows without a type), and
+// keyless rows pass through untouched.
 function mergeUnique(existing, incoming) {
   var result = Array.isArray(existing) ? existing.slice() : []
   var seen = {}

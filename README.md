@@ -6,7 +6,7 @@ Omarchy Navidrome brings your self-hosted Navidrome library into a fast,
 lightweight Omarchy plugin: music skipping the browser, following your active
 Omarchy theme, with a mini player in the bar.
 
-This is a port of the proven Omarchy Spotify plugin to Navidrome's Subsonic
+This is a port of the proven Omarchy music-plugin architecture to Navidrome's Subsonic
 API. It is in active development; see
 [docs/NAVIDROME_PORT_PLAN.md](docs/NAVIDROME_PORT_PLAN.md) for the plan and
 [docs/PORT_STATUS.md](docs/PORT_STATUS.md) for what works today.
@@ -18,9 +18,8 @@ omarchy plugin add /home/tray/Projects/Omarchy-Navidrome/main --enable
 ```
 
 Requires Omarchy 4 and a running Navidrome server. Point the first-run setup
-at your server's base URL and sign in once; credentials are stored in your
-keyring. (Until the port's setup flow ships, point the plugin at your
-checkout path in `omarchy plugin add` for a development build.)
+at your server's base URL, username, and password; the credentials are stored
+in your keyring after the server has been verified live.
 
 ## Remove it completely
 
@@ -30,7 +29,7 @@ Run the bundled uninstaller from outside the plugin directory:
 cd "$HOME" && "$HOME/.config/omarchy/plugins/quickshell.navidrome/scripts/uninstall.sh"
 ```
 
-It disables and removes the plugin, stops and removes both user services,
+It disables and removes the plugin, stops and removes the user service,
 restarts the shell, and deletes all plugin-owned configuration, cached audio,
 backend build files, installed binaries, playback state, runtime sockets, old
 configuration backups, and matching GNOME Keyring entries — including the
@@ -50,7 +49,7 @@ omarchy restart shell
 The cleanup deliberately leaves unrelated software alone, including any other
 Omarchy plugin such as Omasing.
 
-## What carries over from the Spotify plugin
+## What carries over
 
 - **Lightweight by design.** About 60 MB of shell memory instead of a
   browser-sized client.
@@ -60,18 +59,17 @@ Omarchy plugin such as Omasing.
   between sidebar, search, song list, and player, arrows to move, `Enter` to
   activate, `Space` to play/pause, `Ctrl+Left/Right` between songs,
   `Ctrl+Up/Down` for volume. `Ctrl+/` lists every shortcut; the panel keeps
-  the same shortcut-hint overlay you may already know from Omarchy Spotify.
+  the shortcut-hint overlay that lights up the next key after a shortcut.
 - **Lyrics, planned built-in.** The port's lyrics view will read embedded and
-  server-side lyrics (synced or plain text) straight from Navidrome,
-  replacing the Omasing handoff used by the Spotify plugin.
+  server-side lyrics (synced or plain text) straight from Navidrome.
 
 ## Roadmap highlights
 
-The port replaces Spotify-only pieces—OAuth, Connect devices, rate-limit
-cooldowns—with their Navidrome equivalents: password auth into the keyring,
-local streaming through the plugin's Rust backend, honest scrobbles at
-natural track end, and server-persisted play queues with bookmark-accurate
-resume. Artwork, playlists, stars, search, and the queue carry over with the
-same behavior standards the Spotify implementation earned.
+The port replaces the remote-platform machinery with its Navidrome
+equivalents: server URL, username, and password auth into the keyring, local
+streaming through the plugin's Rust backend, honest scrobbles at natural
+track end, and server-persisted play queues with bookmark-accurate resume.
+Artwork, playlists, stars, search, and the queue carry over with the same
+behavior standards the original implementation earned.
 
 Screenshots will be updated to Navidrome content during the port.

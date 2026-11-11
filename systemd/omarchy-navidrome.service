@@ -1,9 +1,7 @@
 [Unit]
 Description=Omarchy Navidrome plugin playback backend
-Documentation=https://github.com/stappmus/QuickshellSpotify
 After=graphical-session.target sound.target
 Wants=sound.target
-Conflicts=omarchy-navidrome-spotifyd.service
 
 StartLimitIntervalSec=300
 StartLimitBurst=5
@@ -12,7 +10,7 @@ StartLimitBurst=5
 Type=simple
 Environment=PULSE_LATENCY_MSEC=30
 Environment=TOKIO_WORKER_THREADS=2
-ExecStart=%h/.local/lib/omarchy-navidrome/omarchy-navidrome-backend --config-path=%h/.config/omarchy-navidrome/spotifyd.conf
+ExecStart=%h/.local/lib/omarchy-navidrome/omarchy-navidrome-backend --config-path=%h/.config/omarchy-navidrome/backend.conf
 Restart=on-failure
 RestartSec=5
 RestartPreventExitStatus=75 77 78

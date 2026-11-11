@@ -6,10 +6,10 @@ import "Api.js" as Api
 import "Subsonic.js" as Subsonic
 
 // Private Unix-socket client for the plugin backend. Local load/control uses
-// this when the supervised process is running; the Subsonic web API and MPRIS
-// remain the fallback when the socket is absent. Protocol v2 requests are
-// {"v":2,...}; before any load the Navidrome server must be configured once
-// per connection via configure_server.
+// this when the supervised process is running; MPRIS supplies playback state
+// when the socket is absent. Protocol v2 requests are {"v":2,...}; before any
+// load the Navidrome server must be configured once per connection via
+// configure_server.
 Item {
   id: root
 
@@ -106,7 +106,7 @@ Item {
     var fields = Api.backendLoadFieldsV2(items, spec)
     if (!fields) {
       if (typeof callback === "function")
-        callback(false, null, "This Spotify item cannot be played")
+        callback(false, null, "This song cannot be played")
       return 0
     }
     return sendCommand("load", fields, callback)

@@ -13,11 +13,6 @@ import "Subsonic.js" as Subsonic
 // overwrites in place and a different server replaces it. Secrets ride stdin
 // only — never argv, never logs, never settings files — and the keyring write
 // goes through scripts/keyring-store.sh.
-//
-// Transitional shim: SpotifyApi.qml still requires an `auth` object with
-// withAccessToken()/invalidateAccessToken(); both now fail Web API paths
-// immediately so they degrade into their existing fallbacks. Package 5
-// deletes SpotifyApi.qml entirely, and this shim with it.
 Item {
   id: root
 
@@ -78,21 +73,6 @@ Item {
       username: String(navidromeUsername || ""),
       password: String(navidromePassword || "")
     }
-  }
-
-  // Transitional compatibility shim for SpotifyApi.qml, which still requires
-  // an `auth` object with this method. Every Web API path now fails
-  // immediately and gracefully into its existing fallbacks.
-  function withAccessToken(callback) {
-    if (typeof callback === "function")
-      callback(null, "Spotify Web API was removed in the Navidrome port")
-  }
-
-  // Transitional no-op: see withAccessToken().
-  function invalidateAccessToken() {}
-
-  function tokenIsFresh() {
-    return loggedIn
   }
 
   // ------ validation ------------------------------------------------------------
@@ -190,9 +170,8 @@ Item {
     loginSucceeded()
   }
 
-  // Transitional alias for the old OAuth entry point: Service.qml's login and
-  // reconnect flows call it. It now re-reads the keyring so credentials saved
-  // after the last load are picked up.
+  // Service.qml's login and reconnect flows call this. It re-reads the
+  // keyring so credentials saved after the last load are picked up.
   function beginLogin() {
     if (loginBusy || secretLookup.running) return
     lastError = ""

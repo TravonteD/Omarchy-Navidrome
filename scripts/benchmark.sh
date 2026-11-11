@@ -29,15 +29,12 @@ done < <(pgrep -x quickshell || true)
 }
 
 mapfile -t playback_pids < <(
-  {
-    pgrep -x spotifyd || true
-    for process_dir in /proc/[0-9]*; do
-      executable=$(readlink -f -- "$process_dir/exe" 2>/dev/null || true)
-      if [[ $executable == */omarchy-navidrome-backend ]]; then
-        printf '%s\n' "${process_dir##*/}"
-      fi
-    done
-  } | sort -nu
+  for process_dir in /proc/[0-9]*; do
+    executable=$(readlink -f -- "$process_dir/exe" 2>/dev/null || true)
+    if [[ $executable == */omarchy-navidrome-backend ]]; then
+      printf '%s\n' "${process_dir##*/}"
+    fi
+  done | sort -nu
 )
 all_pids=("$shell_pid" "${playback_pids[@]}")
 clock_ticks=$(getconf CLK_TCK)
@@ -103,13 +100,7 @@ runtime_kind=none
 for pid in "${playback_pids[@]}"; do
   playback_pss=$((playback_pss + $(rollup_value "$pid" Pss)))
   playback_rss=$((playback_rss + $(rollup_value "$pid" Rss)))
-  executable=$(readlink -f -- "/proc/$pid/exe" 2>/dev/null || true)
-  kind=$([[ $executable == */omarchy-navidrome-backend ]] && printf backend || printf spotifyd)
-  if [[ $runtime_kind == none ]]; then
-    runtime_kind=$kind
-  elif [[ $runtime_kind != "$kind" ]]; then
-    runtime_kind=mixed
-  fi
+  runtime_kind=backend
 done
 
 playback_pid_list=none

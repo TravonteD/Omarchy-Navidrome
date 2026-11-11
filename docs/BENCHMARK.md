@@ -1,5 +1,13 @@
 # Resource benchmark
 
+The recorded numbers below date from the Spotify-baseline era of this plugin
+(the "Spotify" rows measure the Spotify plugin UI and the official Spotify
+client; "spotifyd" is the removed fallback runtime). They are kept as history
+and as the standard for the UI-overhead deltas the port must re-earn against
+Navidrome content during live-server validation. Only the method and tooling
+descriptions reflect the current code: the Spotify-only comparator script is
+gone and `scripts/benchmark.sh` samples the shell plus the plugin backend.
+
 Measured on 2026-08-12 on Omarchy 4 (`4.0.0.r1658.g0820484`),
 Quickshell `0.3.0.r20.g28771c7`, Qt 6.11.1, and Linux 7.1.5. The host has an
 Intel Core Ultra X7 358H, 31.0 GiB RAM, and a 3200×2000 display at 120 Hz and
@@ -10,8 +18,8 @@ active.
 ## Results
 
 Each reported value is the median of three consecutive 10-second samples after
-a 20-second settle period. `spotifyd` and the official desktop client were not
-running in these three UI-overhead states.
+a 20-second settle period. No playback runtime was running in these three
+UI-overhead states.
 
 | State | Total PSS | Total RSS | CPU | Scheduler switches/s |
 |---|---:|---:|---:|---:|
@@ -33,9 +41,9 @@ The open-window sample was logged in on Discover with personalized rows and
 artwork loaded. Loaded rows remain bounded to 200 per view, delegates are
 recycled, and list artwork pixmaps are released with those delegates.
 
-## Official Spotify comparison
+## Historical official-client comparison
 
-Spotify 1.2.92.147 was then launched from a fresh start, allowed to settle, and
+The official Spotify desktop client (1.2.92.147) was then launched from a fresh start, allowed to settle, and
 left paused on its populated Home screen. All nine `/opt/spotify/spotify`
 processes were included. The plugin window was closed and `spotifyd` was not
 running.
@@ -53,13 +61,14 @@ already running; the official client figure is its complete standalone process
 set. PSS is the primary comparison—summed RSS double-counts shared pages across
 the official client's processes.
 
-## Genuine playback
+## Historical genuine playback
 
-Playback was also measured with the UI closed and a real Premium-account track
-streaming through spotifyd 0.4.2 and PulseAudio. The official Spotify desktop
-client was closed before sampling. The daemon had been restarted with the exact
-shipped configuration, including `disable_discovery = true`, and restored an
-isolated credential provisioned for this test with the account owner's consent.
+Playback was also measured with the UI closed and a real track streaming
+through the removed `spotifyd` 0.4.2 fallback and PulseAudio. The official
+Spotify desktop client was closed before sampling. The daemon had been
+restarted with the exact shipped configuration of the time and restored an
+isolated credential provisioned for this test with the account owner's
+consent.
 
 These paired samples use the same Omarchy shell PID before and after stopping
 spotifyd, which removes most shell-startup variability:
@@ -75,20 +84,19 @@ for a median **26.3 MiB PSS / 35.6 MiB RSS**; the small difference from the
 total delta is ordinary shared-page and measurement noise. Context switches
 rose by 1.509/s.
 
-The playback sample validates the shipped audio configuration and real decoder,
-network, PulseAudio, and MPRIS costs. Automatic local-device selection is
-covered separately by offline routing tests because exercising the Web API
-would mutate the tester's real Spotify playback state.
+The playback sample validates the shipped audio configuration and real
+decoder, network, PulseAudio, and MPRIS costs of that era. The port re-earns
+these numbers with the Subsonic stream engine during live-server validation.
 
 ## Plugin backend migration check
 
 On 2026-08-16, the same host was switched live from the patched spotifyd
-prototype to `omarchy-navidrome-backend` while a real track was playing. After the
-backend optimization audit, three 10-second live samples reported a stable
-backend median of **16.77 MiB PSS / 26.09 MiB RSS**. The documented spotifyd
-playback median above was 26.3 MiB PSS / 35.6 MiB RSS, so the plugin-owned
-process was about **36% smaller by PSS** and **27% smaller by RSS** in this
-migration check.
+prototype (since removed) to `omarchy-navidrome-backend` while a real track was
+playing. After the backend optimization audit, three 10-second live samples
+reported a stable backend median of **16.77 MiB PSS / 26.09 MiB RSS**. The
+documented spotifyd playback median above was 26.3 MiB PSS / 35.6 MiB RSS, so
+the plugin-owned process was about **36% smaller by PSS** and **27% smaller by
+RSS** in this migration check.
 
 This is supporting evidence rather than a new controlled UI-baseline run: the
 shell and Omarchy revision changed between measurements, and plugin UI was open
@@ -103,9 +111,8 @@ the `Playing` state—there was no intermediate stop or pause—and produced no
 decoder underrun. The promoted service then passed a natural track transition
 with no error or restart.
 
-To reproduce the playing state, complete both browser authorizations, select a
-track, wait for it to play steadily for at least 30 seconds, and keep all plugin
-UI closed:
+To reproduce the playing state, connect to a server, play a track, wait for it
+to play steadily for at least 30 seconds, and keep all plugin UI closed:
 
 ```bash
 for sample in 1 2 3; do
@@ -113,18 +120,14 @@ for sample in 1 2 3; do
 done
 ```
 
-The script reports shell and playback-runtime memory separately as well as their
-total. Do not use a sample in which the backend or spotifyd starts, stops, or
-changes PID during the 10-second window.
+The script reports shell and playback-runtime memory separately as well as
+their total. Do not use a sample in which the backend starts, stops, or changes
+PID during the 10-second window.
 
 ## Method
 
 `scripts/benchmark.sh` identifies exactly one Omarchy Quickshell process and
-the plugin backend or all spotifyd processes at sample start.
-`scripts/benchmark-spotify-desktop.sh`
-includes every process whose executable resolves to `/opt/spotify/spotify` and
-rejects a sample if that process set changes during the window. Both scripts
-read:
+the plugin backend processes at sample start, and reads:
 
 - PSS and RSS from `/proc/PID/smaps_rollup` at the end of the window;
 - user plus system CPU ticks from `/proc/PID/stat` before and after; and
@@ -142,18 +145,10 @@ counter, while PowerTOP requires elevated privileges, so no wall-energy claim
 is made.
 
 To reproduce the baseline, disable only this plugin, restart the shell, wait 20
-seconds, and take three samples. Then enable the plugin, restart once more, keep
-all Spotify surfaces closed, and repeat. Open Discover, wait another 20 seconds,
-and take the populated-window samples. Use supported Omarchy commands so the
-comparison exercises the same production loading path. For the desktop-client
-comparison, launch Spotify from a fresh start, wait for Home and its artwork to
-load, then run:
-
-```bash
-for sample in 1 2 3; do
-  ./scripts/benchmark-spotify-desktop.sh "official-home-$sample" 10
-done
-```
+seconds, and take three samples. Then enable the plugin, restart once more,
+keep every plugin surface closed, and repeat. Open Explore, wait another 20
+seconds, and take the populated-window samples. Use supported Omarchy commands
+so the comparison exercises the same production loading path.
 
 ## Raw samples used
 
@@ -178,7 +173,7 @@ production-idle-paired-2,10.004134,398679,636448,0,0,398679,636448,0.700,40.583
 production-idle-paired-3,10.001837,398812,636584,0,0,398812,636584,1.000,47.191
 ```
 
-The baseline/UI rows omit zero-valued spotifyd columns for readability and are
+The historical baseline/UI rows omit zero-valued spotifyd columns and are
 `state,seconds,total_pss_kib,total_rss_kib,cpu_percent,switches_per_second`.
 The official-client rows are
 `state,seconds,process_count,pss_kib,rss_kib,cpu_percent,switches_per_second`.
@@ -201,9 +196,8 @@ backend-optimized-playing-3,10.002246,1804726,backend,1832381,434660,669428,1716
 
 ## Disk footprint
 
-The stripped plugin backend built on this host is 9.12 MiB. Arch's spotifyd
-0.4.2 package reports an 11.34 MiB installed size; both use audio and TLS
-libraries already present on Omarchy. For scale only, the installed proprietary
-Spotify desktop package on the same host reports 368.51 MiB. Disk footprint is
-not a substitute for runtime measurement, but it illustrates why the plugin
-avoids shipping a browser runtime.
+The stripped plugin backend built on this host is 9.12 MiB and uses the audio
+and TLS libraries already present on Omarchy. For historical scale only, the
+proprietary Spotify desktop package on the same host reported 368.51 MiB. Disk
+footprint is not a substitute for runtime measurement, but it illustrates why
+the plugin avoids shipping a browser runtime.

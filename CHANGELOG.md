@@ -9,6 +9,15 @@ record Navidrome-relevant behavior only. The bullet list under this section
 describes the inherited baseline and is reduced as the port removes or
 replaces capabilities.
 
+Removal pass (10 November 2026, once the package 5 Subsonic replacements
+existed): the Web API transport (`SpotifyApi.qml`) and its OAuth shim,
+Spotify Connect (`SpotifyConnectManager.qml`, local discovery helper, Devices
+view, Sonos control), the spotifyd fallback chain (unit, patches,
+`config/spotifyd.conf`, configure script, credential-file actions), the
+legacy `clientId` setting, and the Spotify-only benchmark comparator were
+deleted. The engine unit is the single playback runtime; the socket-first
+startup diagnostics and restart bounds carry over unchanged.
+
 ## 1.0.4 (unreleased, Spotify baseline)
 
 

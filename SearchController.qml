@@ -14,7 +14,7 @@ Item {
   signal checkSavedItems(var items)
   function safeError(error) { return Api.redact(error) }
   property string searchQuery: ""
-  property var searchGroups: Api.searchGroups({}, 128)
+  property var searchGroups: Api.searchGroups()
   property string searchError: ""
   property string searchResultQuery: ""
   property string searchActiveType: "track"
@@ -77,12 +77,12 @@ Item {
       api.cancelSearch()
       searchGeneration++
       searchResultQuery = normalized
-      searchGroups = Api.searchGroups({}, 128)
+      searchGroups = Api.searchGroups()
       searchLoadedTypes = ({})
     }
     if (force === true) {
       var refreshedGroups = Api.shallowCopy(searchGroups)
-      refreshedGroups[value] = Api.normalizeSearchPage({}, value, 128)
+      refreshedGroups[value] = { items: [], next: "", total: 0 }
       searchGroups = refreshedGroups
       var refreshedTypes = Api.shallowCopy(searchLoadedTypes)
       refreshedTypes[value] = false
@@ -116,7 +116,7 @@ Item {
             if (row) rows.push(row)
           }
         }
-        var groups = Api.searchGroups({}, 128)
+        var groups = Api.searchGroups()
         groups[value] = { items: rows, next: "", total: rows.length }
         var error = result && result.ok === true
           ? "" : String(result && result.errorMessage || "Search failed")
@@ -134,7 +134,7 @@ Item {
         var groups = result && result.ok === true
           ? Api.subsonicSearchGroups(result.results, value, root.subsonicArt,
             20, 0)
-          : Api.searchGroups({}, 128)
+          : Api.searchGroups()
         root.deliverSearch(groups, error, normalized, value)
       })
   }
@@ -202,7 +202,7 @@ Item {
     pageRequest = null
     searchLoading = false
     searchQuery = ""
-    searchGroups = Api.searchGroups({}, 128)
+    searchGroups = Api.searchGroups()
     searchError = ""
     searchResultQuery = ""
     searchActiveType = "track"

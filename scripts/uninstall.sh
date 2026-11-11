@@ -39,12 +39,12 @@ omarchy restart shell
 
 hypr_config="$HOME/.config/hypr"
 if command -v rg >/dev/null 2>&1 && [[ -d $hypr_config ]] \
-    && rg -q 'quickshell\.spotify|Omarchy Navidrome' "$hypr_config"; then
+    && rg -q 'quickshell\.spotify|omarchy-navidrome' "$hypr_config"; then
   echo >&2
-  echo "Legacy Omarchy Navidrome references remain in Hyprland config:" >&2
-  rg -n 'quickshell\.spotify|Omarchy Navidrome' "$hypr_config" >&2 || true
+  echo "Legacy references remain in Hyprland config:" >&2
+  rg -n 'quickshell\.spotify|omarchy-navidrome' "$hypr_config" >&2 || true
   echo "Remove those custom lines (and their dotfiles source), then run hyprctl reload." >&2
 fi
 
 echo "Omarchy Navidrome's plugin data and runtime have been completely uninstalled."
-echo "External source checkouts, other plugins, and the spotifyd package were left alone."
+echo "External source checkouts, other plugins, and unrelated configuration were left alone."

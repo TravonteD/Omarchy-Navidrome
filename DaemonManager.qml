@@ -1,12 +1,10 @@
 import QtQuick
-import Quickshell
 import Quickshell.Io
 
 import "Api.js" as Api
 
-// Owns only short-lived runtime/authentication commands. The plugin backend
-// (or its spotifyd fallback) is supervised by a user unit and is never launched
-// as an untracked child of the shell.
+// Owns only short-lived runtime commands. The plugin backend is supervised by
+// a user unit and is never launched as an untracked child of the shell.
 Item {
   id: root
 
@@ -24,10 +22,7 @@ Item {
   property bool binaryChecked: false
   property bool unitAvailable: false
   property bool unitChecked: false
-  property bool usingFallbackRuntime: false
   property bool automaticSetupAttempted: false
-  property bool credentialsAvailable: false
-  property bool credentialsChecked: false
   property bool serviceActive: false
   readonly property bool requirementsChecked: binaryChecked && unitChecked
   readonly property bool playbackReady: binaryAvailable && unitAvailable
@@ -35,11 +30,6 @@ Item {
   readonly property bool running: mprisPresent || serviceActive
   property bool busy: false
   property bool setupBusy: false
-  // Transitional always-false flags: the browser authorization flow was
-  // removed with the OAuth machinery (package 2). They stay declared because
-  // the setup UI still reads them; the cleanup pass drops them.
-  property bool authenticationBusy: false
-  property bool credentialsClearBusy: false
   property bool configurationBusy: false
   property bool configurationPending: false
   property bool startAfterConfiguration: false
@@ -53,12 +43,6 @@ Item {
   signal stopped()
   signal setupSucceeded()
   signal setupFailed(string reason)
-  // Transitional: never emitted since the OAuth authorization flow was
-  // removed; the Connections in Service.qml stay for the interim.
-  signal authenticationSucceeded()
-  signal authenticationFailed(string reason)
-  signal credentialsCleared()
-  signal credentialsClearFailed(string reason)
 
   function safeError(value) {
     return Api.redact(String(value || ""))
@@ -79,7 +63,6 @@ Item {
         pluginDir + "/scripts/playback-runtime.sh", "unit"]
       unitCheck.running = true
     }
-    checkCredentials()
     requestConfiguration()
   }
 
@@ -90,7 +73,7 @@ Item {
   function installPlaybackBackendIfNeeded() {
     if (automaticSetupAttempted || setupBusy || !pluginDir
         || !requirementsChecked) return
-    if (playbackReady && !usingFallbackRuntime) return
+    if (playbackReady) return
     automaticSetupAttempted = true
     setupPlayback()
   }
@@ -106,16 +89,6 @@ Item {
   function requestConfiguration() {
     configurationPending = true
     configurationDelay.restart()
-  }
-
-  function checkCredentials() {
-    if (!pluginDir || credentialsCheck.running) return
-    // Build this path at launch. pluginDir is assigned after the child Process
-    // exists, and a stale initial binding can otherwise run /scripts/... and
-    // incorrectly report that a saved playback authorization is missing.
-    credentialsCheck.command = ["/usr/bin/bash",
-      pluginDir + "/scripts/playback-runtime.sh", "credentials"]
-    credentialsCheck.running = true
   }
 
   function refreshStatus() {
@@ -162,32 +135,15 @@ Item {
     // Omarchy's Audio panel remains the sole owner of desktop audio routing.
     configurationInput = String(deviceName) + "\n" + String(bitrateKbps) + "\n"
     configurationBusy = true
-    configWriter.command = [pluginDir + "/scripts/configure-spotifyd.sh"]
+    configWriter.command = [pluginDir + "/scripts/configure-backend.sh"]
     configWriter.running = true
   }
 
   function stop() {
-    if (busy && !credentialsClearBusy) return
+    if (busy) return
     lastError = ""
     busy = true
     stopCommand.running = true
-  }
-
-  function cancelAuthentication() {
-    // Transitional no-op: the spotifyd OAuth authorization flow was removed
-    // with package 2. Service.qml's cancel path still calls this.
-  }
-
-  function clearCredentials() {
-    if (credentialsClearBusy) return
-    credentialsClearBusy = true
-    busy = true
-    lastError = ""
-    // Only the spotifyd fallback's saved OAuth files are cleared here; the
-    // Navidrome keyring credential set is cleared by AuthManager.logout().
-    clearCredentialsCommand.command = ["/usr/bin/bash",
-      pluginDir + "/scripts/playback-runtime.sh", "logout"]
-    clearCredentialsCommand.running = true
   }
 
   onMprisPresentChanged: {
@@ -258,8 +214,6 @@ Item {
       root.unitAvailable = exitCode === 0
       root.unitChecked = true
       if (unit) root.unitName = unit
-      root.usingFallbackRuntime = exitCode === 0
-        && unit === "omarchy-navidrome-spotifyd.service"
       if (exitCode === 0) root.requestConfiguration()
       root.installPlaybackBackendIfNeeded()
     }
@@ -322,22 +276,14 @@ Item {
       var code = String(failureOutput.text || "").trim()
       var messages = {
         invalid_configuration: "Playback configuration is invalid. Review Settings, then start this computer again.",
-        missing_credentials: "Authorize playback on this computer in Settings.",
+        missing_credentials: "Set up your Navidrome connection in Settings.",
         reconnect_exhausted: "Playback lost its connection repeatedly. Check the network, then start this computer again.",
-        restart_limit: "Playback stopped after repeated failures. Check your network, Premium account and playback authorization, then start this computer again."
+        restart_limit: "Playback stopped after repeated failures. Check your network and server connection, then start this computer again."
       }
       if (messages[code]) {
         root.terminalFailure = true
         root.lastError = messages[code]
       }
-    }
-  }
-
-  Process {
-    id: credentialsCheck
-    onExited: function(exitCode) {
-      root.credentialsAvailable = exitCode === 0
-      root.credentialsChecked = true
     }
   }
 
@@ -369,26 +315,6 @@ Item {
       root.busy = false
       if (exitCode === 0) root.stopped()
       else root.lastError = "Could not stop playback on this computer"
-    }
-  }
-
-  Process {
-    id: clearCredentialsCommand
-    stdout: StdioCollector { waitForEnd: true }
-    stderr: StdioCollector { waitForEnd: true }
-    onExited: function(exitCode) {
-      root.credentialsClearBusy = false
-      root.busy = false
-      root.serviceActive = false
-      if (exitCode === 0) {
-        root.credentialsAvailable = false
-        root.credentialsChecked = true
-        root.credentialsCleared()
-      } else {
-        root.lastError = "Could not clear the saved playback session"
-        root.credentialsClearFailed(root.lastError)
-        root.checkCredentials()
-      }
     }
   }
 }

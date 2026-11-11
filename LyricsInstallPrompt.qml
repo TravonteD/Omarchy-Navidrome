@@ -49,7 +49,7 @@ Item {
       text: root.availability === "disabled"
         ? "Omasing is already installed. Enable it and add its widget to the center of your bar?"
         : (root.availability === "ready"
-          ? "The plugin is installed, but Spotify could not open its lyrics window."
+          ? "The plugin is installed, but its lyrics window could not be opened."
           : "Lyrics are provided by the optional Omasing plugin. Install and enable it now?")
       color: root.muted
       font.family: Style.font.family

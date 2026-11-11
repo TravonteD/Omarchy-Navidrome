@@ -11,7 +11,7 @@ jobs:
     container:
       image: archlinux:base-devel@sha256:84cd9ef000b3cff245ec028e87965b84724f4bf1cc63fc2741ba927b88515ed6
     env:
-      CARGO_TARGET_DIR: /tmp/spotify-target
+      CARGO_TARGET_DIR: /tmp/navidrome-target
       OMARCHY_PATH: /usr/share/omarchy
       QT_QPA_PLATFORM: offscreen
     steps:
@@ -34,7 +34,7 @@ jobs:
       - name: Validate the exact checkout
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          mkdir -p /tmp/spotify-runtime
-          chmod 700 /tmp/spotify-runtime
-          export XDG_RUNTIME_DIR=/tmp/spotify-runtime
+          mkdir -p /tmp/navidrome-runtime
+          chmod 700 /tmp/navidrome-runtime
+          export XDG_RUNTIME_DIR=/tmp/navidrome-runtime
           bash scripts/test.sh

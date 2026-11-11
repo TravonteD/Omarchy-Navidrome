@@ -7,9 +7,8 @@ import Quickshell.Services.Mpris
 import "Api.js" as Api
 import "Subsonic.js" as Subsonic
 
-// Shared state for the bar widget and the lazy full panel. MPRIS supplies local
-// playback changes. External Spotify Connect playback is refreshed only while
-// a UI is visible (or while a known remote item is actively playing).
+// Shared state for the bar widget and the lazy full panel. MPRIS supplies
+// local playback changes from the plugin's stream engine.
 Item {
   id: root
 
@@ -50,8 +49,7 @@ Item {
     scrollSpeed: "1",
     maxBarTextWidth: "240",
     fixedBarWidth: "Off",
-    audioQuality: "320 kbps",
-    clientId: ""
+    audioQuality: "320 kbps"
   })
   property var settings: Api.shallowCopy(defaultSettingValues)
 
@@ -101,7 +99,6 @@ Item {
   property bool pluginSessionKeysPendingStrip: false
 
   readonly property alias auth: authManager
-  readonly property alias api: spotifyApi
   readonly property alias daemon: daemonManager
   readonly property alias backend: backendClient
   readonly property bool accountConnected: authManager.loggedIn
@@ -111,41 +108,50 @@ Item {
   readonly property bool loginBusy: daemonManager.setupBusy
     || authManager.loginBusy
     || authManager.sessionBusy || !authManager.sessionChecked
-    || daemonManager.authenticationBusy || daemonManager.credentialsClearBusy
-    || !daemonManager.credentialsChecked || !daemonManager.requirementsChecked
+    || !daemonManager.requirementsChecked
   readonly property string loginProgress: loginProgressText()
 
   readonly property var mprisPlayers: Mpris.players ? Mpris.players.values : []
-  readonly property var activePlayer: spotifydPlayer()
-  readonly property bool hasLocalPlayer: activePlayer !== null
-  property var remotePlayback: null
-  property bool remotePlaybackLoading: false
-  property var remotePlaybackWaiters: []
-  property var rememberedRemoteVolumeDevice: null
-  property real rememberedRemoteVolumePercent: -1
-  property var pendingRemoteSeek: null
-  property var pendingRemoteVolume: null
   property real pendingSliderVolume: -1
   property double pendingSliderUntil: 0
   property bool volumeFlushQueued: false
   property real queuedVolumeSlider: 0
   property bool volumeFlushCooling: false
   property bool volumeLiveActive: false
-  property int remoteControlSerial: 0
-  readonly property int remoteControlGraceMs: 8000
-  property string remoteVolumeProbeKey: ""
+  readonly property int sliderGraceMs: 8000
   property int playbackPositionTick: 0
-  property string remoteControlDiscoveryKey: ""
-  readonly property var remoteTrack: remotePlayback ? remotePlayback.item : null
-  readonly property var currentArtists: remoteTrack
-    && (useRemotePlayback || (currentTrackId !== ""
-      && String(remoteTrack.id || "") === currentTrackId))
-    ? Api.arrayValues(remoteTrack.artists) : []
-  readonly property bool currentArtistContextAvailable: Api.artistContextAvailable(
-    useRemotePlayback && remoteTrack ? remoteTrack.type : "",
-    currentTrackId, currentArtists)
-  readonly property bool currentAlbumContextAvailable: album !== ""
-    && currentTrackId !== ""
+  readonly property var activePlayer: enginePlayer()
+  readonly property bool hasLocalPlayer: activePlayer !== null
+  readonly property bool hasPlayer: hasLocalPlayer
+  readonly property bool hasMedia: hasLocalPlayer
+    && !!(activePlayer.trackTitle || activePlayer.trackArtist)
+  readonly property bool playing: hasLocalPlayer && activePlayer.isPlaying
+  readonly property int playbackState: hasPlayer
+    ? activePlayer.playbackState : MprisPlaybackState.Stopped
+  readonly property string title: hasLocalPlayer
+    ? String(activePlayer.trackTitle || "") : ""
+  readonly property string artist: hasLocalPlayer
+    ? String(activePlayer.trackArtist || "") : ""
+  readonly property string album: hasLocalPlayer
+    ? String(activePlayer.trackAlbum || "") : ""
+  readonly property string artUrl: hasLocalPlayer
+    ? String(activePlayer.trackArtUrl || "") : ""
+  readonly property real positionSeconds: {
+    playbackPositionTick
+    return hasLocalPlayer && activePlayer.positionSupported
+      ? Math.max(0, Number(activePlayer.position) || 0) : 0
+  }
+  readonly property real lengthSeconds: hasLocalPlayer
+    && activePlayer.lengthSupported
+    ? Math.max(0, Number(activePlayer.length) || 0) : 0
+  readonly property real playbackVolume: hasLocalPlayer
+    && activePlayer.volumeSupported
+    ? Math.max(0, Math.min(1, Number(activePlayer.volume) || 0)) : 0
+  readonly property real reportedSliderVolume: playbackVolume
+  readonly property real volume: pendingSliderVolume >= 0
+    ? pendingSliderVolume : reportedSliderVolume
+  readonly property bool volumePending: pendingSliderVolume >= 0
+  onReportedSliderVolumeChanged: reconcilePendingSliderVolume()
   readonly property var currentLyricsSong: Api.lyricsSong(currentTrackId,
     title, artist, album, lengthSeconds, artUrl, positionSeconds)
   readonly property bool lyricsAvailable: showLyrics && currentLyricsSong !== null
@@ -167,116 +173,17 @@ Item {
   property var pendingLyricsSong: null
   property int lyricsPluginLaunchAttempts: 0
   property double lyricsPluginInstallStartedAt: 0
-  readonly property var currentAlbumItem: remoteTrack
-    && (useRemotePlayback || (currentTrackId !== ""
-      && String(remoteTrack.id || "") === currentTrackId))
-    ? remoteTrack.albumItem : null
-  readonly property var remoteDevice: remotePlayback ? remotePlayback.device : null
-  readonly property bool remotePlaybackIsLocal: !!remoteDevice
-    && Api.isLocalPlaybackDevice(remoteDevice, deviceName,
-      localRuntimeDeviceName, localDeviceId)
-  readonly property bool useRemotePlayback: !!remotePlayback
-    && !!remoteDevice && remoteDevice.active === true
-    && !remotePlaybackIsLocal
-    && !(hasLocalPlayer && activePlayer.isPlaying)
-  readonly property bool hasPlayer: useRemotePlayback || hasLocalPlayer
-  readonly property bool hasMedia: useRemotePlayback
-    ? !!remoteTrack
-    : (hasLocalPlayer && !!(activePlayer.trackTitle || activePlayer.trackArtist))
-  readonly property bool playing: useRemotePlayback
-    ? remotePlayback.playing === true
-    : (hasLocalPlayer && activePlayer.isPlaying)
-  readonly property int playbackState: hasPlayer
-    ? (useRemotePlayback
-      ? (remotePlayback.playing ? MprisPlaybackState.Playing : MprisPlaybackState.Paused)
-      : activePlayer.playbackState)
-    : MprisPlaybackState.Stopped
-  readonly property string title: useRemotePlayback && remoteTrack
-    ? String(remoteTrack.name || "")
-    : (hasLocalPlayer ? String(activePlayer.trackTitle || "") : "")
-  readonly property string artist: useRemotePlayback && remoteTrack
-    ? String(remoteTrack.subtitle || "")
-    : (hasLocalPlayer ? String(activePlayer.trackArtist || "") : "")
-  readonly property string album: useRemotePlayback && remoteTrack
-    ? String(remoteTrack.album || "")
-    : (hasLocalPlayer ? String(activePlayer.trackAlbum || "") : "")
-  readonly property string artUrl: useRemotePlayback && remoteTrack
-    ? String(remoteTrack.imageUrl || "")
-    : (hasLocalPlayer ? String(activePlayer.trackArtUrl || "") : "")
-  readonly property real positionSeconds: {
-    playbackPositionTick
-    if (!useRemotePlayback) return hasLocalPlayer && activePlayer.positionSupported
-      ? Math.max(0, Number(activePlayer.position) || 0) : 0
-    var value = Api.displayedRemotePosition(remotePlayback,
-      pendingRemoteSeek, Date.now())
-    var maximum = remoteTrack ? Math.max(0, Number(remoteTrack.durationMs) || 0) / 1000 : 0
-    return maximum > 0 ? Math.min(maximum, value) : value
-  }
-  readonly property real lengthSeconds: useRemotePlayback && remoteTrack
-    ? Math.max(0, Number(remoteTrack.durationMs) || 0) / 1000
-    : (hasLocalPlayer && activePlayer.lengthSupported
-      ? Math.max(0, Number(activePlayer.length) || 0) : 0)
-  readonly property real playbackVolume: useRemotePlayback && remoteDevice
-    ? displayedRemoteVolumePercent(remoteDevice) / 100
-    : (hasLocalPlayer && activePlayer.volumeSupported
-      ? Math.max(0, Math.min(1, Number(activePlayer.volume) || 0)) : 0)
-  readonly property real reportedSliderVolume: useRemotePlayback
-    ? playbackVolume : Api.spotifydVolumeToSlider(playbackVolume)
-  readonly property real volume: pendingSliderVolume >= 0
-    ? pendingSliderVolume : reportedSliderVolume
-  readonly property bool volumePending: pendingSliderVolume >= 0
-  onReportedSliderVolumeChanged: reconcilePendingSliderVolume()
-  onUseRemotePlaybackChanged: {
-    clearPendingSliderVolume()
-    volumeFlushQueued = false
-    volumeFlushCooling = false
-    volumeLiveActive = false
-    if (volumeFlushTimer) volumeFlushTimer.stop()
-    if (volumeLiveIdleTimer) volumeLiveIdleTimer.stop()
-  }
-  readonly property bool shuffle: useRemotePlayback
-    ? remotePlayback.shuffle === true
-    : (hasLocalPlayer && activePlayer.shuffleSupported
-      ? activePlayer.shuffle === true : false)
-  readonly property string repeatMode: useRemotePlayback
-    ? String(remotePlayback.repeatMode || "off") : mprisRepeatMode()
-  readonly property string currentUri: useRemotePlayback && remoteTrack
-    ? String(remoteTrack.uri || "") : metadataString("xesam:url")
-  readonly property string currentExternalUrl: useRemotePlayback && remoteTrack
-    ? String(remoteTrack.externalUrl || spotifyWebUrl(currentUri)) : spotifyWebUrl(currentUri)
+  readonly property bool shuffle: hasLocalPlayer && activePlayer.shuffleSupported
+    ? activePlayer.shuffle === true : false
+  readonly property string repeatMode: mprisRepeatMode()
+  readonly property string currentUri: metadataString("xesam:url")
   readonly property string currentTrackId: {
-    // When a remote device owns playback, stale metadata from an idle local
-    // player must not turn a podcast episode into a song.
-    if (useRemotePlayback) {
-      if (!remoteTrack || remoteTrack.type !== "track") return ""
-      return Api.spotifyTrackId(remoteTrack.uri)
-        || String(remoteTrack.id || "").trim()
-    }
-
-    var id = Api.spotifyTrackId(currentUri)
-    if (id) return id
-
     // The Navidrome stream engine publishes the Subsonic song id as xesam:url
-    // (the MPRIS track id is a lossy object path). The interim spotifyd
-    // fallback keeps Spotify-shaped ids until the cleanup pass.
-    if (!daemonManager.usingFallbackRuntime) {
-      var subsonic = String(currentUri || "").trim()
-      if (subsonic && Api.spotifyTrackId(subsonic) === "") return subsonic
-      return remoteTrack && remotePlaybackIsLocal && remoteTrack.type === "track"
-        ? String(remoteTrack.id || "").trim() : ""
-    }
-
-    // spotifyd exposes the recording as an MPRIS object path such as
-    // /spotify/track/<id>, but does not currently publish xesam:url.
-    id = Api.spotifyTrackId(metadataString("mpris:trackid"))
-    if (id) return id
-
-    return remoteTrack && remotePlaybackIsLocal && remoteTrack.type === "track"
-      ? String(remoteTrack.id || "").trim() : ""
+    // (the MPRIS track id is a lossy object path).
+    return String(currentUri || "").trim()
   }
   readonly property var currentTrackItem: Api.currentPlaybackTrack(
-    currentTrackId, remoteTrack, title, artist, album, artUrl,
-    lengthSeconds, currentExternalUrl)
+    currentTrackId, title, artist, album, artUrl, lengthSeconds)
   readonly property string currentTrackItemUri: currentTrackItem
     ? String(currentTrackItem.uri || "") : ""
   readonly property bool currentTrackSaved: isSaved(currentTrackItem)
@@ -285,20 +192,19 @@ Item {
     || isSavedBusy(currentTrackItem)
   readonly property bool currentTrackSaveAvailable: !!currentTrackItem
     && authManager.loggedIn && !currentTrackSaveBusy
-  readonly property bool playbackRestricted: useRemotePlayback
-    && remoteDevice && remoteDevice.restricted === true
-  readonly property var sonosControlDevice: findSonosControlDevice()
-  readonly property bool sonosControlAvailable: useRemotePlayback
-    && playbackRestricted && !!sonosControlDevice
-  readonly property bool playbackControllable: hasPlayer
-    && (!playbackRestricted || sonosControlAvailable)
-  readonly property bool volumeSupported: useRemotePlayback
-    ? !!remoteDevice && remoteDevice.supportsVolume === true
-      && (!playbackRestricted || sonosControlAvailable)
-    : (hasLocalPlayer && activePlayer.volumeSupported)
-  readonly property string playbackDeviceName: useRemotePlayback && remoteDevice
-    ? Api.playbackDeviceDisplayName(remoteDevice, spotifyConnectManager.devices)
-    : (hasLocalPlayer ? deviceName : "")
+  readonly property bool playbackControllable: hasLocalPlayer
+  readonly property bool volumeSupported: hasLocalPlayer
+    && activePlayer.volumeSupported
+  readonly property string playbackDeviceName: hasLocalPlayer ? deviceName : ""
+  // The current track's artist/album context rows: MPRIS metadata carries no
+  // ids, so the footer's go-to-artist/go-to-album buttons resolve by name
+  // through bounded search3 reads (currentContext below).
+  readonly property var currentArtists: []
+  readonly property var currentAlbumItem: null
+  readonly property bool currentArtistContextAvailable: Api.artistContextAvailable(
+    "track", currentTrackId, currentArtists)
+  readonly property bool currentAlbumContextAvailable: album !== ""
+    && currentTrackId !== ""
 
   property var playlists: []
   property string playlistsNext: ""
@@ -318,18 +224,8 @@ Item {
   property string currentUserId: ""
   property string currentUserName: ""
   readonly property string playlistItemsEmptyMessage: Api.playlistItemsEmptyMessage(
-    selectedPlaylist, playlistItems.length, playlistItemsError,
-    playlistItemsStatus, currentUserId)
+    selectedPlaylist, playlistItems.length, playlistItemsError)
   property var queue: []
-  property var devices: []
-  property var apiDevices: []
-  property string pendingDeviceLoadError: ""
-  property var deviceLoadWaiters: []
-  property bool pendingDeviceDiscover: false
-  property string selectedDeviceId: ""
-  property bool selectedDeviceExplicit: false
-  property string localDeviceId: ""
-  property string localRuntimeDeviceName: "Omarchy Navidrome"
   property alias searchQuery: searchController.searchQuery
   property alias searchGroups: searchController.searchGroups
   property alias searchError: searchController.searchError
@@ -420,14 +316,12 @@ Item {
   property bool savedAlbumsLoaded: false
   property bool followedArtistsLoaded: false
   property bool queueLoaded: false
-  property bool devicesLoaded: false
   property bool playlistsLoading: false
   property bool savedTracksLoading: false
   property bool savedAlbumsLoading: false
   property bool followedArtistsLoading: false
   property bool playlistItemsLoading: false
   property bool queueLoading: false
-  property bool devicesLoading: false
   property alias searchLoading: searchController.searchLoading
   // Subsonic has no rate-limit cooldown machinery; the scan controller keeps
   // its cooldown input shape and simply never waits.
@@ -453,30 +347,18 @@ Item {
   property var visibleSurfaces: ({})
   readonly property bool uiVisible: Object.keys(visibleSurfaces).length > 0
   property double lastActivityAt: Date.now()
-  property var pendingPlayback: null
-  property var pendingPlaybackBody: null
   // Protocol v2 load body derived from the same play request; the local
-  // socket path sends this instead of the Spotify-shaped playback body.
+  // socket path sends it.
   property var pendingPlaybackLoad: null
   property string pendingPlaybackMessage: ""
   property var pendingPlaybackRadio: null
   property int pendingPlaybackSerial: 0
   property int radioSerial: 0
   property var lastRadioPlaylist: null
-  property bool radioContextSelected: false
-  readonly property bool lastRadioPlaying: !!lastRadioPlaylist
-    && radioContextSelected && playing
+  readonly property bool lastRadioPlaying: !!lastRadioPlaylist && playing
   property bool localActivationRequested: false
-  property int deviceProbeAttempts: 0
   property int localSocketWaitAttempts: 0
-  property int visibleLocalDeviceRefreshAttempts: 0
   property bool loginFlowActive: false
-  property string pendingConnectDeviceId: ""
-  property int connectActivationAttempts: 0
-  property bool pendingConnectWakeTried: false
-
-  readonly property bool deviceActivationBusy: spotifyConnectManager.activating
-    || (!!pendingConnectDeviceId && spotifyConnectManager.controlling)
 
   readonly property int cacheLimit: 200
 
@@ -487,14 +369,11 @@ Item {
 
   function loginProgressText() {
     if (daemonManager.setupBusy) return "Preparing playback on this computer"
-    if (daemonManager.credentialsClearBusy) return "Signing out"
     if (authManager.loginBusy) return "Saving your Navidrome connection"
     if (authManager.sessionBusy || !authManager.sessionChecked)
       return "Checking your saved Navidrome connection"
-    if (!daemonManager.requirementsChecked || !daemonManager.credentialsChecked)
+    if (!daemonManager.requirementsChecked)
       return "Checking local playback"
-    if (daemonManager.authenticationBusy)
-      return "Approve local playback in your browser"
     return fullyConnected ? "Connected to Navidrome" : "Ready to connect"
   }
 
@@ -511,7 +390,7 @@ Item {
     var keys = ["deviceName", "idleShutdownMinutes", "showMiniPlayer",
       "showVinylRecord", "shortcutPlayer", "shortcutHints", "showLyrics", "showArtwork", "showTrackTitle", "showArtistName",
       "showPausedTrack", "scrollBarText", "scrollSpeed", "maxBarTextWidth",
-      "fixedBarWidth", "audioQuality", "clientId"]
+      "fixedBarWidth", "audioQuality"]
     for (var i = 0; i < keys.length; i++) {
       var key = keys[i]
       if (source[key] !== undefined) next[key] = source[key]
@@ -540,42 +419,16 @@ Item {
     var quality = String(next.audioQuality || "320 kbps")
     next.audioQuality = quality.indexOf("96") === 0 ? "96 kbps"
       : (quality.indexOf("160") === 0 ? "160 kbps" : "320 kbps")
-    // Legacy Spotify-only setting kept so existing settings files load; the
-    // OAuth machinery that consumed it was removed in the Navidrome port and
-    // the settings cleanup pass deletes the key.
     return next
-  }
-
-  function relabelLocalDevices(source, previousName, nextName) {
-    var rows = Array.isArray(source) ? source : []
-    var result = []
-    for (var i = 0; i < rows.length; i++) {
-      var item = rows[i]
-      if (!item) continue
-      var local = item.local === true || Api.isLocalPlaybackDevice(item,
-        previousName, localRuntimeDeviceName, localDeviceId)
-      if (!local) {
-        result.push(item)
-        continue
-      }
-      var copy = Api.shallowCopy(item)
-      copy.name = nextName
-      copy.local = true
-      result.push(copy)
-    }
-    return result
   }
 
   function applySettings(values) {
     var previousDeviceName = deviceName
     var next = normalizedSettings(values)
     if (JSON.stringify(next) !== JSON.stringify(settings)) settings = next
-    if (previousDeviceName !== next.deviceName) {
-      if (daemonManager.running && !localRuntimeDeviceName)
-        localRuntimeDeviceName = previousDeviceName
-      apiDevices = relabelLocalDevices(apiDevices, previousDeviceName, next.deviceName)
-      devices = relabelLocalDevices(devices, previousDeviceName, next.deviceName)
-    }
+    // The backend re-reads device_name/bitrate when the next playback start
+    // writes its configuration (DaemonManager.configureDeviceName).
+    void previousDeviceName
   }
 
   function persistSettings(values) {
@@ -684,22 +537,21 @@ Item {
     resumeLyricsInstallIntent()
   }
 
-  // The Navidrome stream engine publishes its own MPRIS player; the interim
-  // spotifyd fallback keeps its identity until the cleanup pass deletes it.
-  function isLocalEnginePlayer(player) {
+  // The Navidrome stream engine publishes its own MPRIS player; match it by
+  // identity, desktop entry, or bus name.
+  function isEnginePlayer(player) {
     if (!player) return false
     var identity = [player.dbusName, player.desktopEntry, player.identity]
       .join(" ").toLowerCase()
-    return identity.indexOf("spotifyd") !== -1
-      || identity.indexOf("librespot") !== -1
-      || identity.indexOf("navidrome") !== -1
+    return identity.indexOf("navidrome") !== -1
+      || identity.indexOf("omarchy") !== -1
   }
 
-  function spotifydPlayer() {
+  function enginePlayer() {
     var fallback = null
     for (var i = 0; i < mprisPlayers.length; i++) {
       var player = mprisPlayers[i]
-      if (!isLocalEnginePlayer(player)) continue
+      if (!isEnginePlayer(player)) continue
       if (player.isPlaying) return player
       if (!fallback) fallback = player
     }
@@ -709,13 +561,6 @@ Item {
   function metadataString(key) {
     var metadata = activePlayer && activePlayer.metadata ? activePlayer.metadata : null
     return metadata && metadata[key] !== undefined ? String(metadata[key]) : ""
-  }
-
-  function spotifyWebUrl(uri) {
-    var value = String(uri || "")
-    var match = value.match(/^spotify:(track|album|artist|playlist|episode|show|audiobook|chapter):([^:]+)$/)
-    return match ? "https://open.spotify.com/" + match[1] + "/" + match[2]
-      : (value.indexOf("https://open.spotify.com/") === 0 ? value : "")
   }
 
   function mprisRepeatMode() {
@@ -919,50 +764,16 @@ Item {
     lastActivityAt = Date.now()
   }
 
-  function cancelVisibleLocalDeviceRefresh() {
-    visibleLocalDeviceRefreshTimer.stop()
-    visibleLocalDeviceRefreshAttempts = 0
-  }
-
   property bool localPlaybackStopped: false
 
+  // While a player surface is open, keep the local engine up so the mini
+  // player and media keys keep working; the configured idle timeout begins
+  // only after every surface closes.
   function ensureVisibleLocalReceiver() {
     if (localPlaybackStopped || daemonManager.terminalFailure) return
-    var action = Api.visibleLocalReceiverAction(uiVisible,
-      fullyConnected && daemonManager.credentialsAvailable,
+    var action = Api.visibleLocalReceiverAction(uiVisible, fullyConnected,
       daemonManager.running, daemonManager.busy)
-    if (action === "idle") {
-      cancelVisibleLocalDeviceRefresh()
-      return
-    }
     if (action === "start") daemonManager.start()
-    if (action === "refresh") visibleLocalDeviceRefreshAttempts = 0
-    visibleLocalDeviceRefreshTimer.restart()
-  }
-
-  function refreshVisibleLocalDevice() {
-    if (localPlaybackStopped || daemonManager.terminalFailure) return
-    var action = Api.visibleLocalReceiverAction(uiVisible,
-      fullyConnected && daemonManager.credentialsAvailable,
-      daemonManager.running, daemonManager.busy)
-    if (action === "idle") {
-      cancelVisibleLocalDeviceRefresh()
-      return
-    }
-    if (action !== "refresh") {
-      if (action === "start") daemonManager.start()
-      visibleLocalDeviceRefreshTimer.restart()
-      return
-    }
-    loadDevices(function() {
-      if (!root.uiVisible || !root.fullyConnected || root.localDevice()) {
-        root.visibleLocalDeviceRefreshAttempts = 0
-        return
-      }
-      root.visibleLocalDeviceRefreshAttempts++
-      if (root.visibleLocalDeviceRefreshAttempts < 8)
-        visibleLocalDeviceRefreshTimer.restart()
-    })
   }
 
   function setUiVisible(key, value) {
@@ -981,114 +792,14 @@ Item {
   }
 
   function refreshPosition() {
-    if (!useRemotePlayback && activePlayer && activePlayer.positionSupported)
+    if (activePlayer && activePlayer.positionSupported)
       activePlayer.positionChanged()
     else playbackPositionTick++
   }
 
-  function finishRemotePlaybackWaiters(ok) {
-    var pending = remotePlaybackWaiters.slice()
-    remotePlaybackWaiters = []
-    for (var i = 0; i < pending.length; i++) {
-      try { pending[i](ok === true) }
-      catch (e) { /* callers own callback errors */ }
-    }
-  }
-
-  function playbackDeviceKey(device) {
-    var item = device || {}
-    var id = String(item.id || "")
-    if (id) return "id:" + id
-    return "name:" + String(item.name || item.sourceName || "").trim().toLowerCase()
-      + "|" + String(item.type || "").trim().toLowerCase()
-  }
-
-  function rememberRemoteVolume(device, value) {
-    var volumePercent = Api.normalizeVolumePercent(value)
-    if (!device || volumePercent === null) return false
-    rememberedRemoteVolumePercent = volumePercent
-    rememberedRemoteVolumeDevice = {
-      id: String(device.id || ""),
-      name: String(device.name || ""),
-      sourceName: String(device.sourceName || device.name || ""),
-      type: String(device.type || "")
-    }
-    return true
-  }
-
-  function displayedRemoteVolumePercent(device) {
-    if (Api.pendingRemoteVolumeShouldHold(device, pendingRemoteVolume,
-        Date.now()))
-      return Math.max(0, Math.min(100,
-        Number(pendingRemoteVolume.volumePercent) || 0))
-    if (rememberedRemoteVolumePercent >= 0 && rememberedRemoteVolumeDevice
-        && Api.playbackDevicesMatch(rememberedRemoteVolumeDevice, device))
-      return rememberedRemoteVolumePercent
-    var reported = Api.normalizeVolumePercent((device || {}).volumePercent)
-    return reported === null ? 0 : reported
-  }
-
-  function rememberDiscoveredReceiverVolume(device) {
-    var receiver = findDiscoveredReceiver(device)
-    if (!receiver || String(receiver.brand || "").toLowerCase() !== "sonos")
-      return false
-    return rememberRemoteVolume(device, receiver.volumePercent)
-  }
-
-  function remoteControlDeviceSnapshot(device) {
-    var item = device || {}
-    return {
-      id: String(item.id || ""),
-      name: String(item.name || ""),
-      sourceName: String(item.sourceName || item.name || ""),
-      type: String(item.type || "")
-    }
-  }
-
-  function beginRemoteSeek(value) {
-    var serial = ++remoteControlSerial
-    pendingRemoteSeek = {
-      serial: serial,
-      device: remoteControlDeviceSnapshot(remoteDevice),
-      uri: String((remoteTrack && remoteTrack.uri) || ""),
-      positionSeconds: Math.max(0, Number(value) || 0),
-      requestedAt: Date.now(),
-      playing: remotePlayback && remotePlayback.playing === true,
-      expiresAt: Date.now() + remoteControlGraceMs
-    }
-    playbackPositionTick++
-    return serial
-  }
-
-  function beginRemoteVolume(value) {
-    var serial = ++remoteControlSerial
-    var volumePercent = Math.max(0, Math.min(100, Number(value) || 0))
-    pendingRemoteVolume = {
-      serial: serial,
-      device: remoteControlDeviceSnapshot(remoteDevice),
-      volumePercent: volumePercent,
-      expiresAt: Date.now() + remoteControlGraceMs
-    }
-    rememberRemoteVolume(remoteDevice, volumePercent)
-    return serial
-  }
-
-  function clearPendingRemoteSeek(serial) {
-    if (!pendingRemoteSeek
-        || (serial && Number(pendingRemoteSeek.serial) !== Number(serial))) return
-    pendingRemoteSeek = null
-    playbackPositionTick++
-  }
-
-  function clearPendingRemoteVolume(serial) {
-    if (!pendingRemoteVolume
-        || (serial && Number(pendingRemoteVolume.serial) !== Number(serial))) return
-    pendingRemoteVolume = null
-  }
-
   function beginPendingSliderVolume(value) {
     pendingSliderVolume = Math.max(0, Math.min(1, Number(value) || 0))
-    pendingSliderUntil = Date.now() + remoteControlGraceMs
+    pendingSliderUntil = Date.now() + sliderGraceMs
     if (volumeHoldTimer) volumeHoldTimer.restart()
   }
 
@@ -1107,40 +818,14 @@ Item {
       clearPendingSliderVolume()
   }
 
-  function volumeFlushTarget() {
-    if (sonosControlAvailable && sonosControlDevice && sonosControlDevice.id)
-      return "sonos"
-    return useRemotePlayback ? "remote" : "local"
-  }
-
-  // Returns false when the backend could not take the command, so the caller
-  // keeps it queued and retries. Only Sonos rejects this way.
   function sendVolumeCommand(sliderValue) {
-    var localVolume = !useRemotePlayback && hasLocalPlayer
-      && activePlayer.volumeSupported
-    var normalized = localVolume
-      ? Api.sliderToSpotifydVolume(sliderValue) : sliderValue
-    var sonos = volumeFlushTarget() === "sonos"
-    if (sonos && spotifyConnectManager.controlBusy) return false
-    var remoteSerial = 0
-    if (!localVolume && useRemotePlayback && remoteDevice) {
-      var remotePercent = Math.round(normalized * 100)
-      remoteSerial = beginRemoteVolume(remotePercent)
-      var receiver = findDiscoveredReceiver(remoteDevice)
-      if (receiver) spotifyConnectManager.rememberVolume(receiver.id, remotePercent)
+    if (!hasLocalPlayer || !activePlayer.volumeSupported) {
+      // Nothing to talk to: release the pending slider so the displayed
+      // value stops pretending the command was accepted.
+      clearPendingSliderVolume()
+      return true
     }
-    if (sendSonosControl("volume", String(Math.round(normalized * 100)))) return true
-    if (localVolume)
-      activePlayer.volume = normalized
-    else apiAction("PUT", "/me/player/volume",
-      controlQuery({ volume_percent: Math.round(normalized * 100) }),
-      null, "", function(ok) {
-      if (!ok) {
-        root.clearPendingRemoteVolume(remoteSerial)
-        root.clearPendingSliderVolume()
-      }
-      if (!ok || !root.volumeLiveActive) root.loadPlaybackState()
-    })
+    activePlayer.volume = Api.clampUnit(sliderValue)
     return true
   }
 
@@ -1156,105 +841,27 @@ Item {
     if (volumeFlushTimer) volumeFlushTimer.restart()
   }
 
-  function reconcilePendingRemoteControls(state) {
-    var now = Date.now()
-    if (pendingRemoteSeek
-        && !Api.pendingRemoteSeekShouldHold(state, pendingRemoteSeek, now))
-      clearPendingRemoteSeek(Number(pendingRemoteSeek.serial) || 0)
-    if (pendingRemoteVolume
-        && !Api.pendingRemoteVolumeShouldHold(state ? state.device : null,
-          pendingRemoteVolume, now))
-      clearPendingRemoteVolume(Number(pendingRemoteVolume.serial) || 0)
+  // The Web API current-playback fetch died with the Spotify transport.
+  // Playback state comes from the engine's MPRIS player; this remains as the
+  // waiters/refresh hook so callers keep their shape, and it refreshes the
+  // Navidrome resume candidate whenever nothing is playing.
+  function loadPlaybackState(callback) {
+    if (typeof callback === "function") callback(false)
+    if (!hasMedia) root.loadResumeCandidate()
   }
 
-  function applyPlaybackState(payload) {
-    var state = Api.normalizePlaybackState(payload, 192)
-    if (state && state.device) {
-      var device = state.device
-      device.sourceName = device.name
-      device.local = Api.isLocalPlaybackDevice(device, deviceName,
-        localRuntimeDeviceName, localDeviceId)
-      if (device.local && device.id) {
-        localDeviceId = device.id
-        localRuntimeDeviceName = device.name
-      }
-      reconcilePendingRemoteControls(state)
-      if (!rememberDiscoveredReceiverVolume(device))
-        rememberRemoteVolume(device, device.volumePercent)
-    }
-    remotePlayback = state
-    verifyRadioPlaybackContext()
-    var discoveryKey = state && state.device && state.device.active
-        && String(state.device.type).toLowerCase() === "speaker"
-        && (state.device.restricted
-          || Api.spotifyDeviceNameNeedsDiscovery(state.device))
-      ? playbackDeviceKey(state.device)
-      : ""
-    if (discoveryKey && discoveryKey !== remoteControlDiscoveryKey) {
-      remoteControlDiscoveryKey = discoveryKey
-      if (!findDiscoveredReceiver(state.device) && !spotifyConnectManager.loading)
-        spotifyConnectManager.refresh()
-    } else if (!discoveryKey) {
-      remoteControlDiscoveryKey = ""
-    }
-    if (state && state.device && state.device.active === true
-        && lastError === speakerAvailabilityError()) succeed("")
-    playbackPositionTick++
-    if (devicesLoaded || apiDevices.length
-        || (spotifyConnectManager.devices || []).length) mergeConnectDevices()
-    if (state && state.device && state.device.active && !state.device.local
-        && !state.device.restricted
-        && Api.normalizeVolumePercent(state.device.volumePercent) === null
-        && !devicesLoading) {
-      var probeKey = playbackDeviceKey(state.device)
-      if (probeKey && probeKey !== remoteVolumeProbeKey) {
-        remoteVolumeProbeKey = probeKey
-        loadDevices()
-      }
-    }
-  }
-
-  function loadPlaybackState(callback, reportError) {
-    if (typeof callback === "function") {
-      var waiters = remotePlaybackWaiters.slice()
-      waiters.push(callback)
-      remotePlaybackWaiters = waiters
-    }
-    if (remotePlaybackLoading) return
-    var expected = dataSerial
-    remotePlaybackLoading = true
-    spotifyApi.request("GET", "/me/player", { additional_types: "episode" }, null,
-      function(status, payload, error) {
-        root.remotePlaybackLoading = false
-        if (expected !== root.dataSerial) {
-          root.finishRemotePlaybackWaiters(false)
-          return
-        }
-        if (!error) root.applyPlaybackState(payload)
-        else if (reportError === true) root.fail(error)
-        // The Navidrome resume candidate (most recent album) refreshes on the
-        // same cadence whenever nothing is playing.
-        if (!root.hasMedia) root.loadResumeCandidate()
-        root.finishRemotePlaybackWaiters(!error)
-      })
-  }
-
+  // The Web API remote-control paths died with the Spotify transport; with
+  // only the engine's MPRIS player left, every control below acts on the
+  // local player directly. apiAction stays as a typed inert no-op so no
+  // caller can accidentally reach a network path that no longer exists.
   function apiAction(method, path, query, body, successText, callback) {
-    noteActivity()
-    spotifyApi.request(method, path, query, body, function(status, payload, error) {
-      if (error) {
-        root.fail(error)
-        if (typeof callback === "function") callback(false, payload)
-        return
-      }
-      root.succeed(successText)
-      if (typeof callback === "function") callback(true, payload)
-    })
+    void method; void path; void query; void body; void successText
+    if (typeof callback === "function") callback(false)
   }
 
   function normalizedView(view) {
     var value = String(view || "search")
-    return ["home", "discover", "search", "library", "playlists", "detail", "queue", "devices", "setup"].indexOf(value) >= 0
+    return ["home", "discover", "search", "library", "playlists", "detail", "queue", "setup"].indexOf(value) >= 0
       ? value : "search"
   }
 
@@ -1263,7 +870,7 @@ Item {
   // network request; the explicit refresh control can still force one.
   function openView(view, force) {
     activeView = normalizedView(view)
-    if (!authManager.loggedIn && !authManager.tokenIsFresh()) return
+    if (!authManager.loggedIn) return
     if (activeView === "home" && (force || !homeLoaded))
       loadHome()
     else if (activeView === "discover" && (force || !discoverLoaded))
@@ -1276,9 +883,6 @@ Item {
       loadPlaylists(false)
     else if (activeView === "queue" && (force || !queueLoaded))
       loadQueue()
-    else if (activeView === "devices") {
-      loadDevices(null, undefined, true)
-    }
   }
 
   function refreshView(view) {
@@ -1338,24 +942,9 @@ Item {
   function rememberRadioPlaylist(value) {
     if (!validRadioPlaylist(value)) return
     lastRadioPlaylist = value
-    radioContextSelected = false
     var state = Api.shallowCopy(sessionState)
     state.lastRadioPlaylist = value
     persistSession(state)
-  }
-
-  function verifyRadioPlaybackContext() {
-    if (!validRadioPlaylist(lastRadioPlaylist)) {
-      radioContextSelected = false
-      return
-    }
-    var expectedPlaylist = lastRadioPlaylist
-    var contextUri = remotePlayback ? String(remotePlayback.contextUri || "") : ""
-    var contextType = remotePlayback ? String(remotePlayback.contextType || "") : ""
-    var contextHref = remotePlayback ? String(remotePlayback.contextHref || "") : ""
-    radioContextSelected = contextUri === String(expectedPlaylist.uri)
-      || (contextType === "playlist"
-        && contextHref.indexOf("/playlists/" + expectedPlaylist.id) >= 0)
   }
 
   // Opening a panel surface refreshes the login-driven state only then; the
@@ -1366,7 +955,6 @@ Item {
     if (!authManager.loggedIn) return
     root.loadProfile()
     root.loadSidebarPlaylists()
-    root.verifyRadioPlaybackContext()
     root.openView(root.activeView, false)
   }
 
@@ -2121,7 +1709,7 @@ Item {
 
     if (type === "artist") {
       // getArtist answers the discography; getTopSongs answers the popular
-      // songs the Spotify "top tracks" section used to hold.
+      // songs the artist page's songs section shows.
       root.findArtistMusic(initialArtistQuery, serial, item)
       return
     }
@@ -2585,228 +2173,6 @@ Item {
     }, { priority: "interactive" })
   }
 
-  function findDiscoveredReceiver(playbackDevice) {
-    var target = playbackDevice || null
-    if (!target) return null
-    var receivers = spotifyConnectManager.devices || []
-    for (var i = 0; i < receivers.length; i++) {
-      var receiver = receivers[i]
-      if (receiver && receiver.id && Api.playbackDevicesMatch(receiver, target))
-        return receiver
-    }
-    return null
-  }
-
-  function findSonosControlDevice() {
-    var receiver = findDiscoveredReceiver(remoteDevice)
-    return receiver && String(receiver.brand || "").toLowerCase() === "sonos"
-      ? receiver : null
-  }
-
-  function normalizeDevice(value) {
-    var item = value || {}
-    var rawName = String(item.name || "Spotify device")
-    var id = String(item.id || "")
-    var local = Api.isLocalPlaybackDevice({ id: id, name: rawName },
-      deviceName, localRuntimeDeviceName, localDeviceId)
-    if (local) {
-      if (id) localDeviceId = id
-      if (rawName === deviceName || !localRuntimeDeviceName)
-        localRuntimeDeviceName = rawName
-    }
-    return {
-      id: id,
-      name: local ? deviceName : rawName,
-      sourceName: rawName,
-      type: String(item.type || "unknown"),
-      active: item.is_active === true,
-      restricted: item.is_restricted === true,
-      volumePercent: Api.normalizeVolumePercent(item.volume_percent),
-      supportsVolume: item.supports_volume === true,
-      brand: "",
-      model: "",
-      local: local,
-      localDiscovery: false,
-      activationRequired: false,
-      tokenType: "default",
-      description: ""
-    }
-  }
-
-  function mergeConnectDevices() {
-    var local = spotifyConnectManager.devices || []
-    var current = remoteDevice && remoteDevice.active === true ? remoteDevice : null
-    var currentVolume = Api.normalizeVolumePercent(
-      current ? current.volumePercent : null)
-    var localVolumePreferred = current
-      ? rememberDiscoveredReceiverVolume(current) : false
-    if (current && !localVolumePreferred && currentVolume !== null)
-      rememberRemoteVolume(current, currentVolume)
-    var currentMatched = false
-    var localById = ({})
-    for (var i = 0; i < local.length; i++) localById[String(local[i].id || "")] = local[i]
-    var next = []
-    var present = ({})
-    for (var j = 0; j < apiDevices.length && next.length < 32; j++) {
-      var sourceDevice = apiDevices[j]
-      var apiDevice = Api.shallowCopy(sourceDevice)
-      var discovered = localById[String(apiDevice.id || "")]
-      if (discovered) {
-        if (!apiDevice.local) apiDevice.name = discovered.name
-        apiDevice.description = discovered.description
-        apiDevice.localDiscovery = true
-        apiDevice.activationRequired = false
-        apiDevice.tokenType = discovered.tokenType
-        apiDevice.brand = discovered.brand
-        apiDevice.model = discovered.model
-        if (String(discovered.brand || "").toLowerCase() === "sonos"
-            && Api.normalizeVolumePercent(discovered.volumePercent) !== null)
-          apiDevice.volumePercent = discovered.volumePercent
-      }
-      if (current) {
-        var apiCurrentMatch = Api.playbackDevicesMatch(apiDevice, current)
-        apiDevice.active = apiCurrentMatch
-        if (apiCurrentMatch) {
-          currentMatched = true
-          // /me/player is the freshest source for the active receiver. The
-          // separately cached device list is only a fallback when that value
-          // is unknown; otherwise it can undo an accepted volume command.
-          if (!localVolumePreferred && currentVolume === null)
-            rememberRemoteVolume(current, apiDevice.volumePercent)
-          apiDevice.restricted = current.restricted === true
-          apiDevice.volumePercent = displayedRemoteVolumePercent(current)
-          apiDevice.supportsVolume = current.supportsVolume === true
-        }
-      }
-      present[String(apiDevice.id || "")] = true
-      next.push(apiDevice)
-    }
-    for (var k = 0; k < local.length && next.length < 32; k++) {
-      var item = local[k]
-      if (present[String(item.id || "")]) continue
-      var rawName = String(item.name || "Spotify Connect device")
-      var isLocal = Api.isLocalPlaybackDevice({ id: item.id, name: rawName },
-        deviceName, localRuntimeDeviceName, localDeviceId)
-      if (isLocal) {
-        localDeviceId = String(item.id || localDeviceId)
-        if (rawName === deviceName || !localRuntimeDeviceName)
-          localRuntimeDeviceName = rawName
-      }
-      var currentMatch = !!current && !currentMatched
-        && Api.playbackDevicesMatch(item, current)
-      if (currentMatch) currentMatched = true
-      next.push({
-        id: String(item.id || ""),
-        name: isLocal ? deviceName : rawName,
-        sourceName: rawName,
-        type: String(item.type || "Speaker"),
-        active: currentMatch,
-        restricted: currentMatch && current.restricted === true,
-        volumePercent: currentMatch ? displayedRemoteVolumePercent(current)
-          : (Api.normalizeVolumePercent(item.volumePercent) === null
-            ? 0 : item.volumePercent),
-        supportsVolume: currentMatch && current.supportsVolume === true,
-        local: isLocal,
-        localDiscovery: true,
-        activationRequired: !currentMatch,
-        activeUser: item.activeUser === true || currentMatch,
-        tokenType: Api.spotifyConnectTokenType(item.tokenType),
-        brand: String(item.brand || ""),
-        model: String(item.model || ""),
-        description: String(item.description || "")
-      })
-    }
-    if (current && !currentMatched && next.length < 32) {
-      next.push({
-        id: String(current.id || ""),
-        name: String(current.name || "Active Spotify device"),
-        sourceName: String(current.name || "Active Spotify device"),
-        type: String(current.type || "unknown"),
-        active: true,
-        restricted: current.restricted === true,
-        volumePercent: displayedRemoteVolumePercent(current),
-        supportsVolume: current.supportsVolume === true,
-        local: remotePlaybackIsLocal,
-        localDiscovery: false,
-        activationRequired: false,
-        activeUser: true,
-        tokenType: "default",
-        brand: "",
-        model: "",
-        description: ""
-      })
-    }
-    devices = next
-    var explicitActiveReceiver = null
-    if (selectedDeviceExplicit) {
-      for (var selectedIndex = 0; selectedIndex < next.length; selectedIndex++) {
-        var selectedItem = next[selectedIndex]
-        if (selectedItem.id === selectedDeviceId && selectedItem.active
-            && selectedItem.localDiscovery
-            && String(selectedItem.brand || "").toLowerCase() === "sonos") {
-          explicitActiveReceiver = selectedItem
-          break
-        }
-      }
-    }
-    var preferred = explicitActiveReceiver || Api.preferredPlaybackDevice(
-      next, selectedDeviceId, selectedDeviceExplicit, current)
-    if (selectedDeviceExplicit
-        && (!preferred || preferred.id !== selectedDeviceId))
-      selectedDeviceExplicit = false
-    selectedDeviceId = preferred ? preferred.id : ""
-    devicesLoaded = true
-  }
-
-  function finishDeviceLoad(callback, error) {
-    mergeConnectDevices()
-    devicesLoading = false
-    if (error) fail(error)
-    var waiters = deviceLoadWaiters.slice()
-    deviceLoadWaiters = []
-    if (typeof callback === "function") waiters.push(callback)
-    for (var i = 0; i < waiters.length; i++) {
-      try { waiters[i]() }
-      catch (e) { /* callers own callback errors */ }
-    }
-  }
-
-  function loadDevices(callback, serial, discoverLocal) {
-    if (typeof callback === "function") {
-      var waiters = deviceLoadWaiters.slice()
-      waiters.push(callback)
-      deviceLoadWaiters = waiters
-    }
-    if (discoverLocal === true) pendingDeviceDiscover = true
-    if (devicesLoading) return
-    var expected = serial === undefined ? dataSerial : serial
-    var shouldDiscover = pendingDeviceDiscover
-    pendingDeviceDiscover = false
-    devicesLoading = true
-    if (shouldDiscover) loadPlaybackState()
-    spotifyApi.request("GET", "/me/player/devices", null, null,
-      function(status, payload, error) {
-        if (expected !== root.dataSerial) {
-          root.devicesLoading = false
-          root.deviceLoadWaiters = []
-          return
-        }
-        if (!error) {
-          var source = payload && Array.isArray(payload.devices) ? payload.devices : []
-          var next = []
-          for (var i = 0; i < source.length; i++) next.push(root.normalizeDevice(source[i]))
-          root.apiDevices = next.slice(0, 32)
-        }
-        if (shouldDiscover) {
-          root.pendingDeviceLoadError = error || ""
-          if (spotifyConnectManager.loading) return
-          spotifyConnectManager.refresh()
-        } else {
-          root.finishDeviceLoad(null, error || "")
-        }
-      })
-  }
-
   // The live queue is engine-owned; its honest QML-side source is the
   // server-persisted play queue the engine keeps saving (bounded debounce).
   // SongRefs map back to canonical rows so the queue view renders like any
@@ -2906,147 +2272,7 @@ Item {
     detailLoading = false
   }
 
-  function deviceForId(id) {
-    var key = String(id || "")
-    for (var i = 0; i < devices.length; i++)
-      if (String(devices[i].id || "") === key) return devices[i]
-    return null
-  }
-
-  function localDevice() {
-    for (var i = 0; i < devices.length; i++) if (devices[i].local) return devices[i]
-    return null
-  }
-
-  function chooseDevice() {
-    return Api.preferredPlaybackDevice(devices, selectedDeviceId,
-      selectedDeviceExplicit, remoteDevice)
-  }
-
-  // An active Spotify Connect receiver already represents the user's current
-  // target. Otherwise, make the local receiver the visible default as soon as
-  // it is available, so the first playback click needs no trip through Devices.
-  function autoselectLocalDevice() {
-    var current = chooseDevice()
-    var local = Api.automaticLocalPlaybackDevice(
-      selectedDeviceId, current, localDevice())
-    if (!local) return null
-    selectedDeviceId = local.id
-    selectedDeviceExplicit = false
-    return local
-  }
-
-  function beginConnectAuthorization(device) {
-    if (!device || !device.id || pendingConnectDeviceId !== device.id) return
-    pendingConnectWakeTried = false
-    if (Api.spotifyConnectTokenType(device.tokenType) !== "default") {
-      statusMessage = "Checking permission for " + device.name
-      authManager.withAccessToken(function(token, error) {
-        if (root.pendingConnectDeviceId !== device.id) return
-        if (token) {
-          root.statusMessage = "Connecting to " + device.name
-          spotifyConnectManager.activate(device.id, token)
-        } else {
-          root.statusMessage = "Approve speaker access in your browser"
-          authManager.beginLogin()
-        }
-      })
-    } else {
-      statusMessage = "Connecting to " + device.name
-      spotifyConnectManager.activate(device.id, "")
-    }
-  }
-
-  function selectDevice(id, transferPlayback) {
-    var device = deviceForId(id)
-    if (!device) return
-    if (!device.id || (device.restricted && !device.activationRequired)) return
-    selectedDeviceId = device.id
-    selectedDeviceExplicit = true
-    noteActivity()
-    if (device.activationRequired) {
-      if (deviceActivationBusy) return
-      pendingConnectDeviceId = device.id
-      connectActivationAttempts = 0
-      pendingConnectWakeTried = false
-      statusClearTimer.stop()
-      lastError = ""
-      if (String(device.brand || "").toLowerCase() === "sonos") {
-        pendingConnectWakeTried = true
-        statusMessage = "Waking " + device.name
-        spotifyConnectManager.control(device.id, "play", "")
-      } else {
-        beginConnectAuthorization(device)
-      }
-      return
-    }
-    if (device.active) {
-      selectedDeviceId = device.restricted ? "" : String(device.id || "")
-      selectedDeviceExplicit = false
-      succeed("Already playing on " + device.name)
-      loadPlaybackState()
-      return
-    }
-    if (transferPlayback !== false) transferToConnectDevice(device.id)
-  }
-
-  function transferToConnectDevice(deviceId) {
-    apiAction("PUT", "/me/player", null,
-      { device_ids: [deviceId], play: playing }, "Playback device changed",
-      function(ok) {
-        if (ok) {
-          root.loadDevices()
-          root.loadPlaybackState()
-        }
-      })
-  }
-
-  function checkActivatedConnectDevice() {
-    var requested = pendingConnectDeviceId
-    if (!requested) return
-    var device = deviceForId(requested)
-    if (device && !device.activationRequired) {
-      pendingConnectDeviceId = ""
-      connectActivationAttempts = 0
-      pendingConnectWakeTried = false
-      if (device.active) {
-        succeed("Playing on " + device.name)
-        loadPlaybackState()
-      } else {
-        transferToConnectDevice(requested)
-      }
-      return
-    }
-    connectActivationAttempts++
-    if (pendingConnectWakeTried && connectActivationAttempts >= 4 && device) {
-      connectActivationAttempts = 0
-      beginConnectAuthorization(device)
-    } else if (connectActivationAttempts < 20) {
-      connectActivationTimer.restart()
-    }
-    else {
-      pendingConnectDeviceId = ""
-      pendingConnectWakeTried = false
-      fail(speakerAvailabilityError())
-    }
-  }
-
-  function speakerAvailabilityError() {
-    return "The speaker connected, but did not become available. Make sure it is awake and try again"
-  }
-
-  function refreshActivatedConnectDevice() {
-    // Sonos is commonly absent from /me/player/devices even after addUser has
-    // succeeded. Refresh current playback first so an active null-id Sonos can
-    // be matched to its locally discovered receiver by name and type.
-    loadPlaybackState(function() {
-      root.loadDevices(function() { root.checkActivatedConnectDevice() })
-    })
-  }
-
   function clearPendingPlayback(keepActivation) {
-    pendingPlayback = null
-    pendingPlaybackBody = null
     pendingPlaybackLoad = null
     pendingPlaybackMessage = ""
     pendingPlaybackRadio = null
@@ -3054,31 +2280,13 @@ Item {
     if (keepActivation !== true) localActivationRequested = false
   }
 
+  // Playback starts on this computer only: the Navidrome engine is the
+  // receiver. Bring it up when needed and hand the v2 load over as soon as
+  // the socket is ready.
   function dispatchPendingPlayback(playbackSerial) {
     if (playbackSerial !== pendingPlaybackSerial || !pendingPlaybackLoad) return
-    var target = autoselectLocalDevice() || chooseDevice()
-    if (target && !target.local) {
-      localActivationRequested = false
-      sendPendingPlayback(Api.playbackTargetDeviceId(target, selectedDeviceExplicit))
-      return
-    }
-    // Navidrome credentials ride configure_server (keyring → backend), so the
-    // old "approve playback" OAuth gate has no primary-runtime equivalent;
-    // only the interim spotifyd fallback runtime still needs it.
-    if (daemonManager.usingFallbackRuntime
-        && !daemonManager.credentialsAvailable) {
-      fail("Playback on this computer is not set up. Review Settings, then try again")
-      clearPendingPlayback()
-      return
-    }
-    if (!daemonManager.usingFallbackRuntime
-        && (backendClient.ready || daemonManager.playbackReady)) {
+    if (backendClient.ready || daemonManager.playbackReady) {
       waitForLocalSocketThenPlay(playbackSerial)
-      return
-    }
-    if (target && target.local && daemonManager.running) {
-      localActivationRequested = false
-      sendPendingPlayback(Api.playbackTargetDeviceId(target, selectedDeviceExplicit))
       return
     }
     if (!daemonManager.binaryAvailable || !daemonManager.unitAvailable) {
@@ -3086,9 +2294,6 @@ Item {
       clearPendingPlayback()
       return
     }
-    // Cold start: bring the engine up and hand the load over as soon as the
-    // socket is ready. The Spotify-era device probe never applied here —
-    // the Navidrome engine is the receiver itself.
     daemonManager.start()
     waitForLocalSocketThenPlay(playbackSerial)
   }
@@ -3113,7 +2318,6 @@ Item {
     if (playbackSerial !== pendingPlaybackSerial || !pendingPlaybackLoad) return
     var load = pendingPlaybackLoad
     var successMessage = pendingPlaybackMessage
-    var radioPlaylist = pendingPlaybackRadio
     clearPendingPlayback()
     localSocketWaitTimer.stop()
     // Credentials must precede load/add_to_queue on a fresh connection.
@@ -3122,32 +2326,23 @@ Item {
     backendClient.loadPlayback(load, function(ok, result, error) {
       localLoadInFlight = false
       if (ok) {
-        if (playbackSerial === root.radioSerial)
-          root.radioContextSelected = !!radioPlaylist
         if (successMessage) root.succeed(successMessage)
         root.loadQueue()
         return
       }
-      root.pendingPlaybackLoad = load
-      root.pendingPlaybackMessage = successMessage
-      root.pendingPlaybackRadio = radioPlaylist
-      root.pendingPlaybackSerial = playbackSerial
       if (backendClient.credentialFailure) {
-        // Credential-class failures are terminal: no fallback push, no retry
-        // loop — the typed state is surfaced for the setup UI instead.
+        // Credential-class failures are terminal: no retry loop — the typed
+        // state is surfaced for the setup UI instead.
         root.clearPendingPlayback()
         root.fail(Subsonic.backendCredentialMessage(backendClient.commandErrorCode)
           || error || "Playback on this computer is not set up")
         return
       }
-      // Generic failures are surfaced honestly; there is no remote playback
-      // to fall back to in the Navidrome port.
       root.clearPendingPlayback()
       root.fail(error || "Playback on this computer could not start this song")
     })
   }
 
-  // Playback rows are Subsonic songs. The v2 load body is built from the
   // Playback rows are Subsonic songs. The v2 load body is built from the
   // visible list starting at the clicked row, so Next walks the displayed
   // order exactly as before. Context rows (album/playlist/artist) have no
@@ -3170,24 +2365,14 @@ Item {
   }
 
   function beginPlaybackLoad(load, anchorItem, successMessage, playbackSerial) {
-    pendingPlayback = anchorItem
+    void anchorItem
     pendingPlaybackLoad = load
     pendingPlaybackMessage = String(successMessage || "")
     pendingPlaybackRadio = null
     pendingPlaybackSerial = playbackSerial
     localActivationRequested = true
-    deviceProbeAttempts = 0
     noteActivity()
 
-    // Opening the panel refreshes current playback asynchronously. Wait for
-    // that in-flight result before choosing the local fallback, otherwise a
-    // fast click can race the refresh and move playback off the active device.
-    if (!selectedDeviceExplicit && remotePlaybackLoading) {
-      loadPlaybackState(function() {
-        root.dispatchPendingPlayback(playbackSerial)
-      })
-      return
-    }
     dispatchPendingPlayback(playbackSerial)
   }
 
@@ -3316,147 +2501,6 @@ Item {
     return true
   }
 
-  function probeForLocalDevice() {
-    if (!pendingPlayback && !localActivationRequested) return
-    loadDevices(function() {
-      if (!root.pendingPlayback && !root.localActivationRequested) return
-      var target = root.pendingPlayback
-        ? (root.autoselectLocalDevice() || root.chooseDevice()) : null
-      if (target && !target.local) {
-        root.localActivationRequested = false
-        root.sendPendingPlayback(Api.playbackTargetDeviceId(
-          target, root.selectedDeviceExplicit))
-        return
-      }
-      var local = root.localDevice()
-      if (local && local.id && !local.restricted) {
-        root.selectedDeviceId = local.id
-        root.selectedDeviceExplicit = false
-        if (root.pendingPlayback) {
-          root.localActivationRequested = false
-          root.sendPendingPlayback(Api.playbackTargetDeviceId(local, false))
-        } else {
-          root.activateLocalDevice(local.id)
-        }
-        return
-      }
-      root.deviceProbeAttempts++
-      if (root.deviceProbeAttempts < 8) deviceProbeTimer.restart()
-      else {
-        root.clearPendingPlayback()
-        root.fail("Playback on this computer did not become available. Review Settings, then try again")
-      }
-    })
-  }
-
-  function activateLocalDevice(deviceId) {
-    var id = String(deviceId || "")
-    if (!id) return
-    localActivationRequested = false
-    apiAction("PUT", "/me/player", null,
-      { device_ids: [id], play: false }, "Omarchy Navidrome is ready",
-      function(ok) {
-        if (ok) {
-          root.selectedDeviceId = id
-          root.selectedDeviceExplicit = false
-          root.loadDevices()
-        }
-      })
-  }
-
-  function sendPendingPlayback(deviceId) {
-    var body = pendingPlaybackBody
-    var successMessage = pendingPlaybackMessage
-    var radioPlaylist = pendingPlaybackRadio
-    var playbackSerial = pendingPlaybackSerial
-    var account = dataSerial
-    var selection = selectedDeviceId
-    var explicit = selectedDeviceExplicit
-    var target = deviceForId(deviceId)
-    if (!body) return
-    clearPendingPlayback(true)
-    function current() {
-      return account === root.dataSerial && playbackSerial === root.radioSerial
-        && selection === root.selectedDeviceId && explicit === root.selectedDeviceExplicit
-        && !root.localPlaybackStopped
-    }
-    function dispatch(retried) {
-      if (!current()) return
-      spotifyApi.request("PUT", "/me/player/play", { device_id: deviceId }, body,
-        function(status, payload, error) {
-          if (!current()) return
-          if (error && !retried && status === 404 && payload && payload.error
-              && payload.error.reason === "NO_ACTIVE_DEVICE" && target
-              && target.local && !target.restricted && deviceId) {
-            // Wake only the already chosen local receiver, once. Remote and
-            // restricted devices retain their own failure and selection.
-            spotifyApi.request("PUT", "/me/player", null,
-              { device_ids: [deviceId], play: false }, function(code, result, failure) {
-                if (!current()) return
-                if (failure) root.fail(failure)
-                else dispatch(true)
-              }, { priority: "interactive", retryRateLimit: false })
-            return
-          }
-          if (error) { root.fail(error); return }
-          root.succeed(successMessage)
-          root.radioContextSelected = !!radioPlaylist
-          root.selectedDeviceId = String(deviceId || root.selectedDeviceId)
-          root.loadDevices()
-          root.loadQueue()
-        }, { priority: "interactive", retryRateLimit: false })
-    }
-    dispatch(false)
-  }
-
-  // Track radio needs server-side similarity (getSimilarSongs2 with Last.fm)
-  // and is planned with the radio package (6). Until then the action reports
-  // itself unavailable instead of pretending to shuffle.
-  function startRadio(item) {
-    fail("Track radio is not available yet")
-  }
-
-  function sendSonosControl(action, value) {
-    if (!sonosControlAvailable || !sonosControlDevice.id) return false
-    if (!spotifyConnectManager.controlling)
-      spotifyConnectManager.control(sonosControlDevice.id, action, value)
-    return true
-  }
-
-  function sonosPlayMode(nextRepeat, nextShuffle) {
-    if (nextRepeat === "track") return "REPEAT_ONE"
-    if (nextShuffle) return nextRepeat === "context" ? "SHUFFLE" : "SHUFFLE_NOREPEAT"
-    return nextRepeat === "context" ? "REPEAT_ALL" : "NORMAL"
-  }
-
-  function applySonosControlResult(action, value) {
-    if (!remotePlayback) return
-    var nextState = Api.shallowCopy(remotePlayback)
-    if (action === "play" || action === "pause") {
-      nextState.progressSeconds = positionSeconds
-      nextState.receivedAt = Date.now()
-      nextState.playing = action === "play"
-    } else if (action === "seek") {
-      nextState.progressSeconds = Math.max(0, Number(value) || 0)
-      nextState.receivedAt = Date.now()
-    } else if (action === "volume" && remoteDevice) {
-      var nextDevice = Api.shallowCopy(remoteDevice)
-      nextDevice.volumePercent = Math.max(0, Math.min(100, Number(value) || 0))
-      nextState.device = nextDevice
-      rememberRemoteVolume(remoteDevice, nextDevice.volumePercent)
-      if (sonosControlDevice)
-        spotifyConnectManager.rememberVolume(sonosControlDevice.id,
-          nextDevice.volumePercent)
-    } else if (action === "mode") {
-      var mode = String(value || "").toUpperCase()
-      nextState.repeatMode = mode === "REPEAT_ONE" ? "track"
-        : (mode === "REPEAT_ALL" || mode === "SHUFFLE" ? "context" : "off")
-      nextState.shuffle = mode === "SHUFFLE" || mode === "SHUFFLE_NOREPEAT"
-    }
-    remotePlayback = nextState
-    playbackPositionTick++
-  }
-
   // Resume candidates: Navidrome has no client-visible play history, so the
   // "continue where you were" offer is the most recent album window
   // (getAlbumList2 type=recent). Exact-position resume is the saved-session
@@ -3495,65 +2539,32 @@ Item {
     return true
   }
 
+  // Playback controls act on the engine's MPRIS player only. Play with
+  // nothing loaded resumes the most recent album through the regular playback
+  // path, which also brings up the local engine when it has idled out.
   function togglePlayback() {
     noteActivity()
-    if (sendSonosControl(playing ? "pause" : "play", "")) return
     if (!hasMedia && resumeLastPlayed()) return
-    if (!useRemotePlayback && hasLocalPlayer && activePlayer.canTogglePlaying) {
+    if (hasLocalPlayer && activePlayer.canTogglePlaying)
       activePlayer.togglePlaying()
-      return
-    }
-    remotePlayerAction("PUT", playing ? "/me/player/pause" : "/me/player/play",
-      controlQuery())
   }
 
   function next() {
     noteActivity()
-    if (sendSonosControl("next", "")) return
-    if (!useRemotePlayback && hasLocalPlayer && activePlayer.canGoNext) activePlayer.next()
-    else remotePlayerAction("POST", "/me/player/next", controlQuery())
+    if (hasLocalPlayer && activePlayer.canGoNext) activePlayer.next()
   }
 
   function previous() {
     noteActivity()
-    if (sendSonosControl("previous", "")) return
-    if (!useRemotePlayback && hasLocalPlayer && activePlayer.canGoPrevious) activePlayer.previous()
-    else remotePlayerAction("POST", "/me/player/previous", controlQuery())
-  }
-
-  function controlDeviceId() {
-    if (useRemotePlayback) return remoteDevice && !remoteDevice.restricted
-      ? String(remoteDevice.id || "") : ""
-    return String(selectedDeviceId || "")
-  }
-
-  function controlQuery(extra) {
-    var query = extra ? Api.shallowCopy(extra) : ({})
-    var id = controlDeviceId()
-    if (id) query.device_id = id
-    return Object.keys(query).length ? query : null
-  }
-
-  function remotePlayerAction(method, path, query) {
-    apiAction(method, path, query, null, "",
-      function(ok) { if (ok) root.loadPlaybackState() })
+    if (hasLocalPlayer && activePlayer.canGoPrevious) activePlayer.previous()
   }
 
   function seekSeconds(seconds) {
     var value = Math.max(0, Math.min(lengthSeconds || Number.MAX_VALUE,
       Number(seconds) || 0))
     noteActivity()
-    var remoteSerial = useRemotePlayback ? beginRemoteSeek(value) : 0
-    if (sendSonosControl("seek", String(Math.round(value)))) return
-    if (!useRemotePlayback && hasLocalPlayer
-        && activePlayer.canSeek && activePlayer.positionSupported)
+    if (hasLocalPlayer && activePlayer.canSeek && activePlayer.positionSupported)
       activePlayer.position = value
-    else apiAction("PUT", "/me/player/seek",
-      controlQuery({ position_ms: Math.round(value * 1000) }),
-      null, "", function(ok) {
-      if (!ok) root.clearPendingRemoteSeek(remoteSerial)
-      root.loadPlaybackState()
-    })
   }
 
   function setVolume(value, live) {
@@ -3572,23 +2583,16 @@ Item {
   function setShuffle(value) {
     var enabled = value === true
     noteActivity()
-    if (sendSonosControl("mode", sonosPlayMode(repeatMode, enabled))) return
-    if (!useRemotePlayback && hasLocalPlayer && activePlayer.shuffleSupported)
+    if (hasLocalPlayer && activePlayer.shuffleSupported)
       activePlayer.shuffle = enabled
-    else remotePlayerAction("PUT", "/me/player/shuffle",
-      controlQuery({ state: enabled ? "true" : "false" }))
   }
 
   function cycleRepeat() {
     var nextMode = repeatMode === "off" ? "context" : (repeatMode === "context" ? "track" : "off")
     noteActivity()
-    if (sendSonosControl("mode", sonosPlayMode(nextMode, shuffle))) return
-    if (!useRemotePlayback && hasLocalPlayer && activePlayer.loopSupported) {
+    if (hasLocalPlayer && activePlayer.loopSupported) {
       activePlayer.loopState = nextMode === "track" ? MprisLoopState.Track
         : (nextMode === "context" ? MprisLoopState.Playlist : MprisLoopState.None)
-    } else {
-      remotePlayerAction("PUT", "/me/player/repeat",
-        controlQuery({ state: nextMode }))
     }
   }
 
@@ -3685,7 +2689,7 @@ Item {
       fail("Only songs can be added to the queue")
       return
     }
-    if (!useRemotePlayback && backendClient.ready) {
+    if (backendClient.ready) {
       ensureBackendServerConfigured()
       backendClient.sendCommand("add_to_queue",
         { song: Api.backendSongRefV2(item) },
@@ -3697,8 +2701,7 @@ Item {
         })
       return
     }
-    // With no local engine there is nothing to append to; the Web API queue
-    // path died with the Spotify transport.
+    // With no local engine there is nothing to append to.
     fail("Playback on this computer is not ready, so the queue cannot take songs yet")
   }
 
@@ -3706,16 +2709,12 @@ Item {
     localPlaybackStopped = false
     noteActivity()
     localActivationRequested = true
-    deviceProbeAttempts = 0
     daemonManager.start(true)
-    deviceProbeTimer.restart()
   }
 
   function stopEngine() {
     localPlaybackStopped = true
-    cancelVisibleLocalDeviceRefresh()
     clearPendingPlayback()
-    deviceProbeTimer.stop()
     localSocketWaitTimer.stop()
     localSocketWaitAttempts = 0
     daemonManager.stop()
@@ -3723,7 +2722,7 @@ Item {
 
   function login() {
     if (authManager.loginBusy || authManager.sessionBusy
-        || daemonManager.setupBusy || daemonManager.authenticationBusy) return
+        || daemonManager.setupBusy) return
     noteActivity()
     lastError = ""
     statusClearTimer.stop()
@@ -3742,10 +2741,7 @@ Item {
       return
     }
     // The Navidrome backend takes its credentials from the keyring through
-    // configure_server, so no extra local authorization step exists. The
-    // spotifyd fallback can no longer be authorized either — its OAuth flow
-    // was removed with package 2 and the fallback itself goes in the later
-    // cleanup pass.
+    // configure_server, so no extra local authorization step exists.
     finishLoginFlow()
   }
 
@@ -3754,7 +2750,6 @@ Item {
     lastError = ""
     statusMessage = ""
     authManager.cancelLogin()
-    daemonManager.cancelAuthentication()
   }
 
   function reconnectAccount() {
@@ -3781,12 +2776,9 @@ Item {
     loginFlowActive = false
     dataSerial++
     clearPendingPlayback()
-    deviceProbeTimer.stop()
-    spotifyApi.cancelSearch()
     // Drain any in-flight Subsonic reads/writes: a stale starred or playlist
     // write must not land after the credentials are gone.
     subsonicApi.cancelAll()
-    daemonManager.clearCredentials()
     authManager.logout()
     clearData()
   }
@@ -3798,7 +2790,6 @@ Item {
     restoreAttempted = false
     resumeCandidate = null
     resumeCandidateLoadedAt = 0
-    radioContextSelected = false
     playlists = []
     playlistsLoaded = false
     playlistsNext = ""
@@ -3821,34 +2812,13 @@ Item {
     currentUserName = ""
     queue = []
     queueLoaded = false
-    devices = []
-    apiDevices = []
-    remotePlayback = null
-    remotePlaybackLoading = false
-    remotePlaybackWaiters = []
-    rememberedRemoteVolumeDevice = null
-    rememberedRemoteVolumePercent = -1
-    pendingRemoteSeek = null
-    pendingRemoteVolume = null
     clearPendingSliderVolume()
     volumeFlushQueued = false
     volumeFlushCooling = false
     volumeLiveActive = false
     volumeFlushTimer.stop()
     volumeLiveIdleTimer.stop()
-    remoteControlSerial = 0
-    remoteVolumeProbeKey = ""
-    remoteControlDiscoveryKey = ""
     playbackPositionTick++
-    devicesLoaded = false
-    selectedDeviceId = ""
-    selectedDeviceExplicit = false
-    localDeviceId = ""
-    localRuntimeDeviceName = deviceName
-    pendingConnectDeviceId = ""
-    connectActivationAttempts = 0
-    pendingConnectWakeTried = false
-    connectActivationTimer.stop()
     searchController.clearSearch()
     savedUris = ({})
     savedUriCheckedAt = ({})
@@ -3902,9 +2872,6 @@ Item {
     playlistActionBusy = false
     playlistConversionBusy = false
     queueLoading = false
-    devicesLoading = false
-    deviceLoadWaiters = []
-    pendingDeviceDiscover = false
     searchLoading = false
     localSocketWaitAttempts = 0
     localSocketWaitTimer.stop()
@@ -3930,11 +2897,9 @@ Item {
       syncCurrentTrackSaved(true)
       updateSleepCountdown()
     }
-    else cancelVisibleLocalDeviceRefresh()
   }
   onFullyConnectedChanged: {
     if (fullyConnected && uiVisible) ensureVisibleLocalReceiver()
-    else if (!fullyConnected) cancelVisibleLocalDeviceRefresh()
   }
 
   Component.onCompleted: {
@@ -3960,10 +2925,8 @@ Item {
         root.succeed("Navidrome connected · finishing playback on this computer")
         root.continueLocalPlaybackSetup()
       }
-      if (root.localActivationRequested) deviceProbeTimer.restart()
     }
     function onLoggedOut() {
-      spotifyApi.cancelAll()
       root.clearData()
     }
     function onSessionUnavailable(reason) {
@@ -3974,10 +2937,6 @@ Item {
 
   Connections {
     target: daemonManager
-    function onCredentialsAvailableChanged() {
-      if (daemonManager.credentialsAvailable && root.uiVisible)
-        root.ensureVisibleLocalReceiver()
-    }
     function onSetupSucceeded() {
       if (root.loginFlowActive) root.continueLocalPlaybackSetup()
       else root.succeed("Playback on this computer is ready")
@@ -3987,110 +2946,10 @@ Item {
       root.fail(reason)
     }
     function onStarted() {
-      root.localRuntimeDeviceName = root.deviceName
-      root.localDeviceId = ""
       root.succeed("Playback started on this computer")
       if (root.uiVisible) root.ensureVisibleLocalReceiver()
-      if (root.pendingPlayback || root.localActivationRequested) deviceProbeTimer.restart()
     }
     function onStopped() { root.succeed("Playback stopped on this computer") }
-    function onAuthenticationSucceeded() {
-      if (root.loginFlowActive) root.finishLoginFlow()
-      else root.succeed("Playback on this computer is connected")
-      if (root.uiVisible) root.ensureVisibleLocalReceiver()
-      if (root.pendingPlayback || root.localActivationRequested) deviceProbeTimer.restart()
-    }
-    function onAuthenticationFailed(reason) {
-      root.loginFlowActive = false
-      root.fail(reason)
-    }
-    function onCredentialsCleared() { root.succeed("Signed out") }
-    function onCredentialsClearFailed(reason) { root.fail(reason) }
-  }
-
-  Connections {
-    target: spotifyConnectManager
-    function onRefreshed() {
-      var error = root.pendingDeviceLoadError
-      root.pendingDeviceLoadError = ""
-      root.finishDeviceLoad(null, error)
-    }
-    function onRefreshFailed(reason) {
-      var apiError = root.pendingDeviceLoadError
-      root.pendingDeviceLoadError = ""
-      root.finishDeviceLoad(null, apiError)
-      // Local discovery is supplemental. If Spotify already supplied devices
-      // or an active playback target, a transient Avahi failure must not turn
-      // a working connection into a user-visible error.
-      if (!apiError && !root.remoteDevice && !root.apiDevices.length)
-        root.fail(reason)
-    }
-    function onActivated(deviceId) {
-      statusClearTimer.stop()
-      root.statusMessage = "Speaker connected · waiting for it to become available"
-      root.connectActivationAttempts = 0
-      root.pendingConnectWakeTried = false
-      connectActivationTimer.restart()
-    }
-    function onActivationFailed(reason) {
-      root.pendingConnectDeviceId = ""
-      root.connectActivationAttempts = 0
-      root.pendingConnectWakeTried = false
-      root.fail(reason)
-    }
-    function onControlled(deviceId, action, value) {
-      if (root.pendingConnectDeviceId === deviceId && action === "play") {
-        root.statusMessage = "Connecting to "
-          + String((root.deviceForId(deviceId) || {}).name || "speaker")
-        root.connectActivationAttempts = 0
-        connectActivationTimer.restart()
-        return
-      }
-      root.applySonosControlResult(action, value)
-      root.reconcilePendingRemoteControls(root.remotePlayback)
-      sonosControlRefreshTimer.restart()
-    }
-    function onControlFailed(deviceId, reason) {
-      if (root.pendingConnectDeviceId === deviceId) {
-        var device = root.deviceForId(deviceId)
-        if (device) root.beginConnectAuthorization(device)
-        else {
-          root.pendingConnectDeviceId = ""
-          root.pendingConnectWakeTried = false
-          root.fail(reason)
-        }
-        return
-      }
-      root.clearPendingRemoteSeek(0)
-      root.clearPendingRemoteVolume(0)
-      root.loadPlaybackState()
-      root.fail(reason)
-    }
-  }
-
-  Connections {
-    target: authManager
-    function onLoginSucceeded() {
-      var requested = root.pendingConnectDeviceId
-      var device = root.deviceForId(requested)
-      if (!requested || !device) return
-      root.statusMessage = "Connecting to " + device.name
-      authManager.withAccessToken(function(token, error) {
-        if (root.pendingConnectDeviceId !== requested) return
-        if (token) spotifyConnectManager.activate(requested, token)
-        else {
-          root.pendingConnectDeviceId = ""
-          root.fail(error || "Spotify could not authorize this speaker")
-        }
-      })
-    }
-    function onSessionUnavailable(reason) {
-      if (!root.pendingConnectDeviceId) return
-      root.pendingConnectDeviceId = ""
-      root.connectActivationAttempts = 0
-      root.pendingConnectWakeTried = false
-      root.fail(reason || "Spotify could not authorize this speaker")
-    }
   }
 
   Timer {
@@ -4186,38 +3045,6 @@ Item {
   }
 
   Timer {
-    id: deviceProbeTimer
-    interval: 750
-    repeat: false
-    onTriggered: root.probeForLocalDevice()
-  }
-
-  Timer {
-    id: visibleLocalDeviceRefreshTimer
-    interval: 750
-    repeat: false
-    onTriggered: root.refreshVisibleLocalDevice()
-  }
-
-  Timer {
-    id: connectActivationTimer
-    interval: 750
-    repeat: false
-    onTriggered: root.refreshActivatedConnectDevice()
-  }
-
-  Timer {
-    id: remotePlaybackTimer
-    interval: Api.remotePlaybackPollInterval(root.uiVisible,
-      root.useRemotePlayback, root.hasLocalPlayer)
-    repeat: true
-    running: Api.remotePlaybackPollShouldRun(root.auth.loggedIn,
-      root.remotePlaybackLoading, root.uiVisible, root.useRemotePlayback,
-      root.playing)
-    onTriggered: root.loadPlaybackState()
-  }
-
-  Timer {
     id: localSocketWaitTimer
     interval: 200
     repeat: true
@@ -4241,15 +3068,8 @@ Item {
   }
 
   Timer {
-    id: sonosControlRefreshTimer
-    interval: 650
-    repeat: false
-    onTriggered: root.loadPlaybackState()
-  }
-
-  Timer {
     id: volumeFlushTimer
-    interval: Api.volumeFlushInterval(root.volumeFlushTarget())
+    interval: Api.VOLUME_FLUSH_MS
     repeat: false
     onTriggered: root.flushVolume()
   }
@@ -4258,12 +3078,7 @@ Item {
     id: volumeLiveIdleTimer
     interval: 400
     repeat: false
-    onTriggered: {
-      root.volumeLiveActive = false
-      // Only the remote path skipped its per-command refetch; a local MPRIS
-      // write reports the new volume on its own.
-      if (root.useRemotePlayback) root.loadPlaybackState()
-    }
+    onTriggered: root.volumeLiveActive = false
   }
 
   Timer {
@@ -4321,13 +3136,6 @@ Item {
     pluginDir: root.pluginDir
   }
 
-  SpotifyApi {
-    id: spotifyApi
-    // Transitional: SpotifyApi.qml (and the whole Web API layer) is deleted in
-    // package 5; the AuthManager shim fails every Web API path immediately.
-    auth: authManager
-  }
-
   SubsonicApi {
     id: subsonicApi
     // The QML-side Subsonic transport. The saved-session restore uses it for
@@ -4339,10 +3147,8 @@ Item {
     password: authManager.navidromePassword
   }
 
-  SpotifyConnectManager {
-    id: spotifyConnectManager
-    pluginDir: root.pluginDir
-  }
+  // SpotifyConnectManager died with the Spotify Connect machinery; the
+  // engine unit below is the only playback runtime.
 
   DaemonManager {
     id: daemonManager
@@ -4354,14 +3160,12 @@ Item {
 
   BackendClient {
     id: backendClient
-    wanted: daemonManager.running && !daemonManager.usingFallbackRuntime
+    wanted: daemonManager.running
     // The initial state event flips lifecycle to "ready": the single point
     // where a fresh connection (or a reconnect) gets configured.
     onLifecycleChanged: root.ensureBackendServerConfigured()
     onErrorCodeChanged: {
-      if (errorCode === "audio_key_unavailable")
-        root.fail(errorMessage || "This track could not be played on this computer")
-      else if (backendClient.credentialFailure) {
+      if (backendClient.credentialFailure) {
         // Typed credential-class state from the engine: terminal, so the
         // pending playback push stops and the UI explains the actual failure.
         root.clearPendingPlayback()

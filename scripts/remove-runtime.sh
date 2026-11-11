@@ -16,9 +16,13 @@ cache_root=${XDG_CACHE_HOME:-"$HOME/.cache"}
 state_root=${XDG_STATE_HOME:-"$HOME/.local/state"}
 session_runtime_root=${XDG_RUNTIME_DIR:-/tmp}
 backend_unit_file="$config_root/systemd/user/omarchy-navidrome.service"
-fallback_unit_file="$config_root/systemd/user/omarchy-navidrome-spotifyd.service"
+# Legacy leftover from the removed spotifyd fallback; cleared on purge when a
+# pre-port install left it behind.
+legacy_fallback_unit_file="$config_root/systemd/user/omarchy-navidrome-spotifyd.service"
 config_dir="$config_root/omarchy-navidrome"
-cache_dir="$cache_root/spotifyd"
+# The pre-port backend cached audio under ~/.cache/spotifyd; that path stays a
+# purge target so an upgrade leaves no orphaned cache behind.
+legacy_cache_dir="$cache_root/spotifyd"
 build_cache_dir="$cache_root/omarchy-navidrome"
 state_dir="$state_root/omarchy-navidrome"
 session_runtime_dir="$session_runtime_root/omarchy-navidrome"
@@ -50,7 +54,7 @@ fi
 for unit_name in omarchy-navidrome.service omarchy-navidrome-spotifyd.service; do
   systemctl --user disable --now "$unit_name" >/dev/null 2>&1 || true
 done
-rm -f -- "$backend_unit_file" "$fallback_unit_file" "$backend_binary" \
+rm -f -- "$backend_unit_file" "$legacy_fallback_unit_file" "$backend_binary" \
   "$backend_source_id_file" "$backend_binary_hash_file" "$backend_origin_file"
 systemctl --user daemon-reload
 systemctl --user reset-failed omarchy-navidrome.service omarchy-navidrome-spotifyd.service \
@@ -60,7 +64,7 @@ if [[ -d $config_dir ]]; then
   if (( purge )); then
     [[ $config_dir == "$config_root/omarchy-navidrome" ]] || exit 3
     rm -rf -- "$config_dir"
-    echo "Removed spotifyd configuration."
+    echo "Removed backend configuration."
   else
     backup="${config_dir}.bak.$(date -u +%Y%m%d%H%M%S)"
     mv -- "$config_dir" "$backup"
@@ -69,10 +73,10 @@ if [[ -d $config_dir ]]; then
 fi
 
 if (( purge )); then
-  if [[ -d $cache_dir ]]; then
-    [[ $cache_dir == "$cache_root/spotifyd" ]] || exit 3
-    rm -rf -- "$cache_dir"
-    echo "Removed spotifyd cached credentials and audio."
+  if [[ -d $legacy_cache_dir ]]; then
+    [[ $legacy_cache_dir == "$cache_root/spotifyd" ]] || exit 3
+    rm -rf -- "$legacy_cache_dir"
+    echo "Removed the legacy cached-audio directory."
   fi
   if [[ -d $build_cache_dir ]]; then
     [[ $build_cache_dir == "$cache_root/omarchy-navidrome" ]] || exit 3
@@ -119,4 +123,4 @@ else
   rmdir -- "$runtime_dir" 2>/dev/null || true
 fi
 
-echo "Runtime integration removed. The spotifyd package was left installed."
+echo "Runtime integration removed."

@@ -90,7 +90,7 @@ mod tests {
     #[test]
     fn diagnostic_is_private_and_contains_only_safe_fields() {
         let directory =
-            std::env::temp_dir().join(format!("spotify-failure-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("backend-failure-test-{}", std::process::id()));
         let socket = directory.join("backend.sock");
         record(&socket, Failure::MissingCredentials).unwrap();
         let path = directory.join("startup-error.json");

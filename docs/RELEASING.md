@@ -30,7 +30,7 @@ GitHub's attestation to all of the following:
 
 The installer enforces that policy with `gh attestation verify`. If any check is
 unavailable or fails, it never installs the download; it uses a locked local
-source build or the packaged spotifyd fallback.
+source build instead.
 
 After both release assets and their attestations are available, submit the exact
 release commit in a new marketplace Verify ticket. Include the workflow run and

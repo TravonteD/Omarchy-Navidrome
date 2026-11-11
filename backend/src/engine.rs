@@ -75,8 +75,8 @@ impl EngineRuntime {
 }
 
 /// Events produced by the playback pipeline thread and applied into the
-/// shared state by an async task (diff-only, mirroring the previous
-/// librespot event application and its tests).
+/// shared state by an async task (diff-only, mirroring the event application
+/// inherited from the pre-port engine and its tests).
 #[derive(Clone, Debug)]
 pub enum PlaybackEvent {
     /// A track became current. `begin` publishes the loading state (an

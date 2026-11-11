@@ -49,8 +49,8 @@ also includes a stable `error_code` (see the error table below).
 
 ### Track shape
 
-The state's `track` object identifies songs by their Subsonic id (Spotify
-protocol v1 used `uri`; that field was renamed in v2):
+The state's `track` object identifies songs by their Subsonic id (protocol
+v1 used `uri`; that field was renamed in v2):
 
 ```json
 {

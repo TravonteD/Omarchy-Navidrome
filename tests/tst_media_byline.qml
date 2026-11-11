@@ -14,21 +14,21 @@ TestCase {
     kind: "item",
     type: "track",
     id: "track-id",
-    uri: "spotify:track:track-id",
+    uri: "navidrome:track:track-id",
     name: "Have a Cigar",
     subtitle: "Pink Floyd",
     artists: [{
       kind: "context",
       type: "artist",
       id: "pink-floyd",
-      uri: "spotify:artist:pink-floyd",
+      uri: "navidrome:artist:pink-floyd",
       name: "Pink Floyd"
     }],
     albumItem: {
       kind: "context",
       type: "album",
       id: "wish-you-were-here",
-      uri: "spotify:album:wish-you-were-here",
+      uri: "navidrome:album:wish-you-were-here",
       name: "Wish You Were Here"
     }
   })

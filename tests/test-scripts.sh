@@ -123,37 +123,37 @@ grep -q -- '--locked --release' "$release_cargo_log"
 grep -q '^source-build:' "$release_runtime/backend-origin"
 
 mkdir -p "$test_root/config/omarchy-navidrome"
-cp -- "$source_root/config/spotifyd.conf" "$test_root/config/omarchy-navidrome/spotifyd.conf"
-printf '%s\n' 'device = "legacy_output"' >>"$test_root/config/omarchy-navidrome/spotifyd.conf"
+cp -- "$source_root/config/backend.conf" "$test_root/config/omarchy-navidrome/backend.conf"
+printf '%s\n' 'device = "legacy_output"' >>"$test_root/config/omarchy-navidrome/backend.conf"
 printf '%s\n%s\n' "Desk speakers" 320 |
-  XDG_CONFIG_HOME="$test_root/config" "$source_root/scripts/configure-spotifyd.sh"
-grep -qx 'device_name = "Desk speakers"' "$test_root/config/omarchy-navidrome/spotifyd.conf"
-grep -qx 'bitrate = 320' "$test_root/config/omarchy-navidrome/spotifyd.conf"
-grep -qx 'no_audio_cache = false' "$test_root/config/omarchy-navidrome/spotifyd.conf"
-grep -qx 'max_cache_size = 1000000000' "$test_root/config/omarchy-navidrome/spotifyd.conf"
-! grep -q '^device[[:space:]]*=' "$test_root/config/omarchy-navidrome/spotifyd.conf"
-grep -qx 'autoplay = true' "$test_root/config/omarchy-navidrome/spotifyd.conf"
+  XDG_CONFIG_HOME="$test_root/config" "$source_root/scripts/configure-backend.sh"
+grep -qx 'device_name = "Desk speakers"' "$test_root/config/omarchy-navidrome/backend.conf"
+grep -qx 'bitrate = 320' "$test_root/config/omarchy-navidrome/backend.conf"
+grep -qx 'no_audio_cache = false' "$test_root/config/omarchy-navidrome/backend.conf"
+grep -qx 'max_cache_size = 1000000000' "$test_root/config/omarchy-navidrome/backend.conf"
+! grep -q '^device[[:space:]]*=' "$test_root/config/omarchy-navidrome/backend.conf"
+grep -qx 'autoplay = true' "$test_root/config/omarchy-navidrome/backend.conf"
 
 printf '%s\n' "Renamed speakers" |
-  XDG_CONFIG_HOME="$test_root/config" "$source_root/scripts/configure-spotifyd.sh"
-grep -qx 'device_name = "Renamed speakers"' "$test_root/config/omarchy-navidrome/spotifyd.conf"
-grep -qx 'bitrate = 320' "$test_root/config/omarchy-navidrome/spotifyd.conf"
-! grep -q '^device[[:space:]]*=' "$test_root/config/omarchy-navidrome/spotifyd.conf"
+  XDG_CONFIG_HOME="$test_root/config" "$source_root/scripts/configure-backend.sh"
+grep -qx 'device_name = "Renamed speakers"' "$test_root/config/omarchy-navidrome/backend.conf"
+grep -qx 'bitrate = 320' "$test_root/config/omarchy-navidrome/backend.conf"
+! grep -q '^device[[:space:]]*=' "$test_root/config/omarchy-navidrome/backend.conf"
 
 printf '%s\n%s\n\n' "Desk speakers" 96 |
-  XDG_CONFIG_HOME="$test_root/config" "$source_root/scripts/configure-spotifyd.sh"
-grep -qx 'bitrate = 96' "$test_root/config/omarchy-navidrome/spotifyd.conf"
-! grep -q '^device[[:space:]]*=' "$test_root/config/omarchy-navidrome/spotifyd.conf"
+  XDG_CONFIG_HOME="$test_root/config" "$source_root/scripts/configure-backend.sh"
+grep -qx 'bitrate = 96' "$test_root/config/omarchy-navidrome/backend.conf"
+! grep -q '^device[[:space:]]*=' "$test_root/config/omarchy-navidrome/backend.conf"
 
 set +e
 printf '%s\n' 'invalid"name' |
-  XDG_CONFIG_HOME="$test_root/config" "$source_root/scripts/configure-spotifyd.sh"
+  XDG_CONFIG_HOME="$test_root/config" "$source_root/scripts/configure-backend.sh"
 invalid_status=$?
 set -e
 [[ $invalid_status -eq 3 ]]
 
 # Exercise setup and removal entirely inside the temporary tree. The mock
-# spotifyd/systemctl binaries prevent package, service, keyring, or user-config
+# cargo/systemctl binaries prevent package, service, keyring, or user-config
 # changes while still covering the scripts' real file permissions and paths.
 mock_bin="$test_root/mock-bin"
 runtime_config="$test_root/runtime-config"
@@ -169,7 +169,6 @@ omarchy_log="$test_root/omarchy.log"
 mkdir -p "$mock_bin" "$runtime_config" "$runtime_cache" "$runtime_state" \
   "$runtime_session" "$runtime_backend" "$runtime_home"
 
-printf '%s\n' '#!/bin/sh' 'exit 0' >"$mock_bin/spotifyd"
 printf '%s\n' \
   '#!/bin/sh' \
   'mkdir -p "${CARGO_TARGET_DIR:?}/release"' \
@@ -194,30 +193,25 @@ printf '%s\n' \
   '  rm -f -- "$HOME/.config/omarchy/plugins/quickshell.navidrome"' \
   'fi' \
   'exit 0' >"$mock_bin/omarchy"
-chmod 755 "$mock_bin/cargo" "$mock_bin/spotifyd" "$mock_bin/systemctl" \
+chmod 755 "$mock_bin/cargo" "$mock_bin/systemctl" \
   "$mock_bin/secret-tool" "$mock_bin/omarchy"
-
-[[ -x $source_root/scripts/spotify-connect-device.py ]]
-"$source_root/scripts/spotify-connect-device.py" self-test |
-  jq -e '.status == "ok"' >/dev/null
 
 PATH="$mock_bin:$PATH" \
 XDG_CONFIG_HOME="$runtime_config" \
 XDG_CACHE_HOME="$runtime_cache" \
 XDG_STATE_HOME="$runtime_state" \
 OMARCHY_NAVIDROME_RUNTIME_DIR="$runtime_backend" \
-OMARCHY_NAVIDROME_SKIP_BACKEND_BUILD=1 \
   "$source_root/scripts/setup.sh" --device-name "Test speakers" >/dev/null
 
-runtime_spotify_config="$runtime_config/omarchy-navidrome/spotifyd.conf"
-runtime_unit="$runtime_config/systemd/user/omarchy-navidrome-spotifyd.service"
-[[ -f $runtime_spotify_config && -f $runtime_unit ]]
-[[ $(stat -c '%a' "$runtime_spotify_config") == 600 ]]
-[[ $(stat -c '%a' "$runtime_unit") == 644 ]]
-grep -qx 'device_name = "Test speakers"' "$runtime_spotify_config"
-grep -qx 'no_audio_cache = false' "$runtime_spotify_config"
-grep -qx 'max_cache_size = 1000000000' "$runtime_spotify_config"
-grep -qx 'Environment=PULSE_LATENCY_MSEC=30' "$runtime_unit"
+runtime_backend_config="$runtime_config/omarchy-navidrome/backend.conf"
+runtime_backend_unit="$runtime_config/systemd/user/omarchy-navidrome.service"
+[[ -f $runtime_backend_config && -f $runtime_backend_unit ]]
+[[ $(stat -c '%a' "$runtime_backend_config") == 600 ]]
+[[ $(stat -c '%a' "$runtime_backend_unit") == 644 ]]
+grep -qx 'device_name = "Test speakers"' "$runtime_backend_config"
+grep -qx 'no_audio_cache = false' "$runtime_backend_config"
+grep -qx 'max_cache_size = 1000000000' "$runtime_backend_config"
+grep -qx 'Environment=PULSE_LATENCY_MSEC=30' "$runtime_backend_unit"
 
 PATH="$mock_bin:$PATH" \
 XDG_CONFIG_HOME="$runtime_config" \
@@ -226,21 +220,20 @@ XDG_STATE_HOME="$runtime_state" \
 OMARCHY_NAVIDROME_RUNTIME_DIR="$runtime_backend" \
   "$source_root/scripts/remove-runtime.sh" >/dev/null
 
-[[ ! -e $runtime_unit && ! -e $runtime_config/omarchy-navidrome ]]
+[[ ! -e $runtime_backend_unit && ! -e $runtime_config/omarchy-navidrome ]]
 find "$runtime_config" -maxdepth 1 -type d -name 'omarchy-navidrome.bak.*' \
   | grep -q .
 
 # The in-app first-run wrapper must complete the unprivileged setup directly
-# when spotifyd is already present.
+# (the mock cargo builds the plugin-owned backend; no distro fallback exists).
 PATH="$mock_bin:$PATH" \
 XDG_CONFIG_HOME="$runtime_config" \
 XDG_CACHE_HOME="$runtime_cache" \
 XDG_STATE_HOME="$runtime_state" \
 OMARCHY_NAVIDROME_RUNTIME_DIR="$runtime_backend" \
-OMARCHY_NAVIDROME_SKIP_BACKEND_BUILD=1 \
   "$source_root/scripts/setup-playback.sh" >/dev/null
-[[ -f $runtime_spotify_config && -f $runtime_unit ]]
-grep -qx 'device_name = "Omarchy Navidrome"' "$runtime_spotify_config"
+[[ -f $runtime_backend_config && -f $runtime_backend_unit ]]
+grep -qx 'device_name = "Omarchy Navidrome"' "$runtime_backend_config"
 
 # Guided first-run: the live probe against a fake Navidrome decides whether
 # anything is stored, typed outcomes map to exit codes, and a plain http://
@@ -329,7 +322,6 @@ run_first_run() {
   XDG_RUNTIME_DIR="$runtime_session" \
   OMARCHY_NAVIDROME_RUNTIME_DIR="$runtime_backend" \
   env \
-    OMARCHY_NAVIDROME_SKIP_BACKEND_BUILD=1 \
     TEST_KEYRING_LOG="$keyring_log" \
     "$@" \
     "$source_root/scripts/setup-playback.sh"
@@ -455,11 +447,15 @@ installed_hash=$(sha256sum -- "$runtime_backend/omarchy-navidrome-backend")
 printf '%s\n' 'stale backend' >"$runtime_backend/omarchy-navidrome-backend"
 chmod 755 "$runtime_backend/omarchy-navidrome-backend"
 printf '%s\n' 'stale unit' >"$runtime_backend_unit"
-selected_unit=$(PATH="$mock_bin:$PATH" \
+# With the fallback runtime gone, a stale install reports no usable unit.
+set +e
+PATH="$mock_bin:$PATH" \
   XDG_CONFIG_HOME="$runtime_config" \
   OMARCHY_NAVIDROME_RUNTIME_DIR="$runtime_backend" \
-  "$source_root/scripts/playback-runtime.sh" unit)
-[[ $selected_unit == omarchy-navidrome-spotifyd.service ]]
+  "$source_root/scripts/playback-runtime.sh" unit >/dev/null 2>&1
+stale_unit_status=$?
+set -e
+[[ $stale_unit_status -eq 1 ]]
 
 : >"$systemctl_log"
 PATH="$mock_bin:$PATH" \
@@ -497,8 +493,8 @@ mkdir -p "$runtime_config/omarchy-navidrome" \
   "$runtime_config/omarchy-navidrome.bak.20260827000000" \
   "$runtime_cache/spotifyd" "$runtime_cache/omarchy-navidrome/target" \
   "$runtime_session/omarchy-navidrome"
-cp -- "$source_root/config/spotifyd.conf" "$runtime_config/omarchy-navidrome/spotifyd.conf"
-printf '%s\n' stale >"$runtime_config/omarchy-navidrome.bak.20260827000000/spotifyd.conf"
+cp -- "$source_root/config/backend.conf" "$runtime_config/omarchy-navidrome/backend.conf"
+printf '%s\n' stale >"$runtime_config/omarchy-navidrome.bak.20260827000000/backend.conf"
 printf '%s\n' stale >"$runtime_cache/omarchy-navidrome/target/build-artifact"
 printf '%s\n' stale >"$runtime_session/omarchy-navidrome/backend.sock"
 : >"$systemctl_log"
@@ -576,33 +572,17 @@ TEST_OMARCHY_LOG="$omarchy_log" \
   "$source_root/scripts/uninstall.sh" >/dev/null
 [[ $(grep -c '^plugin remove quickshell.navidrome --yes$' "$omarchy_log") -eq 1 ]]
 
-mkdir -p "$runtime_state/omarchy-navidrome/oauth" "$runtime_cache/spotifyd/oauth"
-printf '%s\n' '{"mock":"credential"}' \
-  >"$runtime_state/omarchy-navidrome/oauth/credentials.json"
-printf '%s\n' '{"mock":"legacy-credential"}' \
-  >"$runtime_cache/spotifyd/oauth/credentials.json"
-XDG_CACHE_HOME="$runtime_cache" \
-XDG_STATE_HOME="$runtime_state" \
-  "$source_root/scripts/playback-runtime.sh" credentials
-PATH="$mock_bin:$PATH" \
-XDG_CACHE_HOME="$runtime_cache" \
-XDG_STATE_HOME="$runtime_state" \
-  "$source_root/scripts/playback-runtime.sh" logout
-[[ ! -e $runtime_state/omarchy-navidrome/oauth/credentials.json ]]
-[[ ! -e $runtime_cache/spotifyd/oauth/credentials.json ]]
-if XDG_CACHE_HOME="$runtime_cache" XDG_STATE_HOME="$runtime_state" \
-    "$source_root/scripts/playback-runtime.sh" credentials; then
-  echo "playback-runtime.sh reported removed credentials" >&2
-  exit 1
-fi
-
-set +e
-PATH="$mock_bin:$PATH" \
-XDG_CACHE_HOME="relative-cache" \
-  "$source_root/scripts/playback-runtime.sh" logout >/dev/null 2>&1
-unsafe_logout_status=$?
-set -e
-[[ $unsafe_logout_status -eq 3 ]]
+# The fallback runtime and its credential-file actions are gone: the engine
+# reads its credentials through configure_server, and the keyring identity is
+# cleared by AuthManager / remove-runtime.sh.
+for removed_action in credentials logout; do
+  set +e
+  PATH="$mock_bin:$PATH" \
+    "$source_root/scripts/playback-runtime.sh" "$removed_action" >/dev/null 2>&1
+  removed_action_status=$?
+  set -e
+  [[ $removed_action_status -eq 2 ]]
+done
 
 [[ -x $source_root/scripts/setup-playback.sh ]]
 [[ -x $source_root/scripts/backend-source-id.sh ]]
@@ -610,20 +590,33 @@ set -e
 grep -q 'remove-runtime.sh.*--purge' "$source_root/scripts/uninstall.sh"
 grep -q 'omarchy plugin remove quickshell.navidrome --yes' "$source_root/scripts/uninstall.sh"
 grep -q '^## Remove it completely$' "$source_root/README.md"
-grep -q 'pkexec /usr/bin/pacman -S --needed --noconfirm spotifyd' \
-  "$source_root/scripts/setup-playback.sh"
-! grep -q 'sudo' "$source_root/scripts/setup-playback.sh"
+! grep -q 'pkexec\|pacman\|sudo' "$source_root/scripts/setup-playback.sh"
 # Package 2 removed the OAuth/browser authorization flow and its scripts with
 # it; the plugin's only credential path is the Navidrome keyring identity.
+# The cleanup pass removed the remaining Spotify-only surfaces: the Web API
+# transport, Connect discovery, the spotifyd fallback chain, and the legacy
+# client-ID setting.
 for removed_script in pkce.sh return-from-auth.sh spotifyd-auth.sh \
-  spotifyd-logout.sh; do
+  spotifyd-logout.sh configure-spotifyd.sh \
+  benchmark-spotify-desktop.sh spotify-connect-device.py; do
   [[ ! -e $source_root/scripts/$removed_script ]] || {
-    echo "the OAuth-era script $removed_script must be gone" >&2
+    echo "the OAuth/Spotify-era script $removed_script must be gone" >&2
     exit 1
   }
 done
-[[ ! -e $source_root/OAuth.js ]] || { echo "OAuth.js must be gone" >&2; exit 1; }
-! grep -qi 'pkce\|callbackListener\|quickshell-spotify' "$source_root/AuthManager.qml"
+for removed_file in OAuth.js SpotifyApi.qml SpotifyConnectManager.qml \
+  config/spotifyd.conf systemd/omarchy-navidrome-spotifyd.service \
+  tests/tst_spotify_api.qml tests/test_connect_helper.py; do
+  [[ ! -e $source_root/$removed_file ]] || {
+    echo "the Spotify-era file $removed_file must be gone" >&2
+    exit 1
+  }
+done
+[[ ! -e $source_root/patches/spotifyd-0.4.2-local-librespot.patch ]] || {
+  echo "the librespot patch provenance must be gone" >&2
+  exit 1
+}
+! grep -qi 'pkce\|callbackListener\|quickshell-spotify\|withAccessToken' "$source_root/AuthManager.qml"
 # The Navidrome credential model: keyring identity scoped by fixed attributes,
 # validation through Subsonic.js, and the write path via keyring-store.sh.
 grep -qF 'service", "quickshell-navidrome' "$source_root/AuthManager.qml"
@@ -635,11 +628,12 @@ grep -qF 'kind navidrome-credentials' "$source_root/scripts/keyring-store.sh"
 grep -qF 'keyring-store.sh' "$source_root/scripts/setup-playback.sh"
 grep -qF 'navidrome-credentials' "$source_root/scripts/remove-runtime.sh"
 ! grep -q 'socat\|xdg-open' "$source_root/scripts/setup.sh"
-# The legacy Spotify client-ID setting stays for settings-file compatibility
-# until the settings cleanup pass; nothing in the port consumes it.
-grep -q '"clientId"' "$source_root/manifest.json"
-! grep -q 'settings.clientId' "$source_root/Service.qml"
+# The Spotify-only settings are gone with the removal pass (package 6 keeps
+# the remaining settings surface).
+! grep -q 'clientId' "$source_root/manifest.json"
+! grep -q 'clientId' "$source_root/Service.qml"
 ! grep -q '"oauthPort"' "$source_root/manifest.json"
+! grep -qi 'spotify\|spotifyd' "$source_root/README.md"
 grep -q 'gh attestation verify' "$source_root/scripts/build-backend.sh"
 grep -q -- '--cert-identity' "$source_root/scripts/build-backend.sh"
 grep -q -- '--source-ref' "$source_root/scripts/build-backend.sh"
@@ -670,10 +664,11 @@ jq -e '.version == "0.1.0"
   and (.barWidget.schema[] | select(.key == "audioQuality").defaultValue) == "320 kbps"' \
   "$source_root/manifest.json" >/dev/null
 grep -qx 'section=left' "$source_root/scripts/install-local.sh"
-grep -qx 'bitrate = 320' "$source_root/config/spotifyd.conf"
-grep -qx 'no_audio_cache = false' "$source_root/config/spotifyd.conf"
-grep -qx 'max_cache_size = 1000000000' "$source_root/config/spotifyd.conf"
-grep -qx 'Conflicts=omarchy-navidrome-spotifyd.service' \
+grep -qx 'bitrate = 320' "$source_root/config/backend.conf"
+grep -qx 'no_audio_cache = false' "$source_root/config/backend.conf"
+grep -qx 'max_cache_size = 1000000000' "$source_root/config/backend.conf"
+! grep -q 'Conflicts=' "$source_root/systemd/omarchy-navidrome.service"
+grep -q -- '--config-path=%h/.config/omarchy-navidrome/backend.conf' \
   "$source_root/systemd/omarchy-navidrome.service"
 grep -qx 'Environment=PULSE_LATENCY_MSEC=30' \
   "$source_root/systemd/omarchy-navidrome.service"

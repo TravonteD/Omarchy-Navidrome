@@ -3,10 +3,10 @@ import Quickshell
 import "../.." as Plugin
 
 ShellRoot {
-  // Live integration for the Navidrome credential model: validation, the
-  // transitional SpotifyApi shim, payload parsing, and a full keyring save
-  // round-trip against a stubbed secret-tool (OMARCHY_AUTH_TEST_DIR holds a
-  // plugin dir with scripts/keyring-store.sh; the stub records argv only).
+  // Live integration for the Navidrome credential model: the login state,
+  // payload parsing, and a full keyring save round-trip against a stubbed
+  // secret-tool (OMARCHY_AUTH_TEST_DIR holds a plugin dir with
+  // scripts/keyring-store.sh; the stub records argv only).
   Plugin.AuthManager { id: auth; pluginDir: Quickshell.env("OMARCHY_AUTH_TEST_DIR") }
   Plugin.BackendClient { id: backend }
 
@@ -16,16 +16,8 @@ ShellRoot {
     interval: 1
     running: true
     onTriggered: {
-      // Transitional SpotifyApi shim: Web API paths fail immediately.
-      var shimError = ""
-      auth.withAccessToken(function(token, reason) {
-        if (token !== null) throw new Error("Shim delivered a token")
-        shimError = reason
-      })
-      if (shimError.indexOf("removed in the Navidrome port") < 0)
-        throw new Error("Shim error was not transitional: " + shimError)
-      auth.invalidateAccessToken()
-      if (auth.tokenIsFresh()) throw new Error("tokenIsFresh ignored the login state")
+      // "Signed in" means a complete credential set; there is no token.
+      if (auth.loggedIn) throw new Error("loggedIn before any credential load")
 
       // Empty credentials mean "not set up yet".
       var credentials = auth.navidromeCredentials()

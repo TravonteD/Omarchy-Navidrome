@@ -2,7 +2,7 @@
 set -euo pipefail
 
 config_root=${XDG_CONFIG_HOME:-"$HOME/.config"}
-config_file="$config_root/omarchy-navidrome/spotifyd.conf"
+config_file="$config_root/omarchy-navidrome/backend.conf"
 
 IFS= read -r device_name
 bitrate=""
