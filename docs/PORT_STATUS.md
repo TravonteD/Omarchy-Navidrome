@@ -292,19 +292,151 @@ bookmark/play-queue/restore-plan tests), 19 python helper tests, the script
 tests, and both Quickshell integration checks. `cargo fmt`/`clippy` and
 `qmllint` stay clean.
 
-## Next packages
+## Package 5, part A — library browsing through Subsonic (10 November 2026, ff2c15d)
 
-1. Navidrome API layer (`Api.js`/`SpotifyApi.qml` rewrite on Subsonic JSON) —
-   transport and verbs landed; the remaining piece is rewiring
-   `SearchController`/consumers onto it, which lands with package 5's UI pass.
-2. Setup, credentials, connectivity — landed (see above); package 5 reuses
+The data layer moved off the Web API for good. `Api.js` was rewritten onto
+the Subsonic shapes: row builders (`subsonicSongRow`, `subsonicAlbumRow`,
+`subsonicArtistRow`, `subsonicPlaylistRow`, `subsonicSongRefRow`) mapping
+normalized Subsonic nodes into the existing row model with cover-art ids
+resolved through `Subsonic.coverArtUrl` (credentials live only in the built
+URL and are never logged or persisted), `navidromeUri` context keys replacing
+Spotify URIs for context playback, `search3` window types/params and the
+page shapers for the unified search, starred-state helpers sharing one saved
+key across surfaces, and playlist CRUD switched from `uris` bodies to Subsonic
+song ids. The Spotify-era helpers (This Is playlist discovery, track radio
+seeding, discovery-playlist ranking, catalog search text) were deleted rather
+than ported. `Subsonic.js` gained `parseStarred2` (each group normalizes
+through the shared node shapes; an absent group parses empty, never an
+error). `SearchController` was rewired onto `search3` with the same
+first-page/pagination semantics, and `Service.qml` moved every browsing,
+search, star, and playlist verb onto the `SubsonicApi` transport. Panel
+headings and login strings were renamed (Home, Explore, "Connect your
+Navidrome server…"), but the views themselves were still interim Spotify-era
+layouts.
+
+## Package 5, part B — panel views rebuilt on Navidrome content (10 November 2026, 4ac9a65)
+
+The panel layouts were rebuilt for what Subsonic actually returns. Home is
+the plan's `getAlbumList2` windows — recently played, frequently played, and
+newest albums — plus the starred window shared with the library's single
+`getStarred2` pass. Explore gains random albums and genre browsing: one genre
+name drives a `byGenre` `getAlbumList2` window, with `Load more` pacing via
+the FilterScanController machinery for long genre lists. The library shows
+starred songs, albums, and artists from that same `getStarred2` read; artist
+pages list the artist's albums with top songs; album pages list their tracks.
+Context playback moved from Spotify URIs to context keys (`contextSourceKey`,
+`playlistForContext(key)`), so Play on a row keeps playing its displayed
+album/playlist/search context. The previously verified standards carried
+over unchanged: row actions, keyboard navigation, the compact 300px layout,
+scroll and depth restoration, artwork gating, and Save/star state
+consistency across bar, mini-player, and panel. `tests/integration/AppSmoke.qml`
+grew a Navidrome-shaped smoke pass over the rebuilt views.
+
+## Removal pass — Spotify-only surfaces deleted (10 November 2026, 5708b55)
+
+Once package 5's replacements existed, everything that existed only because
+Spotify does was deleted in one pass (~6,700 lines removed):
+
+- `SpotifyApi.qml`, `SpotifyConnectManager.qml`, `tests/tst_spotify_api.qml`,
+  `tests/test_connect_helper.py`, `scripts/spotify-connect-device.py`, and
+  `scripts/benchmark-spotify-desktop.sh` are gone; `AuthManager.qml` lost the
+  transitional `withAccessToken` shim entirely (the script gate now asserts
+  no `pkce`/`callbackListener`/`quickshell-spotify`/`withAccessToken` trace
+  remains).
+- The spotifyd fallback chain is gone: `systemd/omarchy-navidrome-spotifyd.service`,
+  `config/spotifyd.conf` (renamed to the engine's `backend.conf`), both
+  librespot patches, and the playback-runtime `credentials`/`logout`
+  file actions (the engine reads its credentials through `configure_server`).
+- `Service.qml` shed the entire remote-playback half (~1,450 lines): remote
+  state, remote seek/volume, device discovery, remembered devices, Sonos
+  control, and the restricted-device logic. Playback truth is local-only,
+  from the engine's state snapshots; `DaemonManager.qml` lost the fallback
+  runtime and credential-check machinery; `BarWidget.qml` was repointed to
+  the service alias with renamed surface keys.
+- Docs were rewritten for the port (README, TECHNICAL, BENCHMARK history,
+  RELEASING), the CI validation workflow updated, and `tests/test-scripts.sh`
+  extended to assert the removals stay removed (no Spotify-era scripts,
+  files, or patches; no `clientId` in manifest/Service; no spotify string in
+  the README).
+
+The engine unit is the single playback runtime; the socket-first startup
+diagnostics and restart bounds carry over unchanged.
+
+## Package 6 — lyrics, radio, and settings cleanup (11 November 2026, 6863814)
+
+Lyrics became built-in. `Subsonic.js` grew `lyricsParams`, `emptyLyrics`,
+`normalizeLyricsLine`, and `parseLyricsBySongId` (embedded, external, and
+synced content through the shared normalizers), and the panel gained a lyrics
+surface with synced-line highlight driven by the engine's MPRIS position —
+behind the existing `showLyrics` setting, hide-button behavior, and
+`Ctrl+Shift+L`, all filtered out of the shortcuts reference while the surface
+is off. The Omasing handoff is deleted: `LyricsInstallPrompt.qml`, the
+optional-plugin install intent machinery, and the launch process; the mini
+player's lyrics action now opens the full player's surface.
+
+Explore also gained the `getInternetRadioStations` source
+(`normalizeRadioStation`/`parseInternetRadioStations`), with stations kept
+visually separate from library songs. Playing a station is a typed deferral:
+the stream engine builds `/rest/stream` URLs for library ids only and cannot
+open external stream addresses, so radio playback waits for the engine to
+grow external-stream support. The Spotify "last radio" playlist persistence
+and the track-radio context action are gone (similarity needs server-side
+Last.fm).
+
+The audio-quality setting grew into the Navidrome pair: stream format
+(source/mp3/flac/wav/ogg/opus/aac) and a bounded bit-rate cap
+(0/64/96/128/192/320), validated against `backend/src/config.rs` exactly and
+written to `backend.conf` `[global]` `format`/`max_bit_rate` on every
+settings change via `scripts/configure-backend.sh`; the legacy `bitrate` key
+was dropped from the shipped default config.
+
+## Port complete pending live-server validation
+
+All packages of [the port plan](NAVIDROME_PORT_PLAN.md) — 0 through 7 — have
+landed. Package 7 rewrote the README (Navidrome story, requirements,
+first-run setup, shortcuts table verified against Panel.qml's own shortcut
+reference), TECHNICAL (architecture, the request core, the v2 engine, the
+security contract, endpoints), RELEASING (local build, versioned archive,
+and a checksum note; the GitHub attestation chain is dormant in
+`scripts/build-backend.sh` until the first real release), and the CHANGELOG
+(fresh 0.1.0 section describing the port). `scripts/install-local.sh`
+compiles the backend to `$XDG_CACHE_HOME/omarchy-navidrome/target`, links
+the checkout, enables the widget, and reloads discovery through Omarchy;
+`scripts/uninstall.sh` + `remove-runtime.sh --purge` keep the owned-file
+inventory current (configuration, backend binary and sidecar checksums,
+build cache, state, session runtime, both unit names, config backups, and
+the `quickshell-navidrome` keyring identity, plus the legacy pre-port
+leftovers).
+
+What remains for acceptance:
+
+- **Live-server validation** with real credentials, supplied out of band
+  (environment variables, never committed or logged): the plan's per-package
+  live checks — probe and typed credential errors, streaming across the
+  format list, the scrobble matrix against real play counts, queue
+  save/replay round-trip, bookmark-exact resume, the package 5 view
+  standards, artwork gating, and the benchmark gates re-earned against
+  Navidrome content.
+- **Radio playback deferral.** Playing an internet-radio station is typed as
+  deferred; the stream engine grows external-stream support for
+  non-library stream addresses later.
+- **MPRIS bus rename follow-ups:** none noted. The bus name
+  (`OmarchyNavidrome.instance<pid>`) and the TrackId path are already
+  renamed; no follow-up is pending.
+
+## Previously listed next packages
+
+Every package listed below has now landed; the entries above record them:
+
+1. Navidrome API layer — transport, verbs, and the package 5 UI rewiring.
+2. Setup, credentials, connectivity — landed; package 5 reused
    `saveNavidromeCredentials()` for the in-app setup UI.
-3. Stream engine (Rust `/rest/stream` player with symphonia + rodio).
-4. Queue, scrobble, resume persistence — landed (see above); package 5 binds
-   the restore trigger to the real resume UI.
-5. Collection and discovery UI adaptation.
-6. Lyrics (`getLyricsBySongId`), internet radio, settings cleanup.
-7. Docs, release, install scripts.
+3. Stream engine — landed (protocol v2, symphonia + rodio).
+4. Queue, scrobble, resume persistence — landed; package 5 bound the restore
+   trigger to the real resume UI.
+5. Collection and discovery UI adaptation — landed (parts A and B above).
+6. Lyrics (`getLyricsBySongId`), internet radio, settings cleanup — landed.
+7. Docs, release, install scripts — landed (see the completion section).
 
-Live-server validation (user's Navidrome instance) begins with package 1's
-transport work; credentials will be supplied out of band only.
+Live-server validation (user's Navidrome instance) is the remaining gate;
+credentials will be supplied out of band only.

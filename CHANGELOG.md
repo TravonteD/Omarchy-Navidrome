@@ -9,6 +9,20 @@ record Navidrome-relevant behavior only. The bullet list under this section
 describes the inherited baseline and is reduced as the port removes or
 replaces capabilities.
 
+Package 5 (10 November 2026): the panel views were rebuilt on Navidrome
+content. `Api.js` and the service were rewired onto the Subsonic transports
+— Subsonic rows, `navidromeUri` contexts, and `search3` windows replaced the
+Web API shapes — and Home became bounded `getAlbumList2` windows (recently
+played, frequent, newest) plus the starred window from `getStarred2`; Explore
+gained random albums and genre browsing via `getGenres`; the library shows
+starred songs, albums, and artists from `getStarred2`; artist pages list
+albums with top songs from `getArtist`/`getTopSongs`; album pages list their
+tracks; playlists operate on Subsonic ids with the same CRUD verbs. Search
+covers songs, albums, artists, and playlists through bounded `search3`
+windows with the existing pagination, cancellation, and stale-response
+guarantees. The `clientId` editor and every Spotify data path left the panel
+surface.
+
 Removal pass (10 November 2026, once the package 5 Subsonic replacements
 existed): the Web API transport (`SpotifyApi.qml`) and its OAuth shim,
 Spotify Connect (`SpotifyConnectManager.qml`, local discovery helper, Devices
