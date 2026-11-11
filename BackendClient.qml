@@ -3,6 +3,7 @@ import Quickshell
 import Quickshell.Io
 
 import "Api.js" as Api
+import "Subsonic.js" as Subsonic
 
 // Private Unix-socket client for the plugin backend. Local load/control uses
 // this when the supervised process is running; the Subsonic web API and MPRIS
@@ -32,6 +33,16 @@ Item {
   // flag flips true once the backend acknowledges a configuration; the
   // Service layer re-sends before resuming playback whenever it is false.
   property bool serverConfigured: false
+
+  // Error code from the last failed command response ("" after a success).
+  // State-event codes stay on errorCode; both are typed through Subsonic.js.
+  property string commandErrorCode: ""
+  readonly property string errorCategory:
+    Subsonic.backendErrorCategory(commandErrorCode || errorCode)
+  // Credential-class failures are terminal: they never consume a reconnect
+  // budget and the UI shows a typed state instead of retrying.
+  readonly property bool credentialFailure:
+    Subsonic.isTerminalCredentialCategory(errorCategory)
 
   readonly property string socketPath: {
     var runtime = Quickshell.env("XDG_RUNTIME_DIR")
@@ -121,9 +132,12 @@ Item {
     for (var key in pending) if (key !== id) nextPending[key] = pending[key]
     pending = nextPending
     if (typeof callback !== "function") return
-    if (message.ok === true) callback(true, message.result || ({}), "")
-    else {
+    if (message.ok === true) {
+      commandErrorCode = ""
+      callback(true, message.result || ({}), "")
+    } else {
       var error = message.error || {}
+      commandErrorCode = String(error.code || "")
       callback(false, null, Api.redact(String(error.message
         || "Playback command failed")))
     }
@@ -138,6 +152,7 @@ Item {
     serverConfigured = false
     errorCode = ""
     errorMessage = ""
+    commandErrorCode = ""
     lastState = null
     reconnectAttempt = 0
     resetPending("Playback on this computer stopped")

@@ -18,7 +18,6 @@ Item {
   property string deviceName: "Omarchy Navidrome"
   property int bitrateKbps: 320
   property string unitName: "omarchy-navidrome.service"
-  property bool authenticationCancelled: false
   property bool mprisPresent: false
 
   property bool binaryAvailable: false
@@ -36,22 +35,26 @@ Item {
   readonly property bool running: mprisPresent || serviceActive
   property bool busy: false
   property bool setupBusy: false
+  // Transitional always-false flags: the browser authorization flow was
+  // removed with the OAuth machinery (package 2). They stay declared because
+  // the setup UI still reads them; the cleanup pass drops them.
   property bool authenticationBusy: false
   property bool credentialsClearBusy: false
   property bool configurationBusy: false
   property bool configurationPending: false
   property bool startAfterConfiguration: false
   property string configurationInput: ""
-  property bool authAfterStop: false
+  property bool explicitStart: false
   property string lastError: ""
   property bool terminalFailure: false
-  property bool explicitStart: false
   property int startupStatusAttempts: 0
 
   signal started()
   signal stopped()
   signal setupSucceeded()
   signal setupFailed(string reason)
+  // Transitional: never emitted since the OAuth authorization flow was
+  // removed; the Connections in Service.qml stay for the interim.
   signal authenticationSucceeded()
   signal authenticationFailed(string reason)
   signal credentialsCleared()
@@ -164,65 +167,26 @@ Item {
   }
 
   function stop() {
-    if (busy && !authenticationBusy) return
+    if (busy && !credentialsClearBusy) return
     lastError = ""
     busy = true
     stopCommand.running = true
-  }
-
-  function authenticate() {
-    if (authenticationBusy) return
-    if (!binaryAvailable) {
-      lastError = "Playback support is not installed yet"
-      authenticationFailed(lastError)
-      return
-    }
-    if (!unitAvailable) {
-      lastError = "Playback support needs to be set up"
-      authenticationFailed(lastError)
-      return
-    }
-    authenticationBusy = true
-    busy = true
-    lastError = ""
-    authAfterStop = true
-    stopCommand.running = true
-  }
-
-  function beginAuthenticationProcess() {
-    authAfterStop = false
-    if (authenticationCancelled) {
-      authenticationCancelled = false
-      authenticationBusy = false
-      busy = false
-      return
-    }
-    authCommand.command = [pluginDir + "/scripts/spotifyd-auth.sh"]
-    authCommand.running = true
   }
 
   function cancelAuthentication() {
-    if (!authenticationBusy && !authAfterStop) return
-    authenticationCancelled = true
-    authAfterStop = false
-    lastError = ""
-    if (authCommand.running) authCommand.running = false
-    authenticationBusy = false
-    busy = false
-  }
-
-  function returnFromAuthentication() {
-    if (!pluginDir || returnCommand.running) return
-    returnCommand.command = [pluginDir + "/scripts/return-from-auth.sh"]
-    returnCommand.running = true
+    // Transitional no-op: the spotifyd OAuth authorization flow was removed
+    // with package 2. Service.qml's cancel path still calls this.
   }
 
   function clearCredentials() {
-    if (credentialsClearBusy || authenticationBusy) return
+    if (credentialsClearBusy) return
     credentialsClearBusy = true
     busy = true
     lastError = ""
-    clearCredentialsCommand.command = [pluginDir + "/scripts/spotifyd-logout.sh"]
+    // Only the spotifyd fallback's saved OAuth files are cleared here; the
+    // Navidrome keyring credential set is cleared by AuthManager.logout().
+    clearCredentialsCommand.command = ["/usr/bin/bash",
+      pluginDir + "/scripts/playback-runtime.sh", "logout"]
     clearCredentialsCommand.running = true
   }
 
@@ -402,54 +366,10 @@ Item {
     stderr: StdioCollector { waitForEnd: true }
     onExited: function(exitCode) {
       root.serviceActive = false
-      if (root.authAfterStop) {
-        root.beginAuthenticationProcess()
-        return
-      }
       root.busy = false
       if (exitCode === 0) root.stopped()
       else root.lastError = "Could not stop playback on this computer"
     }
-  }
-
-  Process {
-    id: authCommand
-    stdout: SplitParser {
-      splitMarker: "\n"
-      onRead: function(line) { root.safeError(line) }
-    }
-    // Consume authentication output without forwarding it to the journal or
-    // retaining it in a long-lived collector.
-    stderr: SplitParser {
-      splitMarker: "\n"
-      onRead: function(line) { root.safeError(line) }
-    }
-    onExited: function(exitCode) {
-      if (root.authenticationCancelled) {
-        root.authenticationCancelled = false
-        root.authenticationBusy = false
-        root.busy = false
-        return
-      }
-      root.authenticationBusy = false
-      root.busy = false
-      if (exitCode === 0) {
-        root.credentialsAvailable = true
-        root.credentialsChecked = true
-        root.authenticationSucceeded()
-        root.returnFromAuthentication()
-      } else {
-        root.checkCredentials()
-        root.lastError = "Spotify could not connect playback on this computer. Try again"
-        root.authenticationFailed(root.lastError)
-      }
-    }
-  }
-
-  Process {
-    id: returnCommand
-    stdout: StdioCollector { waitForEnd: true }
-    stderr: StdioCollector { waitForEnd: true }
   }
 
   Process {

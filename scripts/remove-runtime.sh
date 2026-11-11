@@ -105,8 +105,13 @@ if (( purge )); then
     echo "Removed old configuration backup: $backup"
   done
   if command -v secret-tool >/dev/null 2>&1; then
+    # Legacy Spotify OAuth refresh tokens from installs before the port, then
+    # the current Navidrome credential identity.
     for _ in {1..100}; do
       secret-tool clear service quickshell-spotify kind refresh-token >/dev/null 2>&1 || break
+    done
+    for _ in {1..100}; do
+      secret-tool clear service quickshell-navidrome kind navidrome-credentials >/dev/null 2>&1 || break
     done
     echo "Cleared matching Omarchy Navidrome keyring entries."
   fi

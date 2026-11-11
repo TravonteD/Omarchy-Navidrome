@@ -136,12 +136,86 @@ pass yet) and Spotify remote playback stays the fallback.
 - Decide the fate of the pre-existing Quickshell smoke failure above: fix the
   harness stub or restore theme initialization so the gate is green.
 
+## Package 2 — setup, credentials, connectivity (10 November 2026)
+
+The OAuth/browser authorization flow was replaced by a Navidrome credential
+model built on the keyring:
+
+- `AuthManager.qml` is now the credential model: it loads one credential set
+  (server URL, username, password) from the keyring at startup,
+  `loggedIn` means all three are present, and the old login property surface
+  Service.qml consumes (`loggedIn`, `sessionChecked`, `sessionBusy`,
+  `loginBusy`, `beginLogin`, `cancelLogin`, `logout`, `tokenIsFresh`) is
+  repointed to Navidrome semantics. Keyring identity: fixed attributes
+  `service=quickshell-navidrome, kind=navidrome-credentials` with a single-line
+  JSON payload `{v,url,username,password}` — one credential set per install,
+  the URL inside the payload is the server identity, so saving again
+  overwrites in place and a different URL replaces it. New
+  `saveNavidromeCredentials()` validates through Subsonic.js
+  (`normalizeServerUrl` → typed error; `isInsecureServerUrl` → the
+  `navidromeUrlInsecure` warning flag, set regardless of display) and persists
+  via `scripts/keyring-store.sh`, which now stores the payload from stdin
+  under the new identity (python3-validated, secret on stdin only, never
+  argv). Package 5's setup UI reuses that function.
+- Transitional shim: `SpotifyApi.qml` still requires an `auth` object, so
+  `AuthManager.withAccessToken()` now fails every Web API path immediately
+  with a fixed transitional message and `invalidateAccessToken()` is a no-op —
+  all Spotify remote paths degrade into their existing fallbacks. Package 5
+  deletes `SpotifyApi.qml` and this shim. The second Connect AuthManager
+  instance was removed and its references repointed to the single manager.
+- Deleted: `OAuth.js`, `tests/tst_oauth.qml`, `scripts/pkce.sh`,
+  `return-from-auth.sh`, `spotifyd-auth.sh`, `spotifyd-logout.sh`, and the
+  Panel "personal Spotify app" client-ID editor; `clientId` stays in the
+  manifest/setting surface only so existing settings files load (removed
+  during the settings cleanup). `scripts/setup.sh` dropped the OAuth-era
+  `socat`/`xdg-open` command requirements and kept everything else.
+  `playback-runtime.sh` gained a `logout` action (the exact file surface the
+  removed `spotifyd-logout.sh` owned) since the spotifyd fallback and its
+  credential files stay until the cleanup pass.
+- `scripts/setup-playback.sh` is the guided first-run: it keeps the backend
+  install wrapper, then provisions credentials — env/flags for unattended runs
+  (`OMARCHY_NAVIDROME_SERVER_URL/_USERNAME/_PASSWORD`, `--password-file`,
+  never a password flag), terminal prompts otherwise, and a quiet skip when
+  neither is available so the automatic in-shell path never blocks. An
+  embedded python3 probe validates the URL like Subsonic.js, builds token auth
+  (`t = md5(password+salt)`, fresh salt per request, password via environment
+  never argv), calls `ping` then `getUser` against the actual server, and only
+  on success writes the keyring. Typed outcomes map to exit codes (3 invalid
+  URL/input, 10 wrong credentials, 11 token auth rejected, 12 not authorized,
+  1 unreachable/generic or keyring-refused); plain `http://` targets are
+  allowed with a visible "connection is NOT private" warning and TLS
+  validation is never bypassed. Verified against a fake Navidrome server in
+  `tests/test-scripts.sh`: success + insecure warning, wrong password (10),
+  token rejection (11), unreachable (1), invalid URL (3), idempotent re-run
+  (exactly one store per run), and the password never appearing in the
+  keyring-mock log.
+- Reconnect budget re-derived from typed categories: `Subsonic.js` classifies
+  backend protocol-v2 codes (`missing_credentials`, `invalid_configuration`,
+  `stream_rejected` → credential-class terminal; everything else generic),
+  `BackendClient.qml` exposes `errorCategory`/`credentialFailure` over both
+  state-event and command-response error codes, and Service.qml stops the
+  pending-playback push on those failures and surfaces the typed message
+  instead of retrying; generic/network failures keep the retry behavior.
+- Uninstall: `remove-runtime.sh --purge` clears the new
+  `quickshell-navidrome` keyring identity alongside the legacy Spotify
+  entries; the owned-file inventory already covered the new flow (the keyring
+  is the only new owned state), and the README uninstall chapter names the
+  stored credential set.
+
+Validation: the full `scripts/test.sh` gate passes — 44 backend Rust tests,
+237 QML test cases (was 242; tst_oauth.qml's 9 cases removed, 4 new
+Subsonic.js credential/validation tests added), 19 python helper tests, the
+extended script tests, and both Quickshell integration checks (the
+authorization test now drives the live Navidrome save round-trip against a
+stubbed secret-tool and the BackendClient typing). `qmllint` stays clean.
+
 ## Next packages
 
 1. Navidrome API layer (`Api.js`/`SpotifyApi.qml` rewrite on Subsonic JSON) —
    transport and verbs landed; the remaining piece is rewiring
    `SearchController`/consumers onto it, which lands with package 5's UI pass.
-2. Setup, credentials, connectivity (URL/user/password, keyring).
+2. Setup, credentials, connectivity — landed (see above); package 5 reuses
+   `saveNavidromeCredentials()` for the in-app setup UI.
 3. Stream engine (Rust `/rest/stream` player with symphonia + rodio).
 4. Queue, scrobble, resume persistence.
 5. Collection and discovery UI adaptation.

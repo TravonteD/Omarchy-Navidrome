@@ -4,7 +4,7 @@ set -euo pipefail
 source_root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 action=${1:-}
 if (( $# != 1 )); then
-  echo "Usage: scripts/playback-runtime.sh check|credentials|start|start-explicit|stop|status|failure|unit" >&2
+  echo "Usage: scripts/playback-runtime.sh check|credentials|start|start-explicit|stop|status|failure|unit|logout" >&2
   exit 2
 fi
 
@@ -89,6 +89,23 @@ case $action in
   stop)
     systemctl --user stop "$backend_unit" 2>/dev/null || true
     systemctl --user stop "$fallback_unit" 2>/dev/null || true
+    ;;
+  logout)
+    # Removes only the spotifyd fallback's saved OAuth files, exactly the
+    # surface the removed spotifyd-logout.sh owned. The Navidrome keyring
+    # credential set is cleared through AuthManager / remove-runtime.sh.
+    [[ $state_root == /* && $state_root != / && $cache_root == /* && $cache_root != / ]] || exit 3
+    credential_paths=(
+      "$state_root/omarchy-navidrome/oauth/credentials.json"
+      "$state_root/omarchy-navidrome/zeroconf/credentials.json"
+      "$cache_root/spotifyd/oauth/credentials.json"
+      "$cache_root/spotifyd/zeroconf/credentials.json"
+    )
+    [[ ${credential_paths[0]} == "$state_root/omarchy-navidrome/oauth/credentials.json" ]] || exit 3
+    [[ ${credential_paths[2]} == "$cache_root/spotifyd/oauth/credentials.json" ]] || exit 3
+    systemctl --user stop "$backend_unit" 2>/dev/null || true
+    systemctl --user stop "$fallback_unit" 2>/dev/null || true
+    rm -f -- "${credential_paths[@]}"
     ;;
   status)
     unit=$(preferred_unit) || exit 1

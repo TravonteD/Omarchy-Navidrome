@@ -5,6 +5,7 @@ import Quickshell.Io
 import Quickshell.Services.Mpris
 
 import "Api.js" as Api
+import "Subsonic.js" as Subsonic
 
 // Shared state for the bar widget and the lazy full panel. MPRIS supplies local
 // playback changes. External Spotify Connect playback is refreshed only while
@@ -465,7 +466,6 @@ Item {
 
   readonly property bool deviceActivationBusy: spotifyConnectManager.activating
     || (!!pendingConnectDeviceId && spotifyConnectManager.controlling)
-    || connectAuthManager.loginBusy || connectAuthManager.sessionBusy
 
   readonly property int cacheLimit: 200
 
@@ -477,9 +477,9 @@ Item {
   function loginProgressText() {
     if (daemonManager.setupBusy) return "Preparing playback on this computer"
     if (daemonManager.credentialsClearBusy) return "Signing out"
-    if (authManager.loginBusy) return "Approve Spotify access in your browser"
+    if (authManager.loginBusy) return "Saving your Navidrome connection"
     if (authManager.sessionBusy || !authManager.sessionChecked)
-      return "Checking your saved Spotify session"
+      return "Checking your saved Navidrome connection"
     if (!daemonManager.requirementsChecked || !daemonManager.credentialsChecked)
       return "Checking local playback"
     if (daemonManager.authenticationBusy)
@@ -529,10 +529,9 @@ Item {
     var quality = String(next.audioQuality || "320 kbps")
     next.audioQuality = quality.indexOf("96") === 0 ? "96 kbps"
       : (quality.indexOf("160") === 0 ? "160 kbps" : "320 kbps")
-    // A personal Spotify client ID opts out of the shared rate-limit bucket.
-    // Anything that is not a 32-hex ID (including empty) means "keep shipped".
-    var customClientId = String(next.clientId || "").trim()
-    next.clientId = customClientId.toLowerCase()
+    // Legacy Spotify-only setting kept so existing settings files load; the
+    // OAuth machinery that consumed it was removed in the Navidrome port and
+    // the settings cleanup pass deletes the key.
     return next
   }
 
@@ -2840,14 +2839,14 @@ Item {
     pendingConnectWakeTried = false
     if (Api.spotifyConnectTokenType(device.tokenType) !== "default") {
       statusMessage = "Checking permission for " + device.name
-      connectAuthManager.withAccessToken(function(token, error) {
+      authManager.withAccessToken(function(token, error) {
         if (root.pendingConnectDeviceId !== device.id) return
         if (token) {
           root.statusMessage = "Connecting to " + device.name
           spotifyConnectManager.activate(device.id, token)
         } else {
           root.statusMessage = "Approve speaker access in your browser"
-          connectAuthManager.beginLogin()
+          authManager.beginLogin()
         }
       })
     } else {
@@ -3033,6 +3032,14 @@ Item {
       root.pendingPlaybackMessage = successMessage
       root.pendingPlaybackRadio = radioPlaylist
       root.pendingPlaybackSerial = playbackSerial
+      if (backendClient.credentialFailure) {
+        // Credential-class failures are terminal: no fallback push, no retry
+        // loop — the typed state is surfaced for the setup UI instead.
+        root.clearPendingPlayback()
+        root.fail(Subsonic.backendCredentialMessage(backendClient.commandErrorCode)
+          || error || "Playback on this computer is not set up")
+        return
+      }
       root.succeed(Api.localSocketFallbackMessage())
       root.sendPendingPlayback(Api.playbackTargetDeviceId(
         root.localDevice() || root.chooseDevice(), root.selectedDeviceExplicit))
@@ -3599,10 +3606,11 @@ Item {
       daemonManager.setupPlayback()
       return
     }
-    if (!daemonManager.credentialsAvailable) {
-      daemonManager.authenticate()
-      return
-    }
+    // The Navidrome backend takes its credentials from the keyring through
+    // configure_server, so no extra local authorization step exists. The
+    // spotifyd fallback can no longer be authorized either — its OAuth flow
+    // was removed with package 2 and the fallback itself goes in the later
+    // cleanup pass.
     finishLoginFlow()
   }
 
@@ -3611,7 +3619,6 @@ Item {
     lastError = ""
     statusMessage = ""
     authManager.cancelLogin()
-    connectAuthManager.cancelLogin()
     daemonManager.cancelAuthentication()
   }
 
@@ -3627,7 +3634,7 @@ Item {
 
   function finishLoginFlow() {
     loginFlowActive = false
-    succeed("Connected to Spotify")
+    succeed("Connected to Navidrome")
     loadPlaybackState()
     loadProfile()
     loadSidebarPlaylists()
@@ -3642,7 +3649,6 @@ Item {
     deviceProbeTimer.stop()
     spotifyApi.cancelSearch()
     daemonManager.clearCredentials()
-    connectAuthManager.logout()
     authManager.logout()
     clearData()
   }
@@ -3816,12 +3822,11 @@ Item {
     target: authManager
     function onLoginSucceeded() {
       root.syncCurrentTrackSaved(true)
-      var continueSetup = root.loginFlowActive && (!root.daemon.playbackReady
-        || !root.daemon.credentialsAvailable)
+      var continueSetup = root.loginFlowActive && !root.daemon.playbackReady
       root.finishLoginFlow()
       if (continueSetup) {
         root.loginFlowActive = true
-        root.succeed("Spotify connected · finishing playback on this computer")
+        root.succeed("Navidrome connected · finishing playback on this computer")
         root.continueLocalPlaybackSetup()
       }
       if (root.localActivationRequested) deviceProbeTimer.restart()
@@ -3933,13 +3938,13 @@ Item {
   }
 
   Connections {
-    target: connectAuthManager
+    target: authManager
     function onLoginSucceeded() {
       var requested = root.pendingConnectDeviceId
       var device = root.deviceForId(requested)
       if (!requested || !device) return
       root.statusMessage = "Connecting to " + device.name
-      connectAuthManager.withAccessToken(function(token, error) {
+      authManager.withAccessToken(function(token, error) {
         if (root.pendingConnectDeviceId !== requested) return
         if (token) spotifyConnectManager.activate(requested, token)
         else {
@@ -4183,19 +4188,12 @@ Item {
   AuthManager {
     id: authManager
     pluginDir: root.pluginDir
-    customClientId: settings.clientId
-  }
-
-  AuthManager {
-    id: connectAuthManager
-    pluginDir: root.pluginDir
-    clientId: "65b708073fc0480ea92a077233ca87bd"
-    oauthPort: 8990
-    scopes: ["streaming"]
   }
 
   SpotifyApi {
     id: spotifyApi
+    // Transitional: SpotifyApi.qml (and the whole Web API layer) is deleted in
+    // package 5; the AuthManager shim fails every Web API path immediately.
     auth: authManager
   }
 
@@ -4218,7 +4216,16 @@ Item {
     // The initial state event flips lifecycle to "ready": the single point
     // where a fresh connection (or a reconnect) gets configured.
     onLifecycleChanged: root.ensureBackendServerConfigured()
-    onErrorCodeChanged: if (errorCode === "audio_key_unavailable")
-      root.fail(errorMessage || "Spotify could not play this track on this computer")
+    onErrorCodeChanged: {
+      if (errorCode === "audio_key_unavailable")
+        root.fail(errorMessage || "Spotify could not play this track on this computer")
+      else if (backendClient.credentialFailure) {
+        // Typed credential-class state from the engine: terminal, so the
+        // pending playback push stops and the UI explains the actual failure.
+        root.clearPendingPlayback()
+        root.fail(Subsonic.backendCredentialMessage(errorCode)
+          || errorMessage || "Playback on this computer is not set up")
+      }
+    }
   }
 }

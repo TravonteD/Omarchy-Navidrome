@@ -33,7 +33,8 @@ cd "$HOME" && "$HOME/.config/omarchy/plugins/quickshell.navidrome/scripts/uninst
 It disables and removes the plugin, stops and removes both user services,
 restarts the shell, and deletes all plugin-owned configuration, cached audio,
 backend build files, installed binaries, playback state, runtime sockets, old
-configuration backups, and matching GNOME Keyring entries.
+configuration backups, and matching GNOME Keyring entries — including the
+stored Navidrome server credential set.
 
 If you prefer to inspect and paste the main steps individually:
 

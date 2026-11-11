@@ -3,12 +3,21 @@ import Quickshell
 import Quickshell.Io
 
 import "Api.js" as Api
-import "OAuth.js" as OAuth
+import "Subsonic.js" as Subsonic
 
-// OAuth and token storage live here so the rest of the plugin never needs to
-// know what a refresh token looks like. Access tokens exist only in memory;
-// refresh tokens cross the process boundary over stdin and are persisted by
-// GNOME Keyring.
+// Navidrome credentials live here: the server URL, username, and password the
+// plugin and its stream backend need. The full credential set is stored in the
+// keyring as one JSON payload under fixed, plugin-owned attributes
+// (service quickshell-navidrome, kind navidrome-credentials); the URL inside
+// the payload is the server identity, so saving again for the same server
+// overwrites in place and a different server replaces it. Secrets ride stdin
+// only — never argv, never logs, never settings files — and the keyring write
+// goes through scripts/keyring-store.sh.
+//
+// Transitional shim: SpotifyApi.qml still requires an `auth` object with
+// withAccessToken()/invalidateAccessToken(); both now fail Web API paths
+// immediately so they degrade into their existing fallbacks. Package 5
+// deletes SpotifyApi.qml entirely, and this shim with it.
 Item {
   id: root
 
@@ -17,93 +26,43 @@ Item {
   height: 0
 
   required property string pluginDir
-  // spotify-player and ncspot use the defaults below for Web API login.
-  // A second internal instance may override them for the streaming-only grant
-  // required by authorization-code Spotify Connect receivers such as Sonos.
-  property string clientId: "d420a117a32841c2b3474932e49fb54b"
-  // A personal Spotify Developer app client ID opts out of the shared
-  // per-app rate-limit bucket. Empty keeps the shipped client above. Only a
-  // 32-hex value is accepted, so a typo can never redirect the OAuth flow or
-  // the keyring entry (both are scoped per client ID).
-  property string customClientId: ""
-  readonly property bool validClientId: customClientId === "" || /^[0-9a-f]{32}$/i.test(customClientId)
-  readonly property string resolvedClientId: validClientId
-    ? (customClientId ? customClientId.toLowerCase() : clientId) : ""
-  property bool initialized: false
-  property bool switchingIdentity: false
-  Component.onCompleted: {
-    initialized = true
-    if (!validClientId) changeIdentity()
-  }
-  onResolvedClientIdChanged: if (initialized) changeIdentity()
-  property int oauthPort: 8989
-  property string callbackPath: "/login"
-  property var scopes: Api.SCOPES
-  readonly property string redirectUri: "http://127.0.0.1:"
-    + OAuth.normalizedPort(oauthPort) + callbackPath
 
-  property string accessToken: ""
-  property double accessTokenExpiresAt: 0
-  property bool loggedIn: false
-  property bool sessionChecked: false
-  property bool loginBusy: false
-  property bool refreshBusy: false
-  readonly property bool sessionBusy: refreshBusy || secretLookup.running
-  property string lastError: ""
-
-  property var tokenWaiters: []
-  property string lookupPurpose: ""
-  property bool lookupHandled: false
-  property string keyringWriteToken: ""
-
-  property string pkceVerifier: ""
-  property string pkceChallenge: ""
-  property string oauthState: ""
-  property bool callbackHandled: false
-  property bool exchangingCode: false
-  property var tokenRequest: null
-  property var xhrFactory: function() { return new XMLHttpRequest() }
-  property int tokenRequestSerial: 0
-  property bool logoutPendingClear: false
-
-  // Navidrome server credentials for the stream backend (protocol v2's
-  // configure_server). Package 2's setup flow populates these from settings
-  // and the keyring; until then every value stays empty so Service.qml skips
-  // backend configuration and the backend answers playback commands with its
-  // `missing_credentials` error. Never log the returned object.
+  // Loaded from the keyring at startup; empty means "not set up yet". Never
+  // log these values or the object returned by navidromeCredentials().
   property string navidromeUrl: ""
   property string navidromeUsername: ""
   property string navidromePassword: ""
+
+  // Visible-warning flag for plain http:// servers. It is set from the stored
+  // URL regardless of any display decision; consumers own the presentation.
+  readonly property bool navidromeUrlInsecure:
+    navidromeUrl !== "" && Subsonic.isInsecureServerUrl(navidromeUrl)
+
+  property bool initialized: false
+  // "Signed in" for the Navidrome port means: a complete credential set is
+  // loaded. There is no token to refresh.
+  readonly property bool loggedIn: navidromeUrl !== ""
+    && navidromeUsername !== "" && navidromePassword !== ""
+  property bool sessionChecked: false
+  // A keyring write (save) in progress.
+  property bool loginBusy: false
+  readonly property bool sessionBusy: secretLookup.running
+  property string lastError: ""
+
+  property bool lookupHandled: false
+  property bool logoutPendingClear: false
+  property string keyringPayload: ""
+  property var saveWaiters: []
 
   signal loginSucceeded()
   signal loggedOut()
   signal sessionUnavailable(string reason)
 
-  function changeIdentity() {
-    switchingIdentity = true
-    cancelLogin()
-    lookupHandled = true
-    secretLookup.running = false
-    resetMemorySession()
-    sessionChecked = false
-    finishWaiters("", "Spotify application changed. Sign in again.")
-    loggedOut()
-    lastError = validClientId ? "" : "Enter a Spotify client ID containing exactly 32 hexadecimal characters."
-    identityDrain.restart()
+  Component.onCompleted: {
+    initialized = true
+    if (pluginDir) loadCredentials()
   }
-
-  Timer {
-    id: identityDrain
-    interval: 50
-    repeat: true
-    onTriggered: {
-      if (secretLookup.running || keyringStore.running || keyringClear.running
-          || pkceGenerator.running || callbackListener.running) return
-      stop()
-      root.switchingIdentity = false
-      if (root.validClientId) root.restoreSession()
-    }
-  }
+  onPluginDirChanged: if (initialized && pluginDir) loadCredentials()
 
   function safeError(value) {
     return Api.redact(String(value || ""))
@@ -121,297 +80,157 @@ Item {
     }
   }
 
+  // Transitional compatibility shim for SpotifyApi.qml, which still requires
+  // an `auth` object with this method. Every Web API path now fails
+  // immediately and gracefully into its existing fallbacks.
+  function withAccessToken(callback) {
+    if (typeof callback === "function")
+      callback(null, "Spotify Web API was removed in the Navidrome port")
+  }
+
+  // Transitional no-op: see withAccessToken().
+  function invalidateAccessToken() {}
+
   function tokenIsFresh() {
-    return accessToken !== "" && Date.now() + 60000 < accessTokenExpiresAt
+    return loggedIn
   }
 
-  function resetMemorySession() {
-    accessToken = ""
-    accessTokenExpiresAt = 0
-    loggedIn = false
+  // ------ validation ------------------------------------------------------------
+
+  // Pure entry validation shared with the setup UI (Subsonic.js owns the
+  // rules): URL validation goes through normalizeServerUrl — an invalid
+  // address is a typed error, and a plain http:// target stays allowed but is
+  // flagged as insecure.
+  function validateNavidromeEntry(rawUrl, rawUsername, rawPassword) {
+    return Subsonic.validateConnectionEntry(rawUrl, rawUsername, rawPassword)
   }
 
-  function invalidateAccessToken() {
-    accessToken = ""
-    accessTokenExpiresAt = 0
+  // QML-callable setup flow (the package 5 setup UI reuses it): validate,
+  // apply to memory, then persist through scripts/keyring-store.sh. The
+  // password reaches the keyring script over stdin only. There is no live
+  // probe here; the caller can run SubsonicApi.probe() first.
+  function saveNavidromeCredentials(rawUrl, rawUsername, rawPassword, callback) {
+    var entry = validateNavidromeEntry(rawUrl, rawUsername, rawPassword)
+    if (!entry.ok) {
+      lastError = safeError(entry.error)
+      if (typeof callback === "function") callback(false, lastError)
+      return
+    }
+    if (pluginDir && keyringStore.running) {
+      lastError = "A credential save is already running. Try again in a moment."
+      if (typeof callback === "function") callback(false, lastError)
+      return
+    }
+    navidromeUrl = entry.url
+    navidromeUsername = entry.username
+    navidromePassword = entry.password
+    lastError = ""
+    if (typeof callback === "function") saveWaiters = saveWaiters.concat([callback])
+    if (!pluginDir) {
+      // No plugin directory (tests, previews): keep the in-memory values only.
+      finishSaveWaiters("")
+      return
+    }
+    keyringPayload = JSON.stringify({
+      v: 1,
+      url: entry.url,
+      username: entry.username,
+      password: entry.password
+    })
+    loginBusy = true
+    keyringStore.command = [pluginDir + "/scripts/keyring-store.sh", "navidrome"]
+    keyringStore.running = true
   }
 
-  function finishWaiters(token, error) {
-    var pending = tokenWaiters.slice()
-    tokenWaiters = []
-    for (var i = 0; i < pending.length; i++) {
-      try { pending[i](token || "", safeError(error)) }
+  function finishSaveWaiters(error) {
+    var waiters = saveWaiters
+    saveWaiters = []
+    var message = safeError(error)
+    for (var i = 0; i < waiters.length; i++) {
+      try { waiters[i](message === "", message) }
       catch (e) { /* consumers own their callback errors */ }
     }
   }
 
-  function withAccessToken(callback) {
-    if (typeof callback !== "function") return
-    if (switchingIdentity || !validClientId) {
-      callback("", lastError || "Spotify application is changing. Try again.")
-      return
-    }
-    if (tokenIsFresh()) {
-      callback(accessToken, "")
-      return
-    }
+  // ------ keyring load and persistence -------------------------------------------
 
-    var next = tokenWaiters.slice()
-    next.push(callback)
-    tokenWaiters = next
-    if (refreshBusy || secretLookup.running) return
-
-    lookupPurpose = "request"
-    startSecretLookup()
-  }
-
-  function restoreSession() {
-    if (switchingIdentity || !validClientId) return
-    sessionChecked = false
-    if (secretLookup.running || refreshBusy) return
-    lookupPurpose = "restore"
-    startSecretLookup()
-  }
-
-  function startSecretLookup() {
+  // Startup load: one credential set per server identity, read from the
+  // keyring. Missing or malformed payload simply means signed out.
+  function loadCredentials() {
+    if (!pluginDir || sessionChecked || secretLookup.running) return
     lookupHandled = false
     keyringTimeout.restart()
     secretLookup.command = [
       "secret-tool", "lookup",
-      "service", "quickshell-spotify",
-      "kind", "refresh-token",
-      "client-id", String(resolvedClientId)
+      "service", "quickshell-navidrome",
+      "kind", "navidrome-credentials"
     ]
-    secretLookup.identity = resolvedClientId
     secretLookup.running = true
   }
 
+  function parseCredentialPayload(raw) {
+    return Subsonic.parseCredentialPayload(raw)
+  }
+
   function handleSecretLookup(raw) {
-    if (lookupHandled || switchingIdentity || secretLookup.identity !== resolvedClientId) return
+    if (lookupHandled) return
     lookupHandled = true
     keyringTimeout.stop()
-    var token = String(raw || "").trim()
-    var purpose = lookupPurpose
-    lookupPurpose = ""
-    if (!token) {
-      resetMemorySession()
-      sessionChecked = true
-      if (purpose === "request") finishWaiters("", "Log in to Spotify first")
-      return
-    }
-    refreshWithToken(token, purpose)
-  }
-
-  function postTokenRequest(body, previousRefreshToken, callback) {
-    var serial = ++tokenRequestSerial
-    var identity = resolvedClientId
-    var request = xhrFactory()
-    tokenRequest = request
-    request.onreadystatechange = function() {
-      if (request.readyState !== XMLHttpRequest.DONE) return
-      if (serial !== root.tokenRequestSerial || identity !== root.resolvedClientId) return
-      tokenTimeout.stop()
-      if (root.tokenRequest === request) root.tokenRequest = null
-      var result = OAuth.parseTokenResponse(request.status, request.responseText,
-        previousRefreshToken)
-      if (typeof callback === "function") callback(result)
-    }
-    request.open("POST", Api.TOKEN_URL)
-    request.setRequestHeader("Content-Type", "application/x-www-form-urlencoded")
-    tokenTimeout.restart()
-    request.send(body)
-  }
-
-  function refreshWithToken(refreshToken, purpose) {
-    refreshBusy = true
-    postTokenRequest(Api.formBody({
-      client_id: resolvedClientId,
-      grant_type: "refresh_token",
-      refresh_token: refreshToken
-    }), refreshToken, function(result) {
-      refreshToken = ""
-      root.refreshBusy = false
-      root.sessionChecked = true
-      if (!result.ok) {
-        root.resetMemorySession()
-        root.lastError = root.safeError(result.error)
-        if (result.invalidGrant) root.clearStoredToken()
-        if (purpose === "request") root.finishWaiters("", root.lastError)
-        else root.sessionUnavailable(root.lastError)
-        return
-      }
-      root.acceptToken(result)
-      root.finishWaiters(root.accessToken, "")
-    })
-  }
-
-  function acceptToken(result) {
-    accessToken = result.accessToken
-    accessTokenExpiresAt = Date.now() + result.expiresIn * 1000
-    loggedIn = true
-    lastError = ""
-    if (result.refreshToken) storeRefreshToken(result.refreshToken)
-  }
-
-  function storeRefreshToken(refreshToken) {
-    if (!refreshToken || keyringStore.running) return
-    keyringWriteToken = String(refreshToken)
-    keyringStore.command = [pluginDir + "/scripts/keyring-store.sh", String(resolvedClientId)]
-    keyringStore.identity = resolvedClientId
-    keyringStore.running = true
-  }
-
-  function clearStoredToken(identity) {
-    if (keyringClear.running) return
-    keyringClear.command = [
-      "secret-tool", "clear",
-      "service", "quickshell-spotify",
-      "kind", "refresh-token",
-      "client-id", String(identity || resolvedClientId)
-    ]
-    keyringClear.running = true
-  }
-
-  function logout() {
-    lookupHandled = true
-    secretLookup.running = false
-    cancelLogin()
-    resetMemorySession()
+    var payload = parseCredentialPayload(raw)
     sessionChecked = true
+    if (!payload) {
+      // No stored credential set: stay signed out until setup fills the
+      // keyring. Deliberately quiet — an unsigned-in state is not an error.
+      return
+    }
+    navidromeUrl = payload.url
+    navidromeUsername = payload.username
+    navidromePassword = payload.password
     lastError = ""
-    finishWaiters("", "Logged out")
-    if (keyringStore.running) logoutPendingClear = true
-    else clearStoredToken()
-    loggedOut()
+    loginSucceeded()
   }
 
+  // Transitional alias for the old OAuth entry point: Service.qml's login and
+  // reconnect flows call it. It now re-reads the keyring so credentials saved
+  // after the last load are picked up.
   function beginLogin() {
-    if (loginBusy || refreshBusy || switchingIdentity || !validClientId) return
+    if (loginBusy || secretLookup.running) return
     lastError = ""
-    loginBusy = true
-    callbackHandled = false
-    exchangingCode = false
-    pkceGenerator.command = [pluginDir + "/scripts/pkce.sh"]
-    pkceGenerator.running = true
-  }
-
-  function handlePkce(raw) {
-    if (!loginBusy || pkceVerifier !== "") return
-    var result = OAuth.parsePkceOutput(raw)
-    if (!result.ok) {
-      failLogin("Could not start a secure Spotify sign-in. Please try again")
-      return
-    }
-    pkceVerifier = result.verifier
-    pkceChallenge = result.challenge
-    oauthState = result.state
-    callbackListener.command = [
-      "socat", "-T", "180",
-      "TCP4-LISTEN:" + OAuth.normalizedPort(oauthPort) + ",bind=127.0.0.1,reuseaddr",
-      "STDIO"
-    ]
-    callbackListener.running = true
-    authTimeout.restart()
-  }
-
-  function openAuthorizationPage() {
-    if (!loginBusy || callbackHandled || pkceChallenge === "") return
-    var url = Api.appendQuery(Api.AUTH_URL, {
-      client_id: resolvedClientId,
-      code_challenge: pkceChallenge,
-      code_challenge_method: "S256",
-      redirect_uri: redirectUri,
-      response_type: "code",
-      scope: (Array.isArray(scopes) ? scopes : Api.SCOPES).join(" "),
-      state: oauthState,
-      show_dialog: "true"
-    })
-    Quickshell.execDetached(["xdg-open", url])
-  }
-
-  function handleCallbackLine(rawLine) {
-    if (!loginBusy || callbackHandled) return
-    var line = String(rawLine || "").replace(/\r$/, "")
-    if (line.indexOf("GET ") !== 0) return
-    callbackHandled = true
-    authTimeout.stop()
-    var callback = OAuth.parseCallbackRequestLine(line, callbackPath)
-    if (!callback.ok || callback.state !== oauthState) {
-      callbackListener.write(OAuth.failureResponse())
-      callbackStopTimer.restart()
-      failLogin(callback.ok
-        ? "Spotify sign-in could not be verified. Please try again"
-        : callback.error, true)
-      return
-    }
-    callbackListener.write(OAuth.successResponse())
-    callbackStopTimer.restart()
-    exchangeAuthorizationCode(callback.code)
-  }
-
-  function exchangeAuthorizationCode(code) {
-    exchangingCode = true
-    var verifier = pkceVerifier
-    var requestBody = Api.formBody({
-      client_id: resolvedClientId,
-      code: code,
-      code_verifier: verifier,
-      grant_type: "authorization_code",
-      redirect_uri: redirectUri
-    })
-    code = ""
-    verifier = ""
-    clearPkce()
-
-    postTokenRequest(requestBody, "", function(result) {
-      root.exchangingCode = false
-      root.loginBusy = false
-      if (!result.ok) {
-        root.lastError = root.safeError(result.error)
-        root.sessionUnavailable(root.lastError)
-        return
-      }
-      root.acceptToken(result)
-      root.sessionChecked = true
-      root.finishWaiters(root.accessToken, "")
-      root.loginSucceeded()
-    })
-    requestBody = ""
-  }
-
-  function clearPkce() {
-    pkceVerifier = ""
-    pkceChallenge = ""
-    oauthState = ""
-  }
-
-  function failLogin(reason, listenerAlreadyAnswered) {
-    lastError = safeError(reason || "Spotify sign-in failed. Please try again")
-    loginBusy = false
-    exchangingCode = false
-    authTimeout.stop()
-    authOpenDelay.stop()
-    if (!listenerAlreadyAnswered && callbackListener.running) callbackListener.running = false
-    clearPkce()
-    sessionUnavailable(lastError)
+    sessionChecked = false
+    loadCredentials()
   }
 
   function cancelLogin() {
     keyringTimeout.stop()
-    tokenTimeout.stop()
-    authTimeout.stop()
-    authOpenDelay.stop()
-    callbackStopTimer.stop()
-    if (callbackListener.running) callbackListener.running = false
-    if (pkceGenerator.running) pkceGenerator.running = false
-    tokenRequestSerial++
-    if (tokenRequest && tokenRequest.abort) tokenRequest.abort()
-    tokenRequest = null
-    refreshBusy = false
+    if (secretLookup.running) secretLookup.running = false
+    lookupHandled = true
+    if (keyringStore.running) keyringStore.running = false
     loginBusy = false
-    exchangingCode = false
-    callbackHandled = false
-    clearPkce()
+    keyringPayload = ""
+    finishSaveWaiters("Cancelled")
+  }
+
+  function logout() {
+    lookupHandled = true
+    if (secretLookup.running) secretLookup.running = false
+    navidromeUrl = ""
+    navidromeUsername = ""
+    navidromePassword = ""
+    sessionChecked = true
+    lastError = ""
+    if (keyringStore.running) logoutPendingClear = true
+    else clearStoredCredentials()
+    loggedOut()
+  }
+
+  function clearStoredCredentials() {
+    if (keyringClear.running) return
+    keyringClear.command = [
+      "secret-tool", "clear",
+      "service", "quickshell-navidrome",
+      "kind", "navidrome-credentials"
+    ]
+    keyringClear.running = true
   }
 
   Timer {
@@ -422,75 +241,19 @@ Item {
       secretLookup.running = false
       root.lastError = "The secure keyring did not respond. Unlock it, then try again."
       root.sessionChecked = true
-      root.finishWaiters("", root.lastError)
       root.sessionUnavailable(root.lastError)
-    }
-  }
-
-  Timer {
-    id: tokenTimeout
-    interval: 15000
-    onTriggered: {
-      root.cancelLogin()
-      root.lastError = "Spotify authorization took too long. Try again."
-      root.finishWaiters("", root.lastError)
-      root.sessionUnavailable(root.lastError)
-    }
-  }
-
-  Timer {
-    id: authOpenDelay
-    interval: 120
-    onTriggered: root.openAuthorizationPage()
-  }
-
-  Timer {
-    id: callbackStopTimer
-    interval: 250
-    onTriggered: if (callbackListener.running) callbackListener.running = false
-  }
-
-  Timer {
-    id: authTimeout
-    interval: 180000
-    onTriggered: root.failLogin("Spotify sign-in took too long. Please try again")
-  }
-
-  Process {
-    id: pkceGenerator
-    stdout: SplitParser {
-      splitMarker: "\n"
-      onRead: function(line) { root.handlePkce(line) }
-    }
-    onExited: function(exitCode) {
-      if (root.loginBusy && root.pkceVerifier === "" && exitCode !== 0)
-        root.failLogin("Could not start a secure Spotify sign-in. Please try again")
-    }
-  }
-
-  Process {
-    id: callbackListener
-    stdinEnabled: true
-    stdout: SplitParser {
-      splitMarker: "\n"
-      onRead: function(line) { root.handleCallbackLine(line) }
-    }
-    stderr: StdioCollector { waitForEnd: true }
-    onStarted: authOpenDelay.restart()
-    onExited: function(exitCode) {
-      if (root.loginBusy && !root.callbackHandled && !root.exchangingCode)
-        root.failLogin(exitCode === 0
-          ? "The Spotify sign-in window closed before it finished"
-          : "Could not complete Spotify sign-in. Close any other sign-in windows and try again")
     }
   }
 
   Process {
     id: secretLookup
-    property string identity: ""
     stdout: SplitParser {
       splitMarker: "\n"
-      onRead: function(line) { root.handleSecretLookup(line) }
+      onRead: function(line) {
+        if (root.lookupHandled) return
+        if (String(line || "").trim() === "") return
+        root.handleSecretLookup(line)
+      }
     }
     stderr: StdioCollector { waitForEnd: true }
     onExited: function(exitCode) {
@@ -500,21 +263,27 @@ Item {
 
   Process {
     id: keyringStore
-    property string identity: ""
     stdinEnabled: true
     stdout: StdioCollector { waitForEnd: true }
     stderr: StdioCollector { waitForEnd: true }
     onStarted: {
-      write(root.keyringWriteToken + "\n")
-      root.keyringWriteToken = ""
+      write(root.keyringPayload + "\n")
+      root.keyringPayload = ""
     }
     onExited: function(exitCode) {
-      root.keyringWriteToken = ""
-      if (exitCode !== 0 && identity === root.resolvedClientId && !root.switchingIdentity)
-        root.lastError = "Spotify connected, but the session could not be saved securely. You may need to sign in again after restarting"
+      root.keyringPayload = ""
+      root.loginBusy = false
+      if (exitCode === 0) {
+        root.lastError = ""
+        root.finishSaveWaiters("")
+        root.loginSucceeded()
+      } else {
+        root.lastError = "The Navidrome server was verified, but the credentials could not be saved securely. Try saving again."
+        root.finishSaveWaiters(root.lastError)
+      }
       if (root.logoutPendingClear) {
         root.logoutPendingClear = false
-        root.clearStoredToken(identity)
+        root.clearStoredCredentials()
       }
     }
   }

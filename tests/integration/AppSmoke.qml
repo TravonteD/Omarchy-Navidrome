@@ -10,7 +10,6 @@ ShellRoot {
     interval: 20
     running: true
     onTriggered: {
-      spotifyService.auth.customClientId = "invalid"
       spotifyService.search("smoke-test", "track")
       if (spotifyService.searchLoading || !spotifyService.searchError)
         throw new Error("Search service did not return the authorization error")

@@ -139,6 +139,103 @@ TestCase {
     compare(Subsonic.errorCategory(1234), "generic")
   }
 
+  // ------ backend error-code typing (protocol v2) ------
+
+  function test_backendErrorCategory_typesCredentialClassFailures() {
+    compare(Subsonic.backendErrorCategory("missing_credentials"), "missingCredentials")
+    compare(Subsonic.backendErrorCategory("invalid_configuration"), "invalidConfiguration")
+    compare(Subsonic.backendErrorCategory("stream_rejected"), "wrongCredentials")
+    compare(Subsonic.backendErrorCategory("stream_unavailable"), "generic")
+    compare(Subsonic.backendErrorCategory("engine_busy"), "generic")
+    compare(Subsonic.backendErrorCategory("unsupported_version"), "generic")
+    compare(Subsonic.backendErrorCategory(""), "generic")
+    compare(Subsonic.backendErrorCategory(null), "generic")
+    // Unknown codes never masquerade as credential failures.
+    compare(Subsonic.backendErrorCategory("missing_credential"), "generic")
+  }
+
+  function test_isTerminalCredentialCategory_splitsRetryBudgets() {
+    verify(Subsonic.isTerminalCredentialCategory("wrongCredentials"))
+    verify(Subsonic.isTerminalCredentialCategory("tokenAuthRejected"))
+    verify(Subsonic.isTerminalCredentialCategory("missingCredentials"))
+    verify(Subsonic.isTerminalCredentialCategory("invalidConfiguration"))
+    verify(Subsonic.isTerminalCredentialCategory("invalidServerUrl"))
+    verify(!Subsonic.isTerminalCredentialCategory("generic"))
+    verify(!Subsonic.isTerminalCredentialCategory("notAuthorized"))
+    verify(!Subsonic.isTerminalCredentialCategory("serverError"))
+    verify(!Subsonic.isTerminalCredentialCategory(""))
+  }
+
+  function test_backendCredentialMessage_namesOnlyTerminalCodes() {
+    compare(Subsonic.backendCredentialMessage("missing_credentials"),
+      "Set up your Navidrome server in Settings to play on this computer.")
+    verify(Subsonic.backendCredentialMessage("invalid_configuration")
+      .indexOf("invalid") >= 0)
+    verify(Subsonic.backendCredentialMessage("stream_rejected")
+      .indexOf("rejected") >= 0)
+    compare(Subsonic.backendCredentialMessage("stream_unavailable"), "")
+    compare(Subsonic.backendCredentialMessage(""), "")
+  }
+
+  // The terminal message must stay credential-free: no URL, username, token,
+  // or salt may ride in the typed UI text.
+  function test_backendCredentialMessages_stayCredentialFree() {
+    var codes = ["missing_credentials", "invalid_configuration", "stream_rejected"]
+    for (var i = 0; i < codes.length; i++) {
+      var message = Subsonic.backendCredentialMessage(codes[i])
+      verify(message.indexOf("http") < 0)
+      verify(message.indexOf("password") < 0)
+      verify(message.indexOf("salt") < 0)
+      verify(message.indexOf("token") < 0)
+    }
+  }
+
+  // ------ credential entry validation and keyring payload ------
+
+  function test_validateConnectionEntry_appliesTypedRules() {
+    var good = Subsonic.validateConnectionEntry(
+      "https://Music.Example.com/", " alice ", "pw")
+    verify(good.ok)
+    compare(good.url, "https://music.example.com")
+    verify(!good.insecure)
+    compare(good.error, "")
+
+    var insecure = Subsonic.validateConnectionEntry(
+      "http://10.0.0.5:4533/nav/", "alice", "pw")
+    verify(insecure.ok)
+    compare(insecure.url, "http://10.0.0.5:4533/nav")
+    verify(insecure.insecure)
+
+    var badUrl = Subsonic.validateConnectionEntry(
+      "ftp://music.example.com", "alice", "pw")
+    verify(!badUrl.ok)
+    verify(badUrl.error.indexOf("http or https") >= 0)
+    verify(!Subsonic.validateConnectionEntry("", "alice", "pw").ok)
+    verify(!Subsonic.validateConnectionEntry("music.example.com", "alice", "pw").ok)
+
+    var noUser = Subsonic.validateConnectionEntry("https://music.example.com", "  ", "pw")
+    verify(!noUser.ok)
+    verify(noUser.error.indexOf("username") >= 0)
+
+    var noPass = Subsonic.validateConnectionEntry("https://music.example.com", "alice", "")
+    verify(!noPass.ok)
+    verify(noPass.error.indexOf("password") >= 0)
+  }
+
+  function test_parseCredentialPayload_staysDefensive() {
+    compare(Subsonic.parseCredentialPayload(""), null)
+    compare(Subsonic.parseCredentialPayload("not json"), null)
+    compare(Subsonic.parseCredentialPayload('{"v":2,"url":"x","username":"a","password":"b"}'), null)
+    compare(Subsonic.parseCredentialPayload('{"v":1,"url":"x","username":"a"}'), null)
+    compare(Subsonic.parseCredentialPayload('{"v":1,"url":"x","username":"a","password":""}'), null)
+    var parsed = Subsonic.parseCredentialPayload(
+      '{"v":1,"url":"https://music.example.com","username":"alice","password":"pw"}')
+    verify(!!parsed)
+    compare(parsed.url, "https://music.example.com")
+    compare(parsed.username, "alice")
+    compare(parsed.password, "pw")
+  }
+
   // ------ connection probe parsing ------
 
   function test_parseLicense_acceptsValidTrialAndMissing() {

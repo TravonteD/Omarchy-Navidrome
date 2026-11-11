@@ -202,6 +202,103 @@ function errorMessageForCode(code) {
   }
 }
 
+// ------ backend error-code typing (protocol v2) --------------------------------
+
+// The Rust stream engine reports stable error codes. Credential-class ones are
+// terminal: they must never consume a reconnect or retry budget, only surface
+// a typed state the UI can explain. Everything else stays generic/network and
+// keeps the retry behavior.
+var BACKEND_CREDENTIAL_CODES = {
+  missing_credentials: "missingCredentials",
+  invalid_configuration: "invalidConfiguration",
+  // "bad credentials or permissions; no retry is attempted" per the engine.
+  stream_rejected: "wrongCredentials"
+}
+
+function backendErrorCategory(code) {
+  var key = String(code === undefined || code === null ? "" : code)
+  if (Object.prototype.hasOwnProperty.call(BACKEND_CREDENTIAL_CODES, key)) {
+    return BACKEND_CREDENTIAL_CODES[key]
+  }
+  return "generic"
+}
+
+// Terminal categories stop the reconnect push; generic/network ones consume
+// the retry budget. wrongCredentials/tokenAuthRejected come from Subsonic
+// error codes, missingCredentials/invalidServerUrl are the transport's local
+// fail-fast categories, invalidConfiguration is the backend's configure_server
+// rejection.
+function isTerminalCredentialCategory(category) {
+  return category === "wrongCredentials"
+    || category === "tokenAuthRejected"
+    || category === "missingCredentials"
+    || category === "invalidConfiguration"
+    || category === "invalidServerUrl"
+}
+
+// One short line per terminal backend code; "" for non-credential codes so
+// callers can branch on truthiness.
+function backendCredentialMessage(code) {
+  switch (backendErrorCategory(code)) {
+    case "missingCredentials":
+      return "Set up your Navidrome server in Settings to play on this computer."
+    case "invalidConfiguration":
+      return "The Navidrome server settings are invalid. Review them in Settings."
+    case "wrongCredentials":
+      return "The Navidrome server rejected the credentials or permissions for this song."
+    default:
+      return ""
+  }
+}
+
+// ------ credential entry validation and keyring payload ------------------------
+
+// Pure setup-entry validation shared by AuthManager, the setup script's
+// expectations, and tests. The URL goes through normalizeServerUrl: an
+// invalid address is a typed error, and a plain http:// target stays allowed
+// but is flagged insecure (consumers decide the display; the flag is always
+// set).
+function validateConnectionEntry(rawUrl, rawUsername, rawPassword) {
+  var url = String(rawUrl === undefined || rawUrl === null ? "" : rawUrl).trim()
+  var username = String(rawUsername === undefined || rawUsername === null
+    ? "" : rawUsername).trim()
+  var password = String(rawPassword === undefined || rawPassword === null
+    ? "" : rawPassword)
+  var normalized = normalizeServerUrl(url)
+  if (!normalized) {
+    return {ok: false, url: "", username: username, password: password,
+      insecure: false,
+      error: "The server address is not a valid http or https URL."}
+  }
+  if (username === "") {
+    return {ok: false, url: normalized, username: "", password: password,
+      insecure: isInsecureServerUrl(normalized),
+      error: "Enter your Navidrome username."}
+  }
+  if (password === "") {
+    return {ok: false, url: normalized, username: username, password: "",
+      insecure: isInsecureServerUrl(normalized),
+      error: "Enter your Navidrome password."}
+  }
+  return {ok: true, url: normalized, username: username, password: password,
+    insecure: isInsecureServerUrl(normalized), error: ""}
+}
+
+// One credential set rides the keyring as a single-line JSON payload under
+// fixed attributes. Malformed shapes mean "no stored session", never an
+// error; the password only ever lives inside this payload.
+function parseCredentialPayload(raw) {
+  var line = String(raw === undefined || raw === null ? "" : raw).trim()
+  if (line === "" || line.charAt(0) !== "{") return null
+  var parsed = null
+  try { parsed = JSON.parse(line) } catch (error) { parsed = null }
+  if (!parsed || typeof parsed !== "object" || parsed.v !== 1) return null
+  if (typeof parsed.url !== "string" || parsed.url === "") return null
+  if (typeof parsed.username !== "string" || parsed.username === "") return null
+  if (typeof parsed.password !== "string" || parsed.password === "") return null
+  return parsed
+}
+
 function queryEscape(key, value) {
   return encodeURIComponent(key) + "=" + encodeURIComponent(value)
 }

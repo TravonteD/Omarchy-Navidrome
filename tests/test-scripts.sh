@@ -122,20 +122,6 @@ CARGO_TARGET_DIR="$release_target" \
 grep -q -- '--locked --release' "$release_cargo_log"
 grep -q '^source-build:' "$release_runtime/backend-origin"
 
-pkce_output=$("$source_root/scripts/pkce.sh")
-IFS=$'\t' read -r verifier challenge state <<<"$pkce_output"
-
-[[ $verifier =~ ^[A-Za-z0-9._~-]{43,128}$ ]]
-[[ $challenge =~ ^[A-Za-z0-9_-]{43,128}$ ]]
-[[ $state =~ ^[A-Fa-f0-9]{32,128}$ ]]
-
-expected_challenge=$(printf '%s' "$verifier" |
-  openssl dgst -sha256 -binary |
-  openssl base64 -A |
-  tr '+/' '-_' |
-  tr -d '=')
-[[ $challenge == "$expected_challenge" ]]
-
 mkdir -p "$test_root/config/omarchy-navidrome"
 cp -- "$source_root/config/spotifyd.conf" "$test_root/config/omarchy-navidrome/spotifyd.conf"
 printf '%s\n' 'device = "legacy_output"' >>"$test_root/config/omarchy-navidrome/spotifyd.conf"
@@ -255,6 +241,189 @@ OMARCHY_NAVIDROME_SKIP_BACKEND_BUILD=1 \
   "$source_root/scripts/setup-playback.sh" >/dev/null
 [[ -f $runtime_spotify_config && -f $runtime_unit ]]
 grep -qx 'device_name = "Omarchy Navidrome"' "$runtime_spotify_config"
+
+# Guided first-run: the live probe against a fake Navidrome decides whether
+# anything is stored, typed outcomes map to exit codes, and a plain http://
+# target stays allowed but is warned about in plain words. The stub
+# secret-tool records argv only — the payload rides stdin and must never
+# reach the log.
+setup_probe_bin="$test_root/setup-probe-bin"
+keyring_log="$test_root/keyring.log"
+mkdir -p "$setup_probe_bin"
+printf '%s\n' \
+  '#!/bin/sh' \
+  'printf "%s\n" "$*" >>"${TEST_KEYRING_LOG:?}"' \
+  'cat >/dev/null' \
+  'exit 0' >"$setup_probe_bin/secret-tool"
+chmod 755 "$setup_probe_bin/secret-tool"
+
+fake_dir="$test_root/fake-navidrome"
+mkdir -p "$fake_dir"
+cat >"$fake_dir/server.py" <<'FAKE'
+import hashlib, json, os, sys, urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+password = "correct-pass-42"
+mode_path, port_path = sys.argv[1], sys.argv[2]
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed.query)
+        mode = ""
+        if os.path.exists(mode_path):
+            with open(mode_path) as fh:
+                mode = fh.read().strip()
+        expected = hashlib.md5(
+            (password + query.get("s", [""])[0]).encode("utf-8")).hexdigest()
+
+        def reply(payload):
+            body = json.dumps({"subsonic-response": payload}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        if parsed.path not in ("/rest/ping", "/rest/getUser"):
+            reply({"status": "failed",
+                   "error": {"code": 70, "message": "unknown"}})
+        elif mode == "token_reject":
+            reply({"status": "failed",
+                   "error": {"code": 41, "message": "auth"}})
+        elif query.get("t", [""])[0] != expected:
+            reply({"status": "failed",
+                   "error": {"code": 40, "message": "auth"}})
+        elif parsed.path == "/rest/ping":
+            reply({"status": "ok"})
+        else:
+            reply({"status": "ok",
+                   "user": {"username": "testuser", "streamRole": True}})
+
+
+server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+with open(port_path, "w") as fh:
+    fh.write(str(server.server_port))
+server.serve_forever()
+FAKE
+python3 "$fake_dir/server.py" "$fake_dir/mode" "$fake_dir/port" &
+fake_pid=$!
+trap 'kill "$fake_pid" 2>/dev/null || true; rm -rf -- "$test_root"' EXIT
+for _ in {1..100}; do
+  [[ -s $fake_dir/port ]] && break
+  sleep 0.05
+done
+[[ -s $fake_dir/port ]] || { echo "the fake Navidrome never started" >&2; exit 1; }
+fake_port=$(<"$fake_dir/port")
+printf 'ok\n' >"$fake_dir/mode"
+
+run_first_run() {
+  PATH="$setup_probe_bin:$mock_bin:$PATH" \
+  XDG_CONFIG_HOME="$runtime_config" \
+  XDG_CACHE_HOME="$runtime_cache" \
+  XDG_STATE_HOME="$runtime_state" \
+  XDG_RUNTIME_DIR="$runtime_session" \
+  OMARCHY_NAVIDROME_RUNTIME_DIR="$runtime_backend" \
+  env \
+    OMARCHY_NAVIDROME_SKIP_BACKEND_BUILD=1 \
+    TEST_KEYRING_LOG="$keyring_log" \
+    "$@" \
+    "$source_root/scripts/setup-playback.sh"
+}
+
+keyring_stores() {
+  grep -cx 'store --label=Omarchy Navidrome server credentials service quickshell-navidrome kind navidrome-credentials' \
+    "$keyring_log"
+}
+
+: >"$keyring_log"
+set +e
+probe_stderr=$(run_first_run \
+  OMARCHY_NAVIDROME_SERVER_URL="http://127.0.0.1:$fake_port" \
+  OMARCHY_NAVIDROME_USERNAME="testuser" \
+  OMARCHY_NAVIDROME_PASSWORD="correct-pass-42" \
+  2>&1 >/dev/null)
+probe_status=$?
+set -e
+[[ $probe_status -eq 0 ]] || { echo "first-run probe failed: $probe_stderr" >&2; exit 1; }
+grep -qi 'not private' <<<"$probe_stderr"
+[[ $(keyring_stores) -eq 1 ]]
+
+# Re-running for the same server identity overwrites cleanly: exactly one
+# store per successful run, never a duplicate entry.
+set +e
+run_first_run \
+  OMARCHY_NAVIDROME_SERVER_URL="http://127.0.0.1:$fake_port/" \
+  OMARCHY_NAVIDROME_USERNAME="testuser" \
+  OMARCHY_NAVIDROME_PASSWORD="correct-pass-42" \
+  >/dev/null 2>&1
+rerun_status=$?
+set -e
+[[ $rerun_status -eq 0 ]]
+[[ $(keyring_stores) -eq 2 ]]
+! grep -q 'correct-pass-42' "$keyring_log"
+
+# A wrong password is a typed failure that stores nothing.
+set +e
+wrong_stderr=$(run_first_run \
+  OMARCHY_NAVIDROME_SERVER_URL="http://127.0.0.1:$fake_port" \
+  OMARCHY_NAVIDROME_USERNAME="testuser" \
+  OMARCHY_NAVIDROME_PASSWORD="wrong-pass" \
+  2>&1 >/dev/null)
+wrong_status=$?
+set -e
+[[ $wrong_status -eq 10 ]]
+grep -qi 'Wrong username or password' <<<"$wrong_stderr"
+[[ $(keyring_stores) -eq 2 ]]
+
+# A rejected token-auth scheme is typed too.
+printf 'token_reject\n' >"$fake_dir/mode"
+set +e
+run_first_run \
+  OMARCHY_NAVIDROME_SERVER_URL="http://127.0.0.1:$fake_port" \
+  OMARCHY_NAVIDROME_USERNAME="testuser" \
+  OMARCHY_NAVIDROME_PASSWORD="correct-pass-42" \
+  >/dev/null 2>&1
+token_status=$?
+set -e
+[[ $token_status -eq 11 ]]
+printf 'ok\n' >"$fake_dir/mode"
+
+# An unreachable server is generic and stores nothing.
+set +e
+run_first_run \
+  OMARCHY_NAVIDROME_SERVER_URL="http://127.0.0.1:1" \
+  OMARCHY_NAVIDROME_USERNAME="testuser" \
+  OMARCHY_NAVIDROME_PASSWORD="correct-pass-42" \
+  >/dev/null 2>&1
+unreachable_status=$?
+set -e
+[[ $unreachable_status -eq 1 ]]
+[[ $(keyring_stores) -eq 2 ]]
+
+# An invalid address fails before the network and stores nothing.
+set +e
+run_first_run \
+  OMARCHY_NAVIDROME_SERVER_URL="ftp://127.0.0.1:$fake_port" \
+  OMARCHY_NAVIDROME_USERNAME="testuser" \
+  OMARCHY_NAVIDROME_PASSWORD="correct-pass-42" \
+  >/dev/null 2>&1
+invalid_status=$?
+set -e
+[[ $invalid_status -eq 3 ]]
+[[ $(keyring_stores) -eq 2 ]]
+
+# Without input and without a terminal the automatic path stays quiet.
+set +e
+run_first_run >/dev/null 2>&1
+quiet_status=$?
+set -e
+[[ $quiet_status -eq 0 ]]
+[[ $(keyring_stores) -eq 2 ]]
 
 # A clean source install records both the reviewed backend-source fingerprint
 # and installed executable hash. The release path writes the same records only
@@ -418,7 +587,7 @@ XDG_STATE_HOME="$runtime_state" \
 PATH="$mock_bin:$PATH" \
 XDG_CACHE_HOME="$runtime_cache" \
 XDG_STATE_HOME="$runtime_state" \
-  "$source_root/scripts/spotifyd-logout.sh"
+  "$source_root/scripts/playback-runtime.sh" logout
 [[ ! -e $runtime_state/omarchy-navidrome/oauth/credentials.json ]]
 [[ ! -e $runtime_cache/spotifyd/oauth/credentials.json ]]
 if XDG_CACHE_HOME="$runtime_cache" XDG_STATE_HOME="$runtime_state" \
@@ -430,42 +599,11 @@ fi
 set +e
 PATH="$mock_bin:$PATH" \
 XDG_CACHE_HOME="relative-cache" \
-  "$source_root/scripts/spotifyd-logout.sh" >/dev/null 2>&1
+  "$source_root/scripts/playback-runtime.sh" logout >/dev/null 2>&1
 unsafe_logout_status=$?
 set -e
 [[ $unsafe_logout_status -eq 3 ]]
 
-handoff_hypr_log="$test_root/handoff-hypr.log"
-handoff_shell_log="$test_root/handoff-shell.log"
-printf '%s\n' \
-  '#!/bin/sh' \
-  'if [ "${1:-}" = "clients" ]; then printf "%s\n" "${TEST_CLIENTS_JSON:?}"; exit 0; fi' \
-  'printf "%s\n" "$*" >>"${TEST_HYPR_LOG:?}"' \
-  'exit 0' >"$mock_bin/hyprctl"
-printf '%s\n' \
-  '#!/bin/sh' \
-  'printf "%s\n" "$*" >>"${TEST_SHELL_LOG:?}"' \
-  'exit 0' >"$mock_bin/omarchy-shell"
-chmod 755 "$mock_bin/hyprctl" "$mock_bin/omarchy-shell"
-
-TEST_CLIENTS_JSON='[{"address":"0xabc","class":"chromium","title":"127.0.0.1:8000/login?code=mock - Chromium"},{"address":"0xdef","class":"org.quickshell","title":"Omarchy Navidrome"}]' \
-TEST_HYPR_LOG="$handoff_hypr_log" \
-TEST_SHELL_LOG="$handoff_shell_log" \
-PATH="$mock_bin:$PATH" \
-  "$source_root/scripts/return-from-auth.sh"
-grep -q 'send_shortcut.*address:0xabc' "$handoff_hypr_log"
-grep -q 'focus.*address:0xdef' "$handoff_hypr_log"
-grep -q 'shell summon quickshell.navidrome' "$handoff_shell_log"
-
-printf '' >"$handoff_hypr_log"
-TEST_CLIENTS_JSON='[{"address":"0xabc","class":"chromium","title":"Unrelated tab - Chromium"},{"address":"0xdef","class":"org.quickshell","title":"Omarchy Navidrome"}]' \
-TEST_HYPR_LOG="$handoff_hypr_log" \
-TEST_SHELL_LOG="$handoff_shell_log" \
-PATH="$mock_bin:$PATH" \
-  "$source_root/scripts/return-from-auth.sh"
-! grep -q 'send_shortcut' "$handoff_hypr_log"
-
-grep -qx 'umask 077' "$source_root/scripts/spotifyd-auth.sh"
 [[ -x $source_root/scripts/setup-playback.sh ]]
 [[ -x $source_root/scripts/backend-source-id.sh ]]
 [[ -x $source_root/scripts/uninstall.sh ]]
@@ -475,28 +613,33 @@ grep -q '^## Remove it completely$' "$source_root/README.md"
 grep -q 'pkexec /usr/bin/pacman -S --needed --noconfirm spotifyd' \
   "$source_root/scripts/setup-playback.sh"
 ! grep -q 'sudo' "$source_root/scripts/setup-playback.sh"
-grep -q 'exec /usr/bin/spotifyd authenticate' \
-  "$source_root/scripts/spotifyd-auth.sh"
-grep -q 'omarchy-navidrome-backend' "$source_root/scripts/spotifyd-auth.sh"
-grep -q -- '--config-path "$config_root/omarchy-navidrome/spotifyd.conf"' \
-  "$source_root/scripts/spotifyd-auth.sh"
-grep -q -- '--oauth-port 8000' "$source_root/scripts/spotifyd-auth.sh"
-# OAuth identity stays immutable by default: the shipped client ID is the
-# fallback, and only a user-supplied, strictly 32-hex client ID can override
-# it — never an arbitrary string from a writable surface. The keyring and OAuth
-# redirect stay scoped to that resolved ID. The streaming-only Connect ID stays
-# internal (not in the manifest).
-grep -q 'property string clientId: "d420a117a32841c2b3474932e49fb54b"' \
-  "$source_root/AuthManager.qml"
-grep -q 'readonly property string redirectUri: "http://127.0.0.1:"' \
-  "$source_root/AuthManager.qml"
-grep -q 'resolvedClientId' "$source_root/AuthManager.qml"
-grep -q 'customClientId' "$source_root/AuthManager.qml"
-grep -qF '[0-9a-f]{32}' "$source_root/AuthManager.qml"
+# Package 2 removed the OAuth/browser authorization flow and its scripts with
+# it; the plugin's only credential path is the Navidrome keyring identity.
+for removed_script in pkce.sh return-from-auth.sh spotifyd-auth.sh \
+  spotifyd-logout.sh; do
+  [[ ! -e $source_root/scripts/$removed_script ]] || {
+    echo "the OAuth-era script $removed_script must be gone" >&2
+    exit 1
+  }
+done
+[[ ! -e $source_root/OAuth.js ]] || { echo "OAuth.js must be gone" >&2; exit 1; }
+! grep -qi 'pkce\|callbackListener\|quickshell-spotify' "$source_root/AuthManager.qml"
+# The Navidrome credential model: keyring identity scoped by fixed attributes,
+# validation through Subsonic.js, and the write path via keyring-store.sh.
+grep -qF 'service", "quickshell-navidrome' "$source_root/AuthManager.qml"
+grep -qF 'kind", "navidrome-credentials' "$source_root/AuthManager.qml"
+grep -q 'navidromeCredentials' "$source_root/AuthManager.qml"
+grep -q 'normalizeServerUrl' "$source_root/AuthManager.qml"
+grep -qF 'service quickshell-navidrome' "$source_root/scripts/keyring-store.sh"
+grep -qF 'kind navidrome-credentials' "$source_root/scripts/keyring-store.sh"
+grep -qF 'keyring-store.sh' "$source_root/scripts/setup-playback.sh"
+grep -qF 'navidrome-credentials' "$source_root/scripts/remove-runtime.sh"
+! grep -q 'socat\|xdg-open' "$source_root/scripts/setup.sh"
+# The legacy Spotify client-ID setting stays for settings-file compatibility
+# until the settings cleanup pass; nothing in the port consumes it.
 grep -q '"clientId"' "$source_root/manifest.json"
-grep -q 'customClientId: settings.clientId' "$source_root/Service.qml"
+! grep -q 'settings.clientId' "$source_root/Service.qml"
 ! grep -q '"oauthPort"' "$source_root/manifest.json"
-grep -q 'window.close()' "$source_root/OAuth.js"
 grep -q 'gh attestation verify' "$source_root/scripts/build-backend.sh"
 grep -q -- '--cert-identity' "$source_root/scripts/build-backend.sh"
 grep -q -- '--source-ref' "$source_root/scripts/build-backend.sh"
