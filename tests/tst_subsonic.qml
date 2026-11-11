@@ -518,6 +518,26 @@ TestCase {
     compare(Subsonic.parseTopSongs(null).length, 0)
   }
 
+  function test_parseStarred2_splitsTheThreeGroups() {
+    var parsed = Subsonic.parseStarred2({ starred2: {
+      song: [{ id: "tr-1", title: "So What", duration: 540 },
+        { title: "no id" }],
+      album: [{ id: "al-1", name: "Kind of Blue" }],
+      artist: [{ id: "ar-1", name: "Miles Davis" }]
+    }})
+    compare(parsed.songs.length, 1)
+    compare(parsed.songs[0].id, "tr-1")
+    compare(parsed.songs[0].duration, 540)
+    compare(parsed.albums.length, 1)
+    compare(parsed.albums[0].id, "al-1")
+    compare(parsed.artists.length, 1)
+    compare(parsed.artists[0].id, "ar-1")
+    // Malformed and missing shapes parse empty, never an error.
+    compare(Subsonic.parseStarred2(null).songs.length, 0)
+    compare(Subsonic.parseStarred2({}).albums.length, 0)
+    compare(Subsonic.parseStarred2({ starred2: "junk" }).artists.length, 0)
+  }
+
   function test_parseGenres_keysOnValueAndDropsEmpty() {
     var parsed = Subsonic.parseGenres({genres: {genre: [
         {value: "Ambient", songCount: 120, albumCount: 9},

@@ -55,6 +55,16 @@ Item {
   })
   property var settings: Api.shallowCopy(defaultSettingValues)
 
+  // One pinned salt per session for getCoverArt URLs: stable URLs keep
+  // artwork caches valid across row rebuilds, so revisiting a view causes
+  // no artwork traffic. The credentials ride only inside the URL builder
+  // (Subsonic.coverArtUrl) and never in logs or persisted state; persisted
+  // session state is scrubbed of imageUrl by Api.normalizedSessionState.
+  property string artworkSalt: Subsonic.randomSalt()
+  readonly property var subsonicArt: Api.subsonicArtContext(
+    authManager.navidromeUrl, authManager.navidromeUsername,
+    authManager.navidromePassword, artworkSalt)
+
   readonly property string deviceName: String(settings.deviceName || "Omarchy Navidrome").trim() || "Omarchy Navidrome"
   readonly property int idleShutdownMinutes: Math.max(0, Math.min(1440,
     Math.floor(Number(settings.idleShutdownMinutes) || 0)))
@@ -97,7 +107,7 @@ Item {
   readonly property bool accountConnected: authManager.loggedIn
   readonly property bool sessionPending: !authManager.sessionChecked
   readonly property bool fullyConnected: daemonManager.playbackReady
-    && authManager.loggedIn && daemonManager.credentialsAvailable
+    && authManager.loggedIn
   readonly property bool loginBusy: daemonManager.setupBusy
     || authManager.loginBusy
     || authManager.sessionBusy || !authManager.sessionChecked
@@ -236,7 +246,7 @@ Item {
     ? String(remoteTrack.externalUrl || spotifyWebUrl(currentUri)) : spotifyWebUrl(currentUri)
   readonly property string currentTrackId: {
     // When a remote device owns playback, stale metadata from an idle local
-    // spotifyd player must not turn a podcast episode into a song.
+    // player must not turn a podcast episode into a song.
     if (useRemotePlayback) {
       if (!remoteTrack || remoteTrack.type !== "track") return ""
       return Api.spotifyTrackId(remoteTrack.uri)
@@ -245,6 +255,16 @@ Item {
 
     var id = Api.spotifyTrackId(currentUri)
     if (id) return id
+
+    // The Navidrome stream engine publishes the Subsonic song id as xesam:url
+    // (the MPRIS track id is a lossy object path). The interim spotifyd
+    // fallback keeps Spotify-shaped ids until the cleanup pass.
+    if (!daemonManager.usingFallbackRuntime) {
+      var subsonic = String(currentUri || "").trim()
+      if (subsonic && Api.spotifyTrackId(subsonic) === "") return subsonic
+      return remoteTrack && remotePlaybackIsLocal && remoteTrack.type === "track"
+        ? String(remoteTrack.id || "").trim() : ""
+    }
 
     // spotifyd exposes the recording as an MPRIS object path such as
     // /spotify/track/<id>, but does not currently publish xesam:url.
@@ -288,6 +308,9 @@ Item {
   property string savedAlbumsNext: ""
   property var followedArtists: []
   property string followedArtistsNext: ""
+  // Podcast-family collections have no Subsonic equivalent; the slots stay
+  // (empty, marked loaded) so the view layer keeps its shape until the
+  // cleanup pass removes the tabs. Part B.
   property var savedShows: []
   property string savedShowsNext: ""
   property var savedEpisodes: []
@@ -330,16 +353,21 @@ Item {
   property var savedUrisChecking: ({})
   property var savedUrisBusy: ({})
   // The maps stay stable to avoid full copies; revisions keep QML lookups
-  // reactive when individual entries change.
+  // reactive when individual entries change. Keys are the canonical
+  // savedKeyFor(item) ("<type>:<id>") instead of the Web API uri.
   property int savedUrisRevision: 0
   property int savedUrisCheckingRevision: 0
   property int savedUrisBusyRevision: 0
   readonly property int savedUriCacheLimit: 4096
   readonly property int savedUriFreshnessMs: 300000
 
-  property var recentTracks: []
-  // Most recent play from Spotify's history, kept while nothing is loaded so
-  // Play can continue there the way the desktop app's footer does.
+  // Home windows (getAlbumList2) and the starred-song window (getStarred2).
+  property var homeRecent: []
+  property var homeFrequent: []
+  property var homeNewest: []
+  property var homeStarred: []
+  // Most recent album window, kept while nothing is loaded so Play can
+  // continue there the way the desktop app's footer does.
   property var resumeCandidate: null
   property bool resumeCandidateLoading: false
   property real resumeCandidateLoadedAt: 0
@@ -351,14 +379,15 @@ Item {
   // Seek, skip, shuffle, and repeat stay tied to playbackControllable.
   readonly property bool playbackStartable: playbackControllable
     || canResumeLastPlayed
-  property var topTracks: []
-  property var topArtists: []
   property bool homeLoaded: false
   property int homeRequestsPending: 0
   readonly property bool homeLoading: homeRequestsPending > 0
 
-  property var discoverPlaylists: []
-  property var discoverCandidates: []
+  // Explore: random albums from getAlbumList2, plus the genre list for the
+  // genre browser (rendering lands with the view pass; the scan machinery
+  // from FilterScanController stays for long genre lists).
+  property var discoverAlbums: []
+  property var discoverGenres: []
   property bool discoverLoaded: false
   property int discoverRequestsPending: 0
   property int discoverRequestsFailed: 0
@@ -382,6 +411,8 @@ Item {
   property var artistPlaylists: []
   property string artistPlaylistsNext: ""
   property bool artistPlaylistsLoading: false
+  // "This Is <artist>" was a Spotify editorial playlist; Subsonic has no
+  // equivalent, so the slot stays null until the view pass removes it.
   property var artistThisIsPlaylist: null
   property bool artistThisIsLoading: false
   property string artistCatalogQuery: ""
@@ -420,7 +451,9 @@ Item {
   property bool queueLoading: false
   property bool devicesLoading: false
   property alias searchLoading: searchController.searchLoading
-  readonly property double searchCooldownUntil: spotifyApi.rateLimitedUntil
+  // Subsonic has no rate-limit cooldown machinery; the scan controller keeps
+  // its cooldown input shape and simply never waits.
+  readonly property double searchCooldownUntil: 0
   function searchProgressText(timestamp) { return searchController.progressText(timestamp) }
   property string lastError: ""
   property string statusMessage: ""
@@ -484,7 +517,7 @@ Item {
       return "Checking local playback"
     if (daemonManager.authenticationBusy)
       return "Approve local playback in your browser"
-    return fullyConnected ? "Connected to Spotify" : "Ready to connect"
+    return fullyConnected ? "Connected to Navidrome" : "Ready to connect"
   }
 
   function defaults() {
@@ -673,19 +706,22 @@ Item {
     resumeLyricsInstallIntent()
   }
 
-  function isSpotifyd(player) {
+  // The Navidrome stream engine publishes its own MPRIS player; the interim
+  // spotifyd fallback keeps its identity until the cleanup pass deletes it.
+  function isLocalEnginePlayer(player) {
     if (!player) return false
     var identity = [player.dbusName, player.desktopEntry, player.identity]
       .join(" ").toLowerCase()
     return identity.indexOf("spotifyd") !== -1
       || identity.indexOf("librespot") !== -1
+      || identity.indexOf("navidrome") !== -1
   }
 
   function spotifydPlayer() {
     var fallback = null
     for (var i = 0; i < mprisPlayers.length; i++) {
       var player = mprisPlayers[i]
-      if (!isSpotifyd(player)) continue
+      if (!isLocalEnginePlayer(player)) continue
       if (player.isPlaying) return player
       if (!fallback) fallback = player
     }
@@ -712,7 +748,7 @@ Item {
   }
 
   function safeError(reason) {
-    return Api.redact(String(reason || "Spotify operation failed"))
+    return Api.redact(String(reason || "The server operation failed"))
   }
 
   function fail(reason) {
@@ -960,9 +996,8 @@ Item {
     visibleSurfaces = next
     if (value) {
       noteActivity()
-      // SpotifyApi restores the keyring-backed session when needed. Do this for
-      // every opened surface so the mini-player can discover remote Spotify
-      // Connect playback without requiring the full panel to be opened first.
+      // An opened surface refreshes the local MPRIS view; the Subsonic
+      // resume candidate rides the same cadence.
       loadPlaybackState()
     }
   }
@@ -1219,7 +1254,9 @@ Item {
         }
         if (!error) root.applyPlaybackState(payload)
         else if (reportError === true) root.fail(error)
-        if (!error && !root.hasMedia) root.loadResumeCandidate()
+        // The Navidrome resume candidate (most recent album) refreshes on the
+        // same cadence whenever nothing is playing.
+        if (!root.hasMedia) root.loadResumeCandidate()
         root.finishRemotePlaybackWaiters(!error)
       })
   }
@@ -1276,13 +1313,10 @@ Item {
   }
 
   function loadProfile() {
-    if (currentUserId) return
-    var expected = dataSerial
-    spotifyApi.request("GET", "/me", null, null, function(status, payload, error) {
-      if (expected !== root.dataSerial || error || !payload) return
-      root.currentUserId = String(payload.id || "")
-      root.currentUserName = String(payload.display_name || "")
-    })
+    // Subsonic identity is the authenticated username; playlist ownership
+    // compares that name against a playlist's owner field. No profile fetch.
+    currentUserId = String(authManager.navidromeUsername || "")
+    currentUserName = currentUserId
   }
 
   function playlistById(id) {
@@ -1308,23 +1342,6 @@ Item {
     for (var i = 0; i < playlists.length; i++)
       if (playlistEditable(playlists[i])) result.push(playlists[i])
     return result
-  }
-
-  function updatePlaylistSnapshot(id, snapshotId) {
-    var key = String(id || "")
-    var snapshot = String(snapshotId || "")
-    if (!key || !snapshot) return
-    function updated(item) {
-      if (!item || String(item.id || "") !== key) return item
-      var copy = Api.shallowCopy(item)
-      copy.snapshotId = snapshot
-      return copy
-    }
-    var next = []
-    for (var i = 0; i < playlists.length; i++) next.push(updated(playlists[i]))
-    playlists = next
-    selectedPlaylist = updated(selectedPlaylist)
-    if (detailItem && detailItem.type === "playlist") detailItem = updated(detailItem)
   }
 
   function sidebarPlaylists() {
@@ -1378,120 +1395,184 @@ Item {
         && contextHref.indexOf("/playlists/" + expectedPlaylist.id) >= 0)
   }
 
-  // Restore the keyring-backed session only when a Spotify API surface is
-  // actually opened. This avoids a network request when the widget is merely
-  // sitting on the bar and local MPRIS controls are sufficient.
+  // Opening a panel surface refreshes the login-driven state only then; the
+  // widget on the bar and local MPRIS controls stay request-free. Navidrome
+  // credentials live in the keyring; there is no token exchange to await.
   function activate(view) {
     activeView = normalizedView(view)
-    authManager.withAccessToken(function(token, error) {
-      if (token) {
-        root.loadPlaybackState()
-        root.loadProfile()
-        root.loadSidebarPlaylists()
-        root.verifyRadioPlaybackContext()
-        root.openView(root.activeView, false)
-      }
-      else if (error && error !== "Log in to Spotify first") root.fail(error)
-    })
+    if (!authManager.loggedIn) return
+    root.loadProfile()
+    root.loadSidebarPlaylists()
+    root.verifyRadioPlaybackContext()
+    root.openView(root.activeView, false)
   }
 
+  // Every library collection is one Subsonic read. getStarred2 answers
+  // songs/albums/artists in a single response, so its three surfaces share
+  // one fetch per pass; playlists are one-shot getPlaylists. There is no
+  // cursor pagination anywhere — `next` is always "" and the bounded
+  // FilterScanController still handles filtering long lists.
   function libraryCollectionSpec(kind) {
     var value = String(kind || "tracks")
     if (value === "playlists")
       return {
         items: "playlists", next: "playlistsNext",
         loading: "playlistsLoading", loaded: "playlistsLoaded",
-        path: "/me/playlists", query: { limit: 30 },
-        mapper: "playlist", cursor: false, checkSaved: true, mergeDiscover: true
+        endpoint: "getPlaylists", savedKey: "playlist",
+        row: function(node) { return Api.subsonicPlaylistRow(node, root.subsonicArt) },
+        checkSaved: true
       }
     if (value === "albums")
       return {
         items: "savedAlbums", next: "savedAlbumsNext",
         loading: "savedAlbumsLoading", loaded: "savedAlbumsLoaded",
-        path: "/me/albums", query: { limit: 30 },
-        mapper: "context", cursor: false
+        endpoint: "starred2", savedKey: "album",
+        row: function(node) { return Api.subsonicAlbumRow(node, root.subsonicArt) }
       }
     if (value === "artists")
       return {
         items: "followedArtists", next: "followedArtistsNext",
         loading: "followedArtistsLoading", loaded: "followedArtistsLoaded",
-        path: "/me/following", query: { type: "artist", limit: 30 },
-        mapper: "context", cursor: true
+        endpoint: "starred2", savedKey: "artist",
+        row: function(node) { return Api.subsonicArtistRow(node, root.subsonicArt) }
       }
-    if (value === "shows")
+    if (value === "shows" || value === "episodes" || value === "audiobooks") {
+      // No Subsonic content: resolve immediately as an empty, loaded list.
+      // The library tabs go away with the view cleanup (Part B).
       return {
-        items: "savedShows", next: "savedShowsNext",
-        loading: "savedShowsLoading", loaded: "savedShowsLoaded",
-        path: "/me/shows", query: { limit: 30 },
-        mapper: "context", cursor: false
+        items: value === "shows" ? "savedShows"
+          : (value === "episodes" ? "savedEpisodes" : "savedAudiobooks"),
+        next: value === "shows" ? "savedShowsNext"
+          : (value === "episodes" ? "savedEpisodesNext" : "savedAudiobooksNext"),
+        loading: value === "shows" ? "savedShowsLoading"
+          : (value === "episodes" ? "savedEpisodesLoading"
+            : "savedAudiobooksLoading"),
+        loaded: value === "shows" ? "savedShowsLoaded"
+          : (value === "episodes" ? "savedEpisodesLoaded"
+            : "savedAudiobooksLoaded"),
+        endpoint: "", row: function(node) { return null }
       }
-    if (value === "episodes")
-      return {
-        items: "savedEpisodes", next: "savedEpisodesNext",
-        loading: "savedEpisodesLoading", loaded: "savedEpisodesLoaded",
-        path: "/me/episodes", query: { limit: 30 },
-        mapper: "track", cursor: false
-      }
-    if (value === "audiobooks")
-      return {
-        items: "savedAudiobooks", next: "savedAudiobooksNext",
-        loading: "savedAudiobooksLoading", loaded: "savedAudiobooksLoaded",
-        path: "/me/audiobooks", query: { limit: 30 },
-        mapper: "context", cursor: false
-      }
+    }
     return {
       items: "savedTracks", next: "savedTracksNext",
       loading: "savedTracksLoading", loaded: "savedTracksLoaded",
-      path: "/me/tracks", query: { limit: 30 },
-      mapper: "track", cursor: false
+      endpoint: "starred2", savedKey: "song",
+      row: function(node) { return Api.subsonicSongRow(node, root.subsonicArt) }
     }
   }
 
   function libraryMapper(kind) {
-    if (kind === "playlist")
-      return function(value) { return Api.normalizePlaylist(value, 96) }
-    if (kind === "track")
-      return function(value) { return Api.normalizeTrack(value, 96) }
-    return function(value) { return Api.normalizeContext(value, 96) }
+    var spec = libraryCollectionSpec(kind)
+    return spec.row
   }
 
   function loadLibraryCollection(kind, append, callback, serial) {
     var spec = libraryCollectionSpec(kind)
+    if (!spec.endpoint) {
+      // Empty-by-destination collections still behave like loaded ones.
+      root[spec.items] = []
+      root[spec.next] = ""
+      root[spec.loaded] = true
+      root[spec.loading] = false
+      if (typeof callback === "function") callback()
+      return
+    }
     if (root[spec.loading]) {
       if (typeof callback === "function") callback()
       return
     }
-    var path = append ? root[spec.next] : spec.path
-    if (!path) {
-      if (typeof callback === "function") callback()
-      return
-    }
+    // Subsonic windows have no continuation; an append request has nothing
+    // more to load.
     var expected = serial === undefined ? dataSerial : serial
     root[spec.loading] = true
-    spotifyApi.request("GET", path, append ? null : spec.query, null,
-      function(status, payload, error) {
-        if (expected !== root.dataSerial) return
-        root[spec.loading] = false
-        if (error) root.fail(error)
-        else {
-          var mapper = root.libraryMapper(spec.mapper)
-          var page = spec.cursor
-            ? Api.normalizeCursorPage(payload && payload.artists, mapper)
-            : Api.normalizePage(payload, mapper)
-          var items = (append
-            ? Api.mergeUnique(root[spec.items], page.items) : page.items)
-
-          root[spec.items] = items
-          root[spec.next] = page.next
-          root[spec.loaded] = true
-          if (spec.checkSaved === true) root.checkSavedItems(page.items)
-          else root.markItemsSaved(page.items, true)
-          if (spec.mergeDiscover === true
-              && (root.discoverLoaded || root.discoverLoading))
-            root.mergeDiscoverCandidates(page.items)
+    if (spec.endpoint === "starred2") {
+      // One fetch fills the three starred collections of this pass; the
+      // others read the same parsed result without their own requests.
+      root.loadStarred2IfNeeded(expected, function(filled) {
+        if (expected !== root.dataSerial) {
+          if (typeof callback === "function") callback()
+          return
         }
+        root[spec.loading] = false
+        if (!filled) {
+          root[spec.items] = []
+          root[spec.next] = ""
+          root[spec.loaded] = false
+          if (typeof callback === "function") callback()
+          return
+        }
+        var rows = filled[spec.savedKey === "song" ? "songs"
+          : (spec.savedKey === "album" ? "albums" : "artists")]
+        root[spec.items] = rows
+        root[spec.next] = ""
+        root[spec.loaded] = true
         if (typeof callback === "function") callback()
       })
+    } else {
+      subsonicApi.request(spec.endpoint, {}, function(result) {
+        if (expected !== root.dataSerial) {
+          root[spec.loading] = false
+          if (typeof callback === "function") callback()
+          return
+        }
+        root[spec.loading] = false
+        if (!result || result.ok !== true) {
+          root.fail(String(result && result.errorMessage || "The server request failed"))
+          if (typeof callback === "function") callback()
+          return
+        }
+        var normalized = Subsonic.parsePlaylists(result.data)
+        var rows = []
+        for (var i = 0; i < normalized.length; i++) {
+          var row = spec.row(normalized[i])
+          if (row) rows.push(row)
+        }
+        root[spec.items] = rows
+        root[spec.next] = ""
+        root[spec.loaded] = true
+        if (spec.checkSaved === true) root.checkSavedItems(rows)
+        if (typeof callback === "function") callback()
+      }, { priority: "interactive" })
+    }
+  }
+
+  // getStarred2 fills savedTracks/savedAlbums/followedArtists in one pass.
+  // A short-lived cache keyed by the request serial keeps concurrent loads
+  // from tripling the request; every caller still updates its own list.
+  property int starred2Serial: 0
+  property bool starred2Loading: false
+  property var starred2Waiters: []
+
+  function loadStarred2IfNeeded(expected, callback) {
+    starred2Waiters = starred2Waiters.concat([callback])
+    if (starred2Loading) return
+    starred2Loading = true
+    var requestSerial = ++starred2Serial
+    subsonicApi.request("getStarred2", {}, function(result) {
+      var stale = expected !== root.dataSerial || requestSerial !== root.starred2Serial
+      root.starred2Loading = false
+      if (stale) {
+        root.finishStarred2Waiters(null)
+        return
+      }
+      if (!result || result.ok !== true) {
+        root.fail(String(result && result.errorMessage || "The server request failed"))
+        root.finishStarred2Waiters(null)
+        return
+      }
+      root.finishStarred2Waiters(Api.subsonicStarredRows(result.data, root.subsonicArt))
+    }, { priority: "interactive" })
+  }
+
+  function finishStarred2Waiters(rows) {
+    var waiters = starred2Waiters
+    starred2Waiters = []
+    for (var i = 0; i < waiters.length; i++) {
+      var waiter = waiters[i]
+      if (typeof waiter === "function") {
+        try { waiter(rows) } catch (e) { /* consumers own their callbacks */ }
+      }
+    }
   }
 
   function loadPlaylists(append, callback, serial) {
@@ -1506,14 +1587,14 @@ Item {
     loadLibraryCollection("tracks", append, callback, serial)
   }
 
-  function setSavedState(uri, value) {
-    var key = String(uri || "")
-    if (!key) return
-    rememberSavedStates([key], value === true)
+  function setSavedState(key, value) {
+    var id = String(key || "")
+    if (!id) return
+    rememberSavedStates([id], value === true)
   }
 
-  function rememberSavedStates(uris, values) {
-    var rows = Array.isArray(uris) ? uris : []
+  function rememberSavedStates(keys, values) {
+    var rows = Array.isArray(keys) ? keys : []
     var results = Array.isArray(values) ? values : null
     var checkedAt = Date.now()
     var changed = false
@@ -1533,15 +1614,15 @@ Item {
     if (changed) savedUrisRevision++
   }
 
-  function savedStateIsFresh(uri, now) {
-    var key = String(uri || "")
-    if (!key || savedUris[key] === undefined) return false
-    return Api.timestampIsFresh(savedUriCheckedAt[key], now,
+  function savedStateIsFresh(key, now) {
+    var id = String(key || "")
+    if (!id || savedUris[id] === undefined) return false
+    return Api.timestampIsFresh(savedUriCheckedAt[id], now,
       savedUriFreshnessMs)
   }
 
-  function markSavedUrisChecking(uris, value) {
-    var rows = Array.isArray(uris) ? uris : []
+  function markSavedUrisChecking(keys, value) {
+    var rows = Array.isArray(keys) ? keys : []
     var changed = false
     for (var i = 0; i < rows.length; i++) {
       var key = String(rows[i] || "")
@@ -1558,91 +1639,101 @@ Item {
   }
 
   function isSavedChecking(item) {
-    return savedUrisCheckingRevision >= 0 && !!item && !!item.uri
-      && savedUrisChecking[String(item.uri)] === true
+    return savedUrisCheckingRevision >= 0 && !!item
+      && savedUrisChecking[Api.savedKeyFor(item)] === true
   }
 
-  function setSavedBusy(uri, value) {
-    var key = String(uri || "")
-    if (!key) return
-    if (value === true && savedUrisBusy[key] !== true) {
-      savedUrisBusy[key] = true
+  function setSavedBusy(key, value) {
+    var id = String(key || "")
+    if (!id) return
+    if (value === true && savedUrisBusy[id] !== true) {
+      savedUrisBusy[id] = true
       savedUrisBusyRevision++
-    } else if (value !== true && savedUrisBusy[key] === true) {
-      delete savedUrisBusy[key]
+    } else if (value !== true && savedUrisBusy[id] === true) {
+      delete savedUrisBusy[id]
       savedUrisBusyRevision++
     }
   }
 
   function isSavedBusy(item) {
-    return savedUrisBusyRevision >= 0 && !!item && !!item.uri
-      && savedUrisBusy[String(item.uri)] === true
+    return savedUrisBusyRevision >= 0 && !!item
+      && savedUrisBusy[Api.savedKeyFor(item)] === true
   }
 
   function markItemsSaved(items, value) {
     var rows = Array.isArray(items) ? items : []
-    var uris = []
-    for (var i = 0; i < rows.length; i++)
-      if (rows[i] && rows[i].uri) uris.push(String(rows[i].uri))
-    rememberSavedStates(uris, value !== false)
+    var keys = []
+    for (var i = 0; i < rows.length; i++) {
+      var key = Api.savedKeyFor(rows[i])
+      if (key) keys.push(key)
+    }
+    rememberSavedStates(keys, value !== false)
   }
 
   function isSaved(item) {
-    return savedUrisRevision >= 0 && !!item && !!item.uri
-      && savedUris[String(item.uri)] === true
+    return savedUrisRevision >= 0 && !!item
+      && savedUris[Api.savedKeyFor(item)] === true
   }
 
+  // Subsonic rows carry `starred` from the server, so the "is it saved?"
+  // check is a read of row state, not a Web API contains round-trip. Rows
+  // without star information (an MPRIS-derived now-playing item, say) are
+  // skipped entirely so they never overwrite a known state. The bounded
+  // cache and freshness machinery stay: fresh entries win, stale ones are
+  // refreshed from whatever rows arrive next.
   function checkSavedItems(items, force) {
     var rows = Array.isArray(items) ? items : []
-    var uris = []
-    var seen = ({})
+    var values = ({})
+    var order = []
     var now = Date.now()
     for (var i = 0; i < rows.length; i++) {
-      var uri = String((rows[i] && rows[i].uri) || "")
-      if (!uri || seen[uri] || savedUrisChecking[uri] === true
-          || (force !== true && savedStateIsFresh(uri, now))) continue
-      seen[uri] = true
-      uris.push(uri)
+      var item = rows[i]
+      if (!item || typeof item !== "object") continue
+      var key = Api.savedKeyFor(item)
+      if (!key || (item.starred !== true && item.starred !== false)) continue
+      if (force !== true && savedStateIsFresh(key, now)) continue
+      values[key] = item.starred === true
+      order.push(key)
     }
-    var expected = dataSerial
-    markSavedUrisChecking(uris, true)
-    for (var start = 0; start < uris.length; start += 40)
-      requestContains(uris.slice(start, start + 40), expected)
+    if (!order.length) return
+    rememberSavedStates(order, order.map(function(key) {
+      return values[key]
+    }))
   }
 
-  function requestContains(chunk, expected) {
-    spotifyApi.request("GET", "/me/library/contains", { uris: chunk }, null,
-      function(status, payload, error) {
-        if (expected !== root.dataSerial) return
-        root.markSavedUrisChecking(chunk, false)
-        if (error || !Array.isArray(payload)) return
-        root.rememberSavedStates(chunk, payload)
-      })
-  }
-
+  // Star actions go through SubsonicApi's mutating-verb path: a write is
+  // applied to the local view only after the server confirms it, and an
+  // unconfirmed write is reported uncertain without flipping any state.
   function toggleSaved(item) {
-    if (!item || !item.uri || item.type === "chapter" || isSavedBusy(item)) return
+    var key = Api.savedKeyFor(item)
+    if (!key || isSavedBusy(item)) return
+    var type = String((item && item.type) || "track")
+    if (["track", "album", "artist"].indexOf(type) < 0) return
     var removing = isSaved(item)
-    var track = item.type === "track"
-    setSavedBusy(item.uri, true)
-    apiAction(removing ? "DELETE" : "PUT", "/me/library", { uris: item.uri }, null,
-      track
-        ? (removing ? "Removed from Liked Songs" : "Added to Liked Songs")
-        : (removing ? "Removed from your library" : "Saved to your library"),
-      function(ok) {
-        root.setSavedBusy(item.uri, false)
-        if (!ok) return
-        root.setSavedState(item.uri, !removing)
-        if (item.type === "track" && root.savedTracksLoaded) root.loadSavedTracks(false)
-        else if (item.type === "album" && root.savedAlbumsLoaded) root.loadSavedAlbums(false)
-        else if (item.type === "artist" && root.followedArtistsLoaded) root.loadFollowedArtists(false)
-        else if (item.type === "show" && root.savedShowsLoaded) root.loadSavedShows(false)
-        else if (item.type === "episode" && root.savedEpisodesLoaded)
-          root.loadSavedEpisodes(false)
-        else if (item.type === "audiobook" && root.savedAudiobooksLoaded)
-          root.loadSavedAudiobooks(false)
-        if (item.type === "playlist" && root.playlistsLoaded) root.loadPlaylists(false)
-      })
+    var params = type === "album" ? { albumId: [String(item.id)] }
+      : (type === "artist" ? { artistId: [String(item.id)] }
+        : { id: [String(item.id)] })
+    setSavedBusy(key, true)
+    subsonicApi.request(removing ? "unstar" : "star", params, function(result) {
+      root.setSavedBusy(key, false)
+      if (!result || result.ok !== true) {
+        // Uncertain writes must not flip local state; the typed message
+        // explains that the server did not confirm the action.
+        root.fail(String(result && result.errorMessage
+          || "The server did not confirm the change"))
+        return
+      }
+      root.setSavedState(key, !removing)
+      if (type === "song" || type === "track") {
+        if (root.savedTracksLoaded) root.loadSavedTracks(false)
+        if (root.homeLoaded && root.homeRequestsPending === 0)
+          root.loadHomeStarred()
+      } else if (type === "album" && root.savedAlbumsLoaded) {
+        root.loadSavedAlbums(false)
+      } else if (type === "artist" && root.followedArtistsLoaded) {
+        root.loadFollowedArtists(false)
+      }
+    }, { mutating: true, priority: "interactive" })
   }
 
   function syncCurrentTrackSaved(force) {
@@ -1739,58 +1830,55 @@ Item {
 
   function loadPlaylistItems(append) {
     if (!selectedPlaylist || !selectedPlaylist.id || playlistItemsLoading) return
-    var path = append ? playlistItemsNext
-      : "/playlists/" + encodeURIComponent(String(selectedPlaylist.id)) + "/items"
-    if (!path) return
+    if (append === true) {
+      // getPlaylist is a one-shot read: everything is loaded on the first
+      // request, so an append has nothing to fetch.
+      playlistRestoreTargetCount = 0
+      return
+    }
     var playlistId = String(selectedPlaylist.id)
     var expected = dataSerial
     var requestSerial = playlistItemsSerial
     playlistItemsLoading = true
-    spotifyApi.request("GET", path, append ? null : { limit: 50 }, null,
-      function(status, payload, error) {
-        if (expected !== root.dataSerial) return
-        if (requestSerial !== root.playlistItemsSerial) return
-        if (!root.selectedPlaylist || String(root.selectedPlaylist.id) !== playlistId) return
-        root.playlistItemsLoading = false
-        if (error) {
-          root.playlistRestoreTargetCount = 0
-          var hidden = Api.playlistItemsHiddenByApi(status,
-            root.playlistOwned(root.selectedPlaylist),
-            root.selectedPlaylist.collaborative === true,
-            root.currentUserId !== "")
-          if (!append) {
-            root.playlistItemsStatus = status
-            root.playlistItemsError = hidden ? "" : error
-          }
-          if (!hidden || append) root.fail(error)
-          return
+    subsonicApi.request("getPlaylist", { id: playlistId }, function(result) {
+      if (expected !== root.dataSerial) return
+      if (requestSerial !== root.playlistItemsSerial) return
+      if (!root.selectedPlaylist || String(root.selectedPlaylist.id) !== playlistId) return
+      root.playlistItemsLoading = false
+      if (!result || result.ok !== true) {
+        root.playlistRestoreTargetCount = 0
+        if (result) {
+          root.playlistItemsStatus = 0
+          root.playlistItemsError = String(result.errorMessage || "The server request failed")
+          root.fail(root.playlistItemsError)
         }
-        var fallbackPosition = append && root.playlistItems.length
-          ? Api.playlistPositionAt(root.playlistItems,
-            root.playlistItems.length - 1) + 1 : 0
-        var responseOffset = Number(payload && payload.offset)
-        var nextPlaylistPosition = isFinite(responseOffset)
-          ? Math.max(0, Math.floor(responseOffset)) : fallbackPosition
-        var page = Api.normalizePage(payload, function(value) {
-          var position = nextPlaylistPosition++
-          var normalized = Api.normalizeTrack(value, 96)
-          if (normalized) normalized.playlistPosition = position
-          return normalized
-        })
-        // A playlist can intentionally contain the same track more than
-        // once. Preserve every occurrence so visible indexes continue to
-        // match the positions accepted by Spotify's reorder endpoint.
-        root.playlistItemsError = ""
-        root.playlistItemsStatus = status
-        var playlistPage = Api.playlistPageState(root.playlistItems, page.items,
-          append, page.next)
-        root.playlistItems = playlistPage.items
-        root.playlistItemsNext = playlistPage.next
-        if (Api.playlistRestoreShouldContinue(root.playlistItems.length,
-            root.playlistRestoreTargetCount, root.playlistItemsNext))
-          root.loadPlaylistItems(true)
-        else root.playlistRestoreTargetCount = 0
-      })
+        return
+      }
+      var parsed = Subsonic.parsePlaylist(result.data)
+      if (parsed.playlist) {
+        var refreshed = Api.subsonicPlaylistRow(parsed.playlist, root.subsonicArt)
+        if (refreshed) root.selectedPlaylist = refreshed
+      }
+      var rows = []
+      for (var i = 0; i < parsed.entries.length; i++) {
+        var row = Api.subsonicSongRow(parsed.entries[i], root.subsonicArt)
+        if (row) {
+          // A playlist can contain the same track more than once; keep every
+          // occurrence with its explicit entry position.
+          row.playlistPosition = i
+          rows.push(row)
+        }
+      }
+      root.playlistItemsError = ""
+      root.playlistItemsStatus = 0
+      var playlistPage = Api.playlistPageState(root.playlistItems, rows, false, "")
+      root.playlistItems = playlistPage.items
+      root.playlistItemsNext = ""
+      if (Api.playlistRestoreShouldContinue(root.playlistItems.length,
+          root.playlistRestoreTargetCount, root.playlistItemsNext))
+        root.loadPlaylistItems(true)
+      else root.playlistRestoreTargetCount = 0
+    }, { priority: "interactive" })
   }
 
   function loadMorePlaylistItems() {
@@ -1808,42 +1896,55 @@ Item {
     else playlistRestoreTargetCount = 0
   }
 
+  // Playlist verbs map to Subsonic's createPlaylist/updatePlaylist/
+  // deletePlaylist param builders. Every write goes through the mutating
+  // path: unconfirmed writes report uncertain and never pretend success.
   function createPlaylist(name, callback) {
     var normalized = String(name || "").trim()
     if (!normalized || playlistActionBusy) return
     playlistActionBusy = true
-    spotifyApi.request("POST", "/me/playlists", null, {
-      name: normalized.slice(0, 100),
-      "public": false,
-      description: "Created with Omarchy Navidrome"
-    }, function(status, payload, error) {
-      root.playlistActionBusy = false
-      if (error) { root.fail(error); return }
-      var playlist = Api.normalizePlaylist(payload, 96)
-      if (playlist) {
-        root.playlists = [playlist].concat(root.playlists)
-        root.setSavedState(playlist.uri, true)
-        root.succeed("Playlist created")
-        if (typeof callback === "function") callback(playlist)
-      }
-    })
+    subsonicApi.request("createPlaylist",
+      Subsonic.createPlaylistParams(normalized.slice(0, 100)), function(result) {
+        root.playlistActionBusy = false
+        if (!result || result.ok !== true) {
+          root.fail(String(result && result.errorMessage || "The playlist could not be created"))
+          return
+        }
+        var playlist = Api.subsonicPlaylistRow(
+          Subsonic.parsePlaylist(result.data).playlist, root.subsonicArt)
+        if (playlist) {
+          root.playlists = [playlist].concat(root.playlists)
+          root.succeed("Playlist created")
+          if (typeof callback === "function") callback(playlist)
+        } else {
+          root.fail("The playlist was created, but it could not be opened")
+          root.loadPlaylists(false)
+        }
+      }, { mutating: true, priority: "interactive" })
   }
 
+  // Appending uses updatePlaylist's songIdToAdd: createPlaylist with an
+  // existing playlist id replaces the whole playlist with the given songs,
+  // which is the last-writer-wins primitive used for reorders below.
   function addItemToPlaylist(item, playlist) {
-    if (!item || ["track", "episode"].indexOf(item.type) < 0 || !item.uri
+    if (!item || item.type !== "track" || !item.id
         || !playlist || !playlist.id
         || playlistActionBusy) return
     playlistActionBusy = true
-    spotifyApi.request("POST", "/playlists/" + encodeURIComponent(String(playlist.id)) + "/items",
-      null, { uris: [item.uri] }, function(status, payload, error) {
+    subsonicApi.request("updatePlaylist",
+      Subsonic.updatePlaylistParams(String(playlist.id),
+        { songIdToAdd: [String(item.id)] }),
+      function(result) {
         root.playlistActionBusy = false
-        if (error) { root.fail(error); return }
-        root.updatePlaylistSnapshot(playlist.id, payload && payload.snapshot_id)
+        if (!result || result.ok !== true) {
+          root.fail(String(result && result.errorMessage || "The song could not be added"))
+          return
+        }
         root.succeed("Added to " + String(playlist.name || "playlist"))
         if (root.selectedPlaylist && root.selectedPlaylist.id === playlist.id)
           root.loadPlaylistItems(false)
         if (root.detailItem && root.detailItem.id === playlist.id) root.openDetail(root.detailItem)
-      })
+      }, { mutating: true, priority: "interactive" })
   }
 
   function registerPlaylistCopy(playlist) {
@@ -1853,7 +1954,6 @@ Item {
       if (String(playlists[i].id || "") !== String(playlist.id || ""))
         next.push(playlists[i])
     playlists = next
-    setSavedState(playlist.uri, true)
   }
 
   function finishPlaylistConversion(error) {
@@ -1863,108 +1963,73 @@ Item {
     if (error) fail(error)
   }
 
-  function collectPlaylistForCopy(playlist, path, collected, expected, callback) {
-    var first = !path
-    var requestPath = path || "/playlists/" + encodeURIComponent(String(playlist.id)) + "/items"
-    spotifyApi.request("GET", requestPath, first ? { limit: 50 } : null, null,
-      function(status, payload, error) {
-        if (expected !== root.dataSerial) return
-        if (error) { callback([], error); return }
-        if (!payload || !Array.isArray(payload.items)) {
-          callback([], "Spotify does not make this playlist's songs available to copy. The original was left untouched.")
-          return
-        }
-        var page = Api.normalizePage(payload, function(value) {
-          return Api.normalizeTrack(value, 96)
-        })
-        var combined = collected.concat(page.items)
-        if (page.next && combined.length < 10000) {
-          root.collectPlaylistForCopy(playlist, page.next, combined, expected, callback)
-          return
-        }
-        if (page.next) {
-          callback([], "This playlist is too large to copy safely")
-          return
-        }
-        callback(combined, "")
-      })
-  }
-
-  function addPlaylistCopyBatches(playlist, uris, offset, expected, callback) {
-    if (expected !== dataSerial) return
-    if (offset >= uris.length) { callback(""); return }
-    var batch = uris.slice(offset, Math.min(offset + 100, uris.length))
-    spotifyApi.request("POST", "/playlists/" + encodeURIComponent(String(playlist.id)) + "/items",
-      null, { uris: batch }, function(status, payload, error) {
-        if (expected !== root.dataSerial) return
-        if (error) { callback(error); return }
-        root.updatePlaylistSnapshot(playlist.id, payload && payload.snapshot_id)
-        root.addPlaylistCopyBatches(playlist, uris, offset + batch.length, expected, callback)
-      })
-  }
-
   function removeOriginalAfterCopy(original, copy, expected, callback) {
-    spotifyApi.request("DELETE", "/me/library", { uris: original.uri }, null,
-      function(status, payload, error) {
+    subsonicApi.request("deletePlaylist",
+      Subsonic.deletePlaylistParams(original.id), function(result) {
         if (expected !== root.dataSerial) return
-        if (error) {
-          root.finishPlaylistConversion("Your copy is ready, but Spotify could not remove the original from your library")
-          return
-        }
         var next = []
         for (var i = 0; i < root.playlists.length; i++) {
           var candidate = root.playlists[i]
           if (String(candidate.id || "") !== String(original.id || "")) next.push(candidate)
         }
         root.playlists = next
-        root.setSavedState(original.uri, false)
+        if (!result || result.ok !== true) {
+          // Uncertain delete: the copy exists; removing the original did not
+          // confirm, so say exactly that and let the user look at the list.
+          root.finishPlaylistConversion("Your copy is ready, but removing the original did not confirm. Check your playlists.")
+          return
+        }
         root.finishPlaylistConversion("")
         root.succeed("Your playlist is ready")
         if (typeof callback === "function") callback(copy)
-      })
+      }, { mutating: true, priority: "interactive" })
   }
 
   function makePlaylistYourOwn(playlist, callback) {
-    if (!playlist || playlist.type !== "playlist" || !playlist.id || !playlist.uri
-        || playlistOwned(playlist) || playlistActionBusy || !currentUserId) return
+    if (!playlist || playlist.type !== "playlist" || !playlist.id
+        || playlistOwned(playlist) || playlistActionBusy) return
     var expected = dataSerial
     playlistActionBusy = true
     playlistConversionBusy = true
     lastError = ""
     statusClearTimer.stop()
     statusMessage = "Reading " + String(playlist.name || "playlist") + "…"
-    collectPlaylistForCopy(playlist, "", [], expected, function(items, readError) {
-      if (readError) { root.finishPlaylistConversion(readError); return }
-      var uris = Api.playlistItemUris(items)
-      if (Number(playlist.total || 0) > 0 && uris.length === 0) {
-        root.finishPlaylistConversion("Spotify does not make this playlist's songs available to copy. The original was left untouched.")
-        return
-      }
-      root.statusMessage = "Creating your playlist…"
-      spotifyApi.request("POST", "/me/playlists", null, {
-        name: String(playlist.name || "My playlist").slice(0, 100),
-        "public": false,
-        description: "Your copy, created with Omarchy Navidrome"
-      }, function(status, payload, createError) {
+    // getPlaylist is one shot, so the copy flow needs no paging dance.
+    subsonicApi.request("getPlaylist", { id: String(playlist.id) },
+      function(readResult) {
         if (expected !== root.dataSerial) return
-        if (createError) { root.finishPlaylistConversion(createError); return }
-        var copy = Api.normalizePlaylist(payload, 96)
-        if (!copy) {
-          root.finishPlaylistConversion("Spotify created the playlist, but it could not be opened")
+        if (!readResult || readResult.ok !== true) {
+          root.finishPlaylistConversion(String(readResult && readResult.errorMessage
+            || "This playlist could not be copied. The original was left untouched."))
           return
         }
-        root.registerPlaylistCopy(copy)
-        root.statusMessage = "Copying " + uris.length + (uris.length === 1 ? " item…" : " items…")
-        root.addPlaylistCopyBatches(copy, uris, 0, expected, function(copyError) {
-          if (copyError) {
-            root.finishPlaylistConversion("The new playlist was created, but Spotify stopped before every item was copied. The original was kept.")
-            return
-          }
-          root.statusMessage = "Removing the original from your library…"
-          root.removeOriginalAfterCopy(playlist, copy, expected, callback)
-        })
-      })
-    })
+        var entries = Subsonic.parsePlaylist(readResult.data).entries
+        var ids = Api.playlistItemIds(entries.map(function(node) {
+          var row = Api.subsonicSongRow(node, root.subsonicArt)
+          return row
+        }))
+        root.statusMessage = "Creating your playlist…"
+        subsonicApi.request("createPlaylist",
+          Subsonic.createPlaylistParams(
+            String(playlist.name || "My playlist").slice(0, 100), ids),
+          function(createResult) {
+            if (expected !== root.dataSerial) return
+            if (!createResult || createResult.ok !== true) {
+              root.finishPlaylistConversion(String(createResult && createResult.errorMessage
+                || "The playlist could not be created. The original was left untouched."))
+              return
+            }
+            var copy = Api.subsonicPlaylistRow(
+              Subsonic.parsePlaylist(createResult.data).playlist, root.subsonicArt)
+            if (!copy) {
+              root.finishPlaylistConversion("The playlist was created, but it could not be opened")
+              return
+            }
+            root.registerPlaylistCopy(copy)
+            root.statusMessage = "Removing the original from your library…"
+            root.removeOriginalAfterCopy(playlist, copy, expected, callback)
+          }, { mutating: true, priority: "interactive" })
+      }, { priority: "interactive" })
   }
 
   function reloadPlaylist(playlist) {
@@ -1985,72 +2050,89 @@ Item {
       openDetail(detailItem, "", restoredDetailItemCount)
   }
 
+  // Subsonic removes by index inside updatePlaylist; the index is the entry
+  // position, which the playlist rows carry as playlistPosition.
   function removePlaylistItem(item, index, playlist) {
     var target = playlist || selectedPlaylist
-    if (!item || !item.uri || !playlistEditable(target) || playlistActionBusy) return
+    if (!item || !item.id || !playlistEditable(target) || playlistActionBusy) return
+    var position = item.playlistPosition !== undefined
+      && item.playlistPosition !== null
+      ? Math.floor(Number(item.playlistPosition) || 0)
+      : Math.floor(Number(index) || 0)
+    if (position < 0) return
     playlistActionBusy = true
-    var body = { items: [{ uri: item.uri }] }
-    if (target.snapshotId) body.snapshot_id = target.snapshotId
-    spotifyApi.request("DELETE", "/playlists/" + encodeURIComponent(String(target.id)) + "/items",
-      null, body, function(status, payload, error) {
+    subsonicApi.request("updatePlaylist",
+      Subsonic.updatePlaylistParams(String(target.id),
+        { songIndexToRemove: [String(position)] }), function(result) {
         root.playlistActionBusy = false
-        if (error) { root.fail(error); return }
-        root.updatePlaylistSnapshot(target.id, payload && payload.snapshot_id)
+        if (!result || result.ok !== true) {
+          root.fail(String(result && result.errorMessage || "The server did not confirm the removal"))
+          return
+        }
         root.succeed("Removed from playlist")
         root.reloadPlaylist(target)
-      })
+      }, { mutating: true, priority: "interactive" })
   }
 
   function requestPlaylistItemReorder(sourceIndex, destinationIndex, playlist, count,
       sourceItems) {
     var target = playlist || selectedPlaylist
     if (!playlistEditable(target) || playlistActionBusy) return
-    var length = Math.max(0, Math.floor(Number(count) || playlistItems.length))
+    var orderingItems = Array.isArray(sourceItems) && sourceItems.length
+      ? sourceItems
+      : (selectedPlaylist && String(selectedPlaylist.id || "") === String(target.id || "")
+        ? playlistItems : [])
+    var length = Math.max(0, Math.floor(Number(count) || orderingItems.length))
+    if (orderingItems.length < 2 || sourceIndex < 0 || sourceIndex >= orderingItems.length
+        || destinationIndex < 0 || destinationIndex >= orderingItems.length
+        || sourceIndex === destinationIndex) return
+    // Subsonic has no positional reorder. The pattern proven across Subsonic
+    // clients (play:Sub, DSub) is last-writer-wins: re-issue createPlaylist
+    // with the existing playlist id and the full song list in the new order,
+    // which replaces the playlist contents in one write.
+    var reordered = Api.reorderedPlaylistItemsAtPositions(orderingItems,
+      sourceIndex, destinationIndex)
+    var ids = []
+    for (var i = 0; i < reordered.length; i++) {
+      var id = String((reordered[i] && reordered[i].id) || "")
+      if (id) ids.push(id)
+    }
+    if (!ids.length) return
+
     var playlistId = String(target.id || "")
+    var previousPlaylistItems = playlistItems
+    var previousDetailItems = detailItems
     var selectedMatches = selectedPlaylist
       && String(selectedPlaylist.id || "") === playlistId
     var detailMatches = detailItem && detailItem.type === "playlist"
       && String(detailItem.id || "") === playlistId
-    var orderingItems = Array.isArray(sourceItems) ? sourceItems
-      : (selectedMatches ? playlistItems : (detailMatches ? detailItems : []))
-    var body = orderingItems.length
-      ? Api.playlistReorderBodyForItems(orderingItems, sourceIndex,
-        destinationIndex, Math.max(length, Number(target.total) || 0),
-        target.snapshotId)
-      : Api.playlistReorderBody(sourceIndex, destinationIndex, length,
-        target ? target.snapshotId : "")
-    if (!body) return
-
-    var sourcePosition = orderingItems.length
-      ? Api.playlistPositionAt(orderingItems, sourceIndex) : sourceIndex
-    var destinationPosition = orderingItems.length
-      ? Api.playlistPositionAt(orderingItems, destinationIndex) : destinationIndex
-    var previousPlaylistItems = playlistItems
-    var previousDetailItems = detailItems
     if (selectedMatches)
       playlistItems = Api.reorderedPlaylistItemsAtPositions(playlistItems,
-        sourcePosition, destinationPosition)
+        sourceIndex, destinationIndex)
     if (detailMatches)
       detailItems = Api.reorderedPlaylistItemsAtPositions(detailItems,
-        sourcePosition, destinationPosition)
+        sourceIndex, destinationIndex)
 
     playlistActionBusy = true
-    spotifyApi.request("PUT", "/playlists/" + encodeURIComponent(String(target.id)) + "/items",
-      null, body, function(status, payload, error) {
+    subsonicApi.request("createPlaylist",
+      Subsonic.createPlaylistParams(null, ids, playlistId),
+      function(result) {
         root.playlistActionBusy = false
-        if (error) {
+        if (!result || result.ok !== true) {
+          // Uncertain write: restore the displayed order so the view never
+          // claims a mutation the server did not confirm.
           if (selectedMatches && root.selectedPlaylist
               && String(root.selectedPlaylist.id || "") === playlistId)
             root.playlistItems = previousPlaylistItems
           if (detailMatches && root.detailItem && root.detailItem.type === "playlist"
               && String(root.detailItem.id || "") === playlistId)
             root.detailItems = previousDetailItems
-          root.fail(error)
+          root.fail(String(result && result.errorMessage || "The server did not confirm the move"))
           return
         }
-        root.updatePlaylistSnapshot(target.id, payload && payload.snapshot_id)
         root.succeed("Playlist order updated")
-      })
+        root.reloadPlaylist(target)
+      }, { mutating: true, priority: "interactive" })
   }
 
   function reorderPlaylistItem(sourceIndex, destinationIndex, playlist, count,
@@ -2068,33 +2150,16 @@ Item {
       playlist || selectedPlaylist, count)
   }
 
-  function detailPageFromPayload(payload, type, parent) {
-    var container = payload || {}
-    if (type === "album") container = payload && payload.tracks ? payload.tracks : container
-    else if (type === "playlist")
-      container = payload && (payload.items || payload.tracks) ? (payload.items || payload.tracks) : container
-    else if (type === "show") container = payload && payload.episodes ? payload.episodes : container
-    else if (type === "audiobook")
-      container = payload && payload.chapters ? payload.chapters : container
-    var nextPlaylistPosition = Math.max(0,
-      Math.floor(Number(container.offset) || 0))
-    return Api.normalizePage(container, function(value) {
-      var position = nextPlaylistPosition++
-      var normalized = type === "artist" ? Api.normalizeContext(value, 96)
-        : Api.normalizeTrack(value, 96, parent)
-      if (normalized && type === "playlist")
-        normalized.playlistPosition = position
-      return normalized
-    })
-  }
-
+  // Detail pages map one Subsonic verb each: album → getAlbum (its tracks),
+  // playlist → getPlaylist (its entries), artist → getArtist + getTopSongs.
+  // All are one-shot reads; `detailNext` stays "" and there is no cursor
+  // pagination anywhere.
   function openDetail(item, requestedArtistQuery, restoredItemCount) {
     if (!item || !item.id || item.kind !== "context") return
     var type = String(item.type || "")
-    if (["artist", "album", "playlist", "show", "audiobook"].indexOf(type) < 0) return
+    if (["artist", "album", "playlist"].indexOf(type) < 0) return
     var serial = ++detailSerial
-    detailRestoreTargetCount = type === "playlist"
-      ? Api.normalizedPlaylistRestoreCount(restoredItemCount) : 0
+    detailRestoreTargetCount = 0
     detailItem = item
     detailItems = []
     detailNext = ""
@@ -2117,56 +2182,70 @@ Item {
     activeView = "detail"
     checkSavedItems([item])
 
-    var metadataPath = "/" + (type === "show" ? "shows" : type === "audiobook"
-      ? "audiobooks" : type + "s") + "/" + encodeURIComponent(String(item.id))
-    spotifyApi.request("GET", metadataPath, null, null, function(status, payload, error) {
+    if (type === "artist") {
+      // getArtist answers the discography; getTopSongs answers the popular
+      // songs the Spotify "top tracks" section used to hold.
+      root.findArtistMusic(initialArtistQuery, serial, item)
+      return
+    }
+    var endpoint = type === "album" ? "getAlbum" : "getPlaylist"
+    var params = type === "album" ? { id: String(item.id) } : { id: String(item.id) }
+    subsonicApi.request(endpoint, params, function(result) {
       if (serial !== root.detailSerial) return
-      if (error) {
-        root.detailRestoreTargetCount = 0
-        root.detailLoading = false
-        root.fail(error)
-        return
-      }
-      var normalized = Api.normalizeContext(payload, 256)
-      if (normalized) root.detailItem = normalized
-      var parent = root.detailItem || item
-      if (type === "artist") {
-        root.loadArtistThisIs(serial, parent)
-        root.findArtistMusic(initialArtistQuery, serial, parent)
-        return
-      }
-      var page = root.detailPageFromPayload(payload, type, parent)
-      root.detailItems = page.items
-      root.detailNext = page.next
       root.detailLoading = false
+      if (!result || result.ok !== true) {
+        root.detailRestoreTargetCount = 0
+        root.fail(String(result && result.errorMessage || "The server request failed"))
+        return
+      }
+      if (endpoint === "getAlbum") {
+        var parsedAlbum = Subsonic.parseAlbum(result.data)
+        if (parsedAlbum.album) {
+          var refreshed = Api.subsonicAlbumRow(parsedAlbum.album, root.subsonicArt)
+          if (refreshed) root.detailItem = refreshed
+        }
+        var rows = []
+        for (var i = 0; i < parsedAlbum.songs.length; i++) {
+          var row = Api.subsonicSongRow(parsedAlbum.songs[i], root.subsonicArt,
+            root.detailItem)
+          if (row) rows.push(row)
+        }
+        root.detailItems = rows
+      } else {
+        var parsedPlaylist = Subsonic.parsePlaylist(result.data)
+        if (parsedPlaylist.playlist) {
+          var playlist = Api.subsonicPlaylistRow(parsedPlaylist.playlist,
+            root.subsonicArt)
+          if (playlist) root.detailItem = playlist
+        }
+        var entries = []
+        for (var j = 0; j < parsedPlaylist.entries.length; j++) {
+          var entry = Api.subsonicSongRow(parsedPlaylist.entries[j],
+            root.subsonicArt)
+          if (entry) {
+            entry.playlistPosition = j
+            entries.push(entry)
+          }
+        }
+        root.detailItems = entries
+      }
       root.checkSavedItems(root.detailItems)
-      if (type === "playlist" && Api.playlistRestoreShouldContinue(
-          root.detailItems.length, root.detailRestoreTargetCount,
-          root.detailNext)) root.loadMoreDetail()
-      else root.detailRestoreTargetCount = 0
-      if (type === "playlist" && !payload.items && !payload.tracks)
-        root.detailMessage = Api.playlistItemsHiddenMessage()
-    })
+    }, { priority: "interactive" })
   }
 
+  // loadArtistThisIs is deliberately inert: "This Is <artist>" playlists are
+  // Spotify editorial content with no Subsonic counterpart. The slot and the
+  // loading flag stay so the artist view keeps its shape until the cleanup
+  // pass removes them (Part B).
   function loadArtistThisIs(expectedDetail, artist) {
-    if (!artist || artist.type !== "artist" || !artist.name) return
     artistThisIsPlaylist = null
-    artistThisIsLoading = true
-    spotifyApi.request("GET", "/search", {
-      q: "This Is " + String(artist.name),
-      type: "playlist",
-      limit: 10
-    }, null, function(status, payload, error) {
-      if (expectedDetail !== root.detailSerial) return
-      root.artistThisIsLoading = false
-      if (error) return
-      var page = Api.normalizeSearchPage(payload, "playlist", 128)
-      root.artistThisIsPlaylist = Api.findThisIsPlaylist(page.items, artist.name)
-      if (root.artistThisIsPlaylist) root.checkSavedItems([root.artistThisIsPlaylist])
-    })
+    artistThisIsLoading = false
   }
 
+  // Artist page data: the discography comes from getArtist's album list,
+  // and the songs section from getTopSongs. While the artist page filter is
+  // active, both sections become bounded search3 windows over a plain text
+  // query (artist name + filter) — Subsonic has no artist-scoped Lucene.
   function findArtistMusic(query, serial, artist) {
     var parent = artist || detailItem
     if (!parent || parent.type !== "artist" || !parent.name) return
@@ -2184,45 +2263,63 @@ Item {
     artistPlaylistsLoading = false
     detailMessage = ""
     detailLoading = true
+    // Subsonic has no artist-scoped playlist search; the playlist section of
+    // the artist page stays empty (Part B removes it).
     requestArtistCatalog("album", false, expectedDetail, expectedCatalog, parent)
-    if (artistCatalogQuery) {
-      requestArtistCatalog("track", false, expectedDetail, expectedCatalog, parent)
-      requestArtistCatalog("playlist", false, expectedDetail, expectedCatalog, parent)
-    } else requestArtistTopSongs(false, expectedDetail, expectedCatalog, parent, 0)
+    requestArtistTopSongs(false, expectedDetail, expectedCatalog, parent, 0)
   }
 
-  function requestArtistCatalog(type, append, expectedDetail, expectedCatalog, artist) {
+  function artistSearchTerm(artist) {
+    var name = String(artist && artist.name || "").trim()
+    var filter = Api.sanitizeSearchTerm(artistCatalogQuery)
+    return name && filter ? name + " " + filter : name
+  }
+
+  function requestArtistCatalog(type, append, expectedDetail, expectedCatalog,
+      artist) {
     var albums = type === "album"
-    var playlists = type === "playlist"
-    var discography = albums && !artistCatalogQuery && artist.id
-    var path = append ? (albums ? artistAlbumsNext
-      : (playlists ? artistPlaylistsNext : artistSongsNext))
-      : (discography ? "/artists/" + encodeURIComponent(artist.id) + "/albums" : "/search")
-    if (!path) return
+    if (!albums || !artist || !artist.id) return
     if (albums) artistAlbumsLoading = true
-    else if (playlists) artistPlaylistsLoading = true
-    else artistSongsLoading = true
-    var query = append ? null : discography
-      ? { include_groups: "album,single,compilation", limit: 50 } : {
-      q: playlists
-        ? Api.artistPlaylistSearchText(artist.name, artistCatalogQuery)
-        : Api.catalogSearchText(artist.name, artistCatalogQuery),
-      type: type,
-      limit: 10
+    if (!artistCatalogQuery) {
+      subsonicApi.request("getArtist", { id: String(artist.id) },
+        function(result) {
+          if (expectedDetail !== root.detailSerial
+              || expectedCatalog !== root.artistCatalogSerial) return
+          if (albums) root.artistAlbumsLoading = false
+          root.detailLoading = root.artistCatalogLoading
+          if (!result || result.ok !== true) {
+            root.fail(String(result && result.errorMessage || "The server request failed"))
+            return
+          }
+          var parsed = Subsonic.parseArtist(result.data)
+          var rows = []
+          for (var i = 0; i < parsed.albums.length; i++) {
+            var row = Api.subsonicAlbumRow(parsed.albums[i], root.subsonicArt)
+            if (row) rows.push(row)
+          }
+          root.applyArtistCatalogPage(type, append, { items: rows, next: "" })
+        }, { priority: "interactive" })
+      return
     }
-    spotifyApi.request("GET", path, query, null, function(status, payload, error) {
-      if (expectedDetail !== root.detailSerial || expectedCatalog !== root.artistCatalogSerial)
-        return
-      if (albums) root.artistAlbumsLoading = false
-      else if (playlists) root.artistPlaylistsLoading = false
-      else root.artistSongsLoading = false
-      root.detailLoading = root.artistCatalogLoading
-      if (error) { root.fail(error); return }
-      root.applyArtistCatalogPage(type, append,
-        discography ? Api.normalizePage(payload, function(item) {
-          return Api.normalizeContext(item, 96)
-        }) : Api.normalizeSearchPage(payload, type, 96))
-    })
+    subsonicApi.search3(root.artistSearchTerm(artist),
+      Api.search3WindowParams("album", 0), function(result) {
+        if (expectedDetail !== root.detailSerial
+            || expectedCatalog !== root.artistCatalogSerial) return
+        if (albums) root.artistAlbumsLoading = false
+        root.detailLoading = root.artistCatalogLoading
+        if (!result || result.ok !== true) {
+          root.fail(String(result && result.errorMessage || "The server request failed"))
+          return
+        }
+        var rows = []
+        var albumsFound = result.results && result.results.albums
+          ? result.results.albums : []
+        for (var i = 0; i < albumsFound.length; i++) {
+          var row = Api.subsonicAlbumRow(albumsFound[i], root.subsonicArt)
+          if (row) rows.push(row)
+        }
+        root.applyArtistCatalogPage(type, append, { items: rows, next: "" })
+      })
   }
 
   function applyArtistCatalogPage(type, append, page) {
@@ -2246,95 +2343,92 @@ Item {
 
   function requestArtistTopSongs(append, expectedDetail, expectedCatalog, artist,
       automaticPage) {
-    var path = append ? artistSongsNext : "/search"
-    if (!path) return
-    var automaticDepth = Math.max(0, Number(automaticPage) || 0)
+    if (!artist || !artist.id) return
     artistSongsLoading = true
-    var query = append ? null : {
-      q: String(artist.name || ""),
-      type: "track",
-      limit: 10
+    if (!artistCatalogQuery) {
+      // getTopSongs arrives under artist.topSongs in Navidrome's getArtist
+      // answer; it needs Last.fm integration on the server, so an artist
+      // without one parses to an empty list, never an error.
+      subsonicApi.request("getTopSongs", { artist: String(artist.id) },
+        function(result) {
+          if (expectedDetail !== root.detailSerial || expectedCatalog !== root.artistCatalogSerial)
+            return
+          if (result && result.ok !== true) {
+            root.artistSongsLoading = false
+            root.detailLoading = root.artistCatalogLoading
+            root.fail(String(result.errorMessage || "The server request failed"))
+            return
+          }
+          var topSongs = Subsonic.parseTopSongs(result.data)
+          var matching = []
+          for (var i = 0; i < topSongs.length && matching.length < 10; i++) {
+            var row = Api.subsonicSongRow(topSongs[i], root.subsonicArt)
+            if (row) matching.push(row)
+          }
+          root.artistSongs = Api.mergeUnique(append ? root.artistSongs : [],
+            matching).slice(0, 10)
+          root.checkSavedItems(matching)
+          root.artistSongsNext = ""
+          root.artistSongsLoading = false
+          root.detailLoading = root.artistCatalogLoading
+        }, { priority: "interactive" })
+      return
     }
-    spotifyApi.request("GET", path, query, null, function(status, payload, error) {
-      if (expectedDetail !== root.detailSerial || expectedCatalog !== root.artistCatalogSerial)
-        return
-      if (error) {
+    subsonicApi.search3(root.artistSearchTerm(artist),
+      Api.search3WindowParams("track", 0), function(result) {
+        if (expectedDetail !== root.detailSerial || expectedCatalog !== root.artistCatalogSerial)
+          return
+        if (result && result.ok !== true) {
+          root.artistSongsLoading = false
+          root.detailLoading = root.artistCatalogLoading
+          root.fail(String(result.errorMessage || "The server request failed"))
+          return
+        }
+        var found = result.results && result.results.songs
+          ? result.results.songs : []
+        var matching = []
+        for (var i = 0; i < found.length && matching.length < 10; i++) {
+          var row = Api.subsonicSongRow(found[i], root.subsonicArt)
+          if (row) matching.push(row)
+        }
+        root.artistSongs = Api.mergeUnique(append ? root.artistSongs : [],
+          matching).slice(0, 10)
+        root.checkSavedItems(matching)
+        root.artistSongsNext = ""
         root.artistSongsLoading = false
         root.detailLoading = root.artistCatalogLoading
-        root.fail(error)
-        return
-      }
-      var page = Api.normalizeSearchPage(payload, "track", 96)
-      var matching = Api.tracksForArtist(page.items, artist)
-      root.artistSongs = Api.mergeUnique(append ? root.artistSongs : [], matching).slice(0, 10)
-      root.checkSavedItems(matching)
-      if (root.artistSongs.length < 10 && page.next && automaticDepth < 5) {
-        root.artistSongsNext = page.next
-        root.requestArtistTopSongs(true, expectedDetail, expectedCatalog,
-          artist, automaticDepth + 1)
-        return
-      }
-      root.artistSongsNext = ""
-      root.artistSongsLoading = false
-      root.detailLoading = root.artistCatalogLoading
-    })
+      })
   }
 
   function loadMoreArtistAlbums() {
-    if (!artistAlbumsNext || artistAlbumsLoading || !detailItem) return
+    if (artistAlbumsLoading || !detailItem) return
     requestArtistCatalog("album", true, detailSerial, artistCatalogSerial, detailItem)
   }
 
   function loadMoreArtistSongs() {
-    if (!artistSongsNext || artistSongsLoading || !detailItem) return
-    requestArtistCatalog("track", true, detailSerial, artistCatalogSerial, detailItem)
+    // Top songs arrive complete; there is no continuation window.
+    if (artistSongsLoading || !detailItem) return
+    requestArtistTopSongs(true, detailSerial, artistCatalogSerial, detailItem, 0)
   }
 
   function loadMoreArtistPlaylists() {
-    if (!artistPlaylistsNext || artistPlaylistsLoading || !detailItem) return
-    requestArtistCatalog("playlist", true, detailSerial, artistCatalogSerial,
-      detailItem)
+    // No Subsonic artist-playlist search; nothing to load.
   }
 
   function loadMoreDetail() {
-    var path = detailNext
-    var parent = detailItem
-    if (!path || !parent || detailLoading) return
-    var serial = detailSerial
-    var type = String(parent.type || "")
-    if (type === "artist") return
-    detailLoading = true
-    spotifyApi.request("GET", path, null, null, function(status, payload, error) {
-      if (serial !== root.detailSerial) return
-      root.detailLoading = false
-      if (error) {
-        root.detailRestoreTargetCount = 0
-        root.fail(error)
-        return
-      }
-      var page = root.detailPageFromPayload(payload, type, parent)
-      root.detailItems = (type === "playlist"
-        ? root.detailItems.concat(page.items)
-        : Api.mergeUnique(root.detailItems, page.items))
-      root.detailNext = page.next
-      root.checkSavedItems(page.items)
-      if (type === "playlist" && Api.playlistRestoreShouldContinue(
-          root.detailItems.length, root.detailRestoreTargetCount,
-          root.detailNext)) root.loadMoreDetail()
-      else root.detailRestoreTargetCount = 0
-    })
+    // Every Subsonic detail page is a one-shot read; the restore loop the
+    // Web API playlist pages needed simply drains.
+    detailRestoreTargetCount = 0
   }
 
   function ensureDetailItemCount(value) {
-    if (!detailItem || detailItem.type !== "playlist") return
-    var target = Api.normalizedPlaylistRestoreCount(value)
-    if (target <= detailItems.length) return
-    detailRestoreTargetCount = Math.max(detailRestoreTargetCount, target)
-    if (detailLoading) return
-    if (detailNext) loadMoreDetail()
-    else detailRestoreTargetCount = 0
+    if (!detailItem) return
+    detailRestoreTargetCount = 0
   }
 
+  // Footer context buttons: "go to artist" and "go to album" of the current
+  // track. A live row (library playback) carries ids directly; metadata from
+  // MPRIS alone resolves through a bounded search3 by name.
   function currentContext(kind, callback) {
     if (typeof callback !== "function") return
     if (kind === "artist" && currentArtists.length) {
@@ -2347,132 +2441,150 @@ Item {
       callback(currentAlbumItem)
       return
     }
-    var id = currentTrackId
-    if (!id) {
-      if (kind === "artist" && currentArtistContextAvailable)
-        resolveArtist(artist, callback)
+    if (kind === "artist" && currentArtistContextAvailable) {
+      resolveArtist(artist, callback)
       return
     }
-    spotifyApi.request("GET", "/tracks/" + encodeURIComponent(id), null, null,
-      function(status, payload, error) {
-        if (error) { root.fail(error); return }
-        var track = Api.normalizeTrack(payload, 128)
-        if (!track) return
-        if (kind === "album" && track.albumItem) callback(track.albumItem)
-        else if (kind === "artist" && track.artists.length) callback(track.artists[0])
-      })
+    if (kind === "album" && album) resolveAlbum(album, callback)
   }
 
   function resolveArtist(name, callback) {
     var term = String(name || "").trim()
     if (!term || typeof callback !== "function") return
-    spotifyApi.request("GET", "/search", {
-      q: term,
-      type: "artist",
-      limit: 10
-    }, null, function(status, payload, error) {
-      if (error) { root.fail(error); return }
-      var page = Api.normalizeSearchPage(payload, "artist", 128)
-      var match = Api.artistForName(page.items, term)
-      if (!match) {
-        root.fail("Spotify could not find that artist")
-        return
-      }
-      root.checkSavedItems([match])
-      callback(match)
-    })
+    subsonicApi.search3(term, Api.search3WindowParams("artist", 0),
+      function(result) {
+        if (!result || result.ok !== true) {
+          root.fail(String(result && result.errorMessage || "The server request failed"))
+          return
+        }
+        var rows = result.results && result.results.artists
+          ? result.results.artists : []
+        var match = Api.artistForName(
+          rows.map(function(node) {
+            var row = Api.subsonicArtistRow(node, root.subsonicArt)
+            return row
+          }).filter(function(row) { return !!row }), term)
+        if (!match) {
+          root.fail("The server could not find that artist")
+          return
+        }
+        root.checkSavedItems([match])
+        callback(match)
+      })
   }
 
+  function resolveAlbum(name, callback) {
+    var term = String(name || "").trim()
+    if (!term || typeof callback !== "function") return
+    subsonicApi.search3(term, Api.search3WindowParams("album", 0),
+      function(result) {
+        if (!result || result.ok !== true) {
+          root.fail(String(result && result.errorMessage || "The server request failed"))
+          return
+        }
+        var found = result.results && result.results.albums
+          ? result.results.albums : []
+        var rows = []
+        for (var i = 0; i < found.length; i++) {
+          var row = Api.subsonicAlbumRow(found[i], root.subsonicArt)
+          if (row) rows.push(row)
+        }
+        var wanted = term.toLowerCase()
+        var match = null
+        for (var j = 0; j < rows.length; j++) {
+          if (String(rows[j].name || "").trim().toLowerCase() === wanted) {
+            match = rows[j]
+            break
+          }
+        }
+        if (!match && rows.length) match = rows[0]
+        if (!match) {
+          root.fail("The server could not find that album")
+          return
+        }
+        root.checkSavedItems([match])
+        callback(match)
+      })
+  }
+
+  // Home becomes the plan's getAlbumList2 windows — recently played,
+  // frequently played, and newest albums — plus the starred-song window from
+  // getStarred2. Four bounded reads, one per window, all user-priority.
   function finishHomeRequest(error) {
     homeRequestsPending = Math.max(0, homeRequestsPending - 1)
     if (error) fail(error)
     if (homeRequestsPending === 0) {
       homeLoaded = true
-      checkSavedItems(recentTracks.concat(topTracks).concat(topArtists))
+      checkSavedItems(homeRecent.concat(homeFrequent).concat(homeNewest)
+        .concat(homeStarred))
     }
+  }
+
+  function requestHomeAlbumWindow(listName, type, expected) {
+    subsonicApi.request("getAlbumList2",
+      Subsonic.albumList2Params(type, 30, 0), function(result) {
+        if (expected !== root.dataSerial) {
+          root.finishHomeRequest(null)
+          return
+        }
+        if (result && result.ok === true) {
+          root[listName] = Api.subsonicAlbumListRows(result.data, root.subsonicArt)
+        } else {
+          root[listName] = []
+        }
+        root.finishHomeRequest(result && result.ok === true
+          ? null : String(result && result.errorMessage || "The server request failed"))
+      }, { priority: "interactive" })
   }
 
   function loadHome() {
     if (homeLoading) return
     var expected = dataSerial
     homeLoaded = false
-    homeRequestsPending = 3
-    spotifyApi.request("GET", "/me/player/recently-played", { limit: 30 }, null,
-      function(status, payload, error) {
-        if (expected !== root.dataSerial) return
-        if (!error) {
-          var page = Api.normalizePage(payload, function(value) {
-            return Api.normalizeTrack(value, 96)
-          })
-          root.recentTracks = page.items
-        }
-        root.finishHomeRequest(error)
-      })
-    spotifyApi.request("GET", "/me/top/tracks", {
-      limit: 30, time_range: "medium_term"
-    }, null, function(status, payload, error) {
-      if (expected !== root.dataSerial) return
-      if (!error) {
-        var page = Api.normalizePage(payload, function(value) {
-          return Api.normalizeTrack(value, 96)
-          })
-          root.topTracks = page.items
+    homeRequestsPending = 4
+    requestHomeAlbumWindow("homeRecent", "recent", expected)
+    requestHomeAlbumWindow("homeFrequent", "frequent", expected)
+    requestHomeAlbumWindow("homeNewest", "newest", expected)
+    loadHomeStarred(expected)
+  }
+
+  // The starred window shares the single getStarred2 pass with the library
+  // collections: one server read, several consumers.
+  function loadHomeStarred(expected) {
+    var serial = expected === undefined ? dataSerial : expected
+    loadStarred2IfNeeded(serial, function(filled) {
+      if (serial !== root.dataSerial) {
+        root.finishHomeRequest(null)
+        return
       }
-      root.finishHomeRequest(error)
-    })
-    spotifyApi.request("GET", "/me/top/artists", {
-      limit: 30, time_range: "medium_term"
-    }, null, function(status, payload, error) {
-      if (expected !== root.dataSerial) return
-      if (!error) {
-        var page = Api.normalizePage(payload, function(value) {
-          return Api.normalizeContext(value, 96)
-          })
-          root.topArtists = page.items
-      }
-      root.finishHomeRequest(error)
+      root.homeStarred = filled ? filled.songs.slice(0, 100) : []
+      root.finishHomeRequest(filled ? null
+        : "The starred list could not be loaded")
     })
   }
 
   function homeItems(kind) {
     var value = String(kind || "recent")
-    if (value === "tracks") return topTracks
-    if (value === "artists") return topArtists
-    return recentTracks
+    if (value === "frequent") return homeFrequent
+    if (value === "newest") return homeNewest
+    if (value === "starred") return homeStarred
+    return homeRecent
   }
 
-  function mergeDiscoverCandidates(items) {
-    discoverCandidates = Api.mergeUnique(discoverCandidates, items)
-    discoverPlaylists = Api.discoveryPlaylists(discoverCandidates, 24)
-  }
-
+  // Explore keeps the discovery role with Navidrome content: a random-album
+  // window and the genre list. The genre scan machinery from
+  // FilterScanController stays for the genre browser (view pass).
   function finishDiscoverRequest(error) {
     if (error) discoverRequestsFailed++
     discoverRequestsPending = Math.max(0, discoverRequestsPending - 1)
     if (discoverRequestsPending > 0) return
     discoverLoaded = true
-    checkSavedItems(discoverPlaylists)
-    if (!discoverPlaylists.length) {
-      discoverMessage = discoverRequestsFailed >= Api.DISCOVERY_SEARCHES.length
-        ? "Spotify could not load discovery playlists. Try Refresh."
-        : "Spotify did not return any personal discovery playlists yet. Try Refresh later."
+    checkSavedItems(discoverAlbums)
+    if (!discoverAlbums.length) {
+      discoverMessage = discoverRequestsFailed > 0
+        ? "The server could not load random albums. Try Refresh."
+        : "No random albums were returned. Try Refresh later."
     }
-  }
-
-  function requestDiscoverPlaylistSearch(term, expectedData, expectedDiscover) {
-    spotifyApi.request("GET", "/search", {
-      q: String(term || ""),
-      type: "playlist",
-      limit: 10
-    }, null, function(status, payload, error) {
-      if (expectedData !== root.dataSerial || expectedDiscover !== root.discoverSerial)
-        return
-      if (!error) {
-        var page = Api.normalizeSearchPage(payload, "playlist", 128)
-        root.mergeDiscoverCandidates(page.items)
-      }
-      root.finishDiscoverRequest(error)
-    })
   }
 
   function loadDiscover() {
@@ -2482,15 +2594,30 @@ Item {
     discoverLoaded = false
     discoverMessage = ""
     discoverRequestsFailed = 0
-    discoverCandidates = playlists.slice()
-    discoverPlaylists = Api.discoveryPlaylists(discoverCandidates, 24)
-    discoverRequestsPending = Api.DISCOVERY_SEARCHES.length
-    if (!discoverRequestsPending) {
-      discoverLoaded = true
-      return
-    }
-    for (var i = 0; i < Api.DISCOVERY_SEARCHES.length; i++)
-      requestDiscoverPlaylistSearch(Api.DISCOVERY_SEARCHES[i], expectedData, expectedDiscover)
+    discoverRequestsPending = 2
+    subsonicApi.request("getAlbumList2",
+      Subsonic.albumList2Params("random", 30, 0), function(result) {
+        if (expectedData !== root.dataSerial
+            || expectedDiscover !== root.discoverSerial) {
+          root.finishDiscoverRequest(null)
+          return
+        }
+        if (result && result.ok === true)
+          root.discoverAlbums = Api.subsonicAlbumListRows(result.data, root.subsonicArt)
+        else root.discoverAlbums = []
+        root.finishDiscoverRequest(result && result.ok === true
+          ? null : String(result && result.errorMessage || "The server request failed"))
+      }, { priority: "interactive" })
+    subsonicApi.request("getGenres", {}, function(result) {
+      if (expectedData !== root.dataSerial
+          || expectedDiscover !== root.discoverSerial) {
+        root.finishDiscoverRequest(null)
+        return
+      }
+      root.discoverGenres = result && result.ok === true
+        ? Subsonic.parseGenres(result.data) : []
+      root.finishDiscoverRequest(null)
+    }, { priority: "interactive" })
   }
 
   function findDiscoveredReceiver(playbackDevice) {
@@ -2715,6 +2842,10 @@ Item {
       })
   }
 
+  // The live queue is engine-owned; its honest QML-side source is the
+  // server-persisted play queue the engine keeps saving (bounded debounce).
+  // SongRefs map back to canonical rows so the queue view renders like any
+  // other list.
   function loadQueue(callback, serial) {
     if (queueLoading) {
       if (typeof callback === "function") callback()
@@ -2722,28 +2853,35 @@ Item {
     }
     var expected = serial === undefined ? dataSerial : serial
     queueLoading = true
-    spotifyApi.request("GET", "/me/player/queue", null, null,
-      function(status, payload, error) {
-        if (expected !== root.dataSerial) return
+    backendClient.sendCommand("get_saved_queue", null, function(ok, result, error) {
+      if (expected !== root.dataSerial) {
         root.queueLoading = false
-        if (error) root.fail(error)
-        else {
-          var source = payload && Array.isArray(payload.queue) ? payload.queue : []
-          var next = []
-          for (var i = 0; i < source.length && next.length < 100; i++) {
-            var track = Api.normalizeTrack(source[i], 96)
-            if (track) next.push(track)
-          }
-          root.queue = next
-          root.queueLoaded = true
-        }
         if (typeof callback === "function") callback()
-      })
+        return
+      }
+      root.queueLoading = false
+      if (!ok) {
+        root.fail(error || "The queue could not be read")
+        if (typeof callback === "function") callback()
+        return
+      }
+      var saved = result && typeof result === "object" ? result : ({})
+      var songs = Api.arrayValues(saved.songs)
+      var next = []
+      for (var i = 0; i < songs.length && next.length < Api.PLAYBACK_URI_LIMIT; i++) {
+        var row = Api.subsonicSongRefRow(songs[i])
+        if (row) next.push(row)
+      }
+      root.queue = next
+      root.queueLoaded = true
+      if (typeof callback === "function") callback()
+    })
   }
 
   SearchController {
     id: searchController
-    api: spotifyApi
+    api: subsonicApi
+    subsonicArt: root.subsonicArt
     dataSerial: root.dataSerial
     onRememberSearch: term => root.rememberSearch(term)
     onCheckSavedItems: items => root.checkSavedItems(items)
@@ -2953,15 +3091,19 @@ Item {
   }
 
   function dispatchPendingPlayback(playbackSerial) {
-    if (playbackSerial !== pendingPlaybackSerial || !pendingPlaybackBody) return
+    if (playbackSerial !== pendingPlaybackSerial || !pendingPlaybackLoad) return
     var target = autoselectLocalDevice() || chooseDevice()
     if (target && !target.local) {
       localActivationRequested = false
       sendPendingPlayback(Api.playbackTargetDeviceId(target, selectedDeviceExplicit))
       return
     }
-    if (!daemonManager.credentialsAvailable && (!target || target.local)) {
-      fail("Approve playback on this computer in Settings, then try again")
+    // Navidrome credentials ride configure_server (keyring → backend), so the
+    // old "approve playback" OAuth gate has no primary-runtime equivalent;
+    // only the interim spotifyd fallback runtime still needs it.
+    if (daemonManager.usingFallbackRuntime
+        && !daemonManager.credentialsAvailable) {
+      fail("Playback on this computer is not set up. Review Settings, then try again")
       clearPendingPlayback()
       return
     }
@@ -2980,12 +3122,15 @@ Item {
       clearPendingPlayback()
       return
     }
+    // Cold start: bring the engine up and hand the load over as soon as the
+    // socket is ready. The Spotify-era device probe never applied here —
+    // the Navidrome engine is the receiver itself.
     daemonManager.start()
-    deviceProbeTimer.restart()
+    waitForLocalSocketThenPlay(playbackSerial)
   }
 
   function waitForLocalSocketThenPlay(playbackSerial) {
-    if (playbackSerial !== pendingPlaybackSerial || !pendingPlaybackBody) return
+    if (playbackSerial !== pendingPlaybackSerial || !pendingPlaybackLoad) return
     if (backendClient.ready) {
       sendLocalSocketPlayback(playbackSerial)
       return
@@ -3001,33 +3146,24 @@ Item {
   }
 
   function sendLocalSocketPlayback(playbackSerial) {
-    if (playbackSerial !== pendingPlaybackSerial || !pendingPlaybackBody) return
-    var body = pendingPlaybackBody
+    if (playbackSerial !== pendingPlaybackSerial || !pendingPlaybackLoad) return
     var load = pendingPlaybackLoad
     var successMessage = pendingPlaybackMessage
     var radioPlaylist = pendingPlaybackRadio
     clearPendingPlayback()
     localSocketWaitTimer.stop()
-    // Without a v2 load body there is nothing the stream engine can play;
-    // fall back to the remote Spotify API like an absent socket would.
-    if (!load) {
-      root.succeed(Api.localSocketFallbackMessage())
-      root.sendPendingPlayback(Api.playbackTargetDeviceId(
-        root.localDevice() || root.chooseDevice(), root.selectedDeviceExplicit))
-      return
-    }
     // Credentials must precede load/add_to_queue on a fresh connection.
     ensureBackendServerConfigured()
+    localLoadInFlight = true
     backendClient.loadPlayback(load, function(ok, result, error) {
+      localLoadInFlight = false
       if (ok) {
         if (playbackSerial === root.radioSerial)
           root.radioContextSelected = !!radioPlaylist
         if (successMessage) root.succeed(successMessage)
         root.loadQueue()
-        root.loadPlaybackState()
         return
       }
-      root.pendingPlaybackBody = body
       root.pendingPlaybackLoad = load
       root.pendingPlaybackMessage = successMessage
       root.pendingPlaybackRadio = radioPlaylist
@@ -3040,29 +3176,39 @@ Item {
           || error || "Playback on this computer is not set up")
         return
       }
-      root.succeed(Api.localSocketFallbackMessage())
-      root.sendPendingPlayback(Api.playbackTargetDeviceId(
-        root.localDevice() || root.chooseDevice(), root.selectedDeviceExplicit))
+      // Generic failures are surfaced honestly; there is no remote playback
+      // to fall back to in the Navidrome port.
+      root.clearPendingPlayback()
+      root.fail(error || "Playback on this computer could not start this song")
     })
   }
 
+  // Playback rows are Subsonic songs. The v2 load body is built from the
+  // visible list starting at the clicked row, so Next walks the displayed
+  // order exactly as before. Context rows (album/playlist/artist) have no
+  // server-side context to hand over: their full list is fetched first, then
+  // queued from the top.
   function playItem(item, sourceItems, contextUri, successMessage, explicitRadio) {
     localPlaybackStopped = false
     var playbackSerial = ++radioSerial
-    var body = Api.playbackBody(item, sourceItems, contextUri)
-    if (!body) {
-      fail("This Spotify item cannot be played")
+    if (item && item.kind === "context") {
+      playContextItem(item, successMessage, playbackSerial)
       return
     }
-    // The stream engine queues complete songs, not Spotify contexts. Same
-    // ordering rules as the remote body: start at the clicked row and carry
-    // the visible list with it.
-    pendingPlaybackLoad = Api.playbackLoadBodyV2(item, sourceItems, contextUri,
-      item.resumeMs)
-    pendingPlayback = item
-    pendingPlaybackBody = body
+    var load = Api.playbackLoadBodyV2(item, sourceItems, contextUri,
+      item ? item.resumeMs : 0)
+    if (!load) {
+      fail("This song cannot be played")
+      return
+    }
+    beginPlaybackLoad(load, item, successMessage, playbackSerial)
+  }
+
+  function beginPlaybackLoad(load, anchorItem, successMessage, playbackSerial) {
+    pendingPlayback = anchorItem
+    pendingPlaybackLoad = load
     pendingPlaybackMessage = String(successMessage || "")
-    pendingPlaybackRadio = radioPlaylistForPlayback(item, contextUri, explicitRadio)
+    pendingPlaybackRadio = null
     pendingPlaybackSerial = playbackSerial
     localActivationRequested = true
     deviceProbeAttempts = 0
@@ -3078,6 +3224,45 @@ Item {
       return
     }
     dispatchPendingPlayback(playbackSerial)
+  }
+
+  function playContextItem(item, successMessage, playbackSerial) {
+    if (!item || !item.id) {
+      fail("This collection cannot be played")
+      return
+    }
+    var type = String(item.type || "")
+    var endpoint = type === "album" ? "getAlbum"
+      : (type === "playlist" ? "getPlaylist"
+        : (type === "artist" ? "getTopSongs" : ""))
+    if (!endpoint) {
+      fail("This collection cannot be played")
+      return
+    }
+    var params = endpoint === "getTopSongs" ? { artist: String(item.id) }
+      : { id: String(item.id) }
+    succeed("Queuing " + String(item.name || "the collection") + "…")
+    subsonicApi.request(endpoint, params, function(result) {
+      if (playbackSerial !== root.radioSerial) return
+      if (!result || result.ok !== true) {
+        root.fail(String(result && result.errorMessage || "The collection could not be loaded"))
+        return
+      }
+      var songs = endpoint === "getAlbum" ? Subsonic.parseAlbum(result.data).songs
+        : (endpoint === "getPlaylist" ? Subsonic.parsePlaylist(result.data).entries
+          : Subsonic.parseTopSongs(result.data))
+      var rows = []
+      for (var i = 0; i < songs.length && rows.length < Api.PLAYBACK_URI_LIMIT; i++) {
+        var row = Api.subsonicSongRow(songs[i], root.subsonicArt)
+        if (row) rows.push(row)
+      }
+      var load = Api.backendLoadFieldsV2(rows, { play: true, offset_index: 0 })
+      if (!load) {
+        root.fail("This collection has no playable songs")
+        return
+      }
+      root.beginPlaybackLoad(load, rows[0], successMessage, playbackSerial)
+    }, { priority: "interactive" })
   }
 
   // Protocol v2: configure_server must be sent once per backend connection
@@ -3113,13 +3298,15 @@ Item {
   // session stopped. The one-attempt-per-session guard plus the idle check
   // keep a reconnect from clobbering live playback.
   property bool restoreAttempted: false
+  // A v2 load push is on the wire: no restore may race it.
+  property bool localLoadInFlight: false
 
   function backendIdleForRestore() {
     if (hasMedia) return false
     var state = backendClient.lastState
     if (state && (state.playback === "playing" || state.playback === "loading"))
       return false
-    return !pendingPlaybackBody && !localActivationRequested
+    return !pendingPlaybackLoad && !localLoadInFlight && !localActivationRequested
   }
 
   function restoreSavedSession(callback) {
@@ -3149,12 +3336,14 @@ Item {
           if (typeof callback === "function") callback(false)
           return
         }
+        localLoadInFlight = true
         backendClient.loadPlayback({
           items: plan.songs,
           offset_index: plan.offset_index,
           position_ms: plan.position_ms,
           play: false
         }, function(loadOk) {
+          localLoadInFlight = false
           if (typeof callback === "function") callback(loadOk === true)
         })
       })
@@ -3190,7 +3379,7 @@ Item {
       if (root.deviceProbeAttempts < 8) deviceProbeTimer.restart()
       else {
         root.clearPendingPlayback()
-        root.fail("Playback on this computer did not become available. Reconnect Spotify in Settings, then try again")
+        root.fail("Playback on this computer did not become available. Review Settings, then try again")
       }
     })
   }
@@ -3255,100 +3444,11 @@ Item {
     dispatch(false)
   }
 
+  // Track radio needs server-side similarity (getSimilarSongs2 with Last.fm)
+  // and is planned with the radio package (6). Until then the action reports
+  // itself unavailable instead of pretending to shuffle.
   function startRadio(item) {
-    if (!item || item.type !== "track" || !item.id || !item.uri) {
-      fail("Track radio is available for Spotify songs")
-      return
-    }
-    var expected = ++radioSerial
-    noteActivity()
-    succeed("Finding similar tracks…")
-    // Development-mode recommendation requests can succeed with no payload.
-    // Spotify's generated radio playlists provide a real playback context, so
-    // prefer an exact Spotify-owned match and verify its first track is the seed.
-    spotifyApi.request("GET", "/search", {
-      q: String(item.name || "") + " Radio",
-      type: "playlist",
-      limit: 10
-    }, null, function(status, payload, error) {
-      if (expected !== root.radioSerial) return
-      if (!error) {
-        var page = Api.normalizeSearchPage(payload, "playlist", 96)
-        var candidates = Api.trackRadioPlaylists(page.items, item.name)
-        if (candidates.length) {
-          root.tryRadioPlaylist(item, candidates, 0, expected)
-          return
-        }
-      }
-      root.requestRadioRecommendations(item, expected)
-    })
-  }
-
-  function tryRadioPlaylist(item, candidates, index, expected) {
-    if (expected !== radioSerial) return
-    if (index >= candidates.length) {
-      requestRadioRecommendations(item, expected)
-      return
-    }
-    var candidate = candidates[index]
-    spotifyApi.request("GET", "/playlists/"
-      + encodeURIComponent(String(candidate.id)) + "/items", { limit: 1 }, null,
-      function(status, payload, error) {
-        if (expected !== root.radioSerial) return
-        var source = payload && Array.isArray(payload.items) ? payload.items : []
-        var first = !error && source.length ? Api.normalizeTrack(source[0], 96) : null
-        if (first && Api.radioSeedMatches(first, item)) {
-          root.rememberRadioPlaylist(candidate)
-          root.playItem(candidate, null, "", "Track radio started", candidate)
-          root.radioPlaylistReady(candidate)
-          return
-        }
-        root.tryRadioPlaylist(item, candidates, index + 1, expected)
-      })
-  }
-
-  function requestRadioRecommendations(item, expected) {
-    if (expected !== radioSerial) return
-    spotifyApi.request("GET", "/recommendations", {
-      limit: 49,
-      seed_tracks: item.id
-    }, null, function(status, payload, error) {
-      if (expected !== root.radioSerial) return
-      var source = payload && Array.isArray(payload.tracks) ? payload.tracks : []
-      var extras = []
-      for (var i = 0; i < source.length; i++) {
-        var track = Api.normalizeTrack(source[i], 96)
-        if (track) extras.push(track)
-      }
-      var radio = Api.uniqueRadioTracks(item, extras)
-      if (!error && radio.length > 1) {
-        root.playItem(item, radio, "", "Track radio started")
-        return
-      }
-      root.requestRadioArtistTracks(item, expected)
-    })
-  }
-
-  function requestRadioArtistTracks(item, expected) {
-    if (expected !== radioSerial) return
-    var artist = item.artists && item.artists.length ? item.artists[0] : null
-    if (!artist || !artist.name) {
-      fail("Spotify could not find a radio mix for this song")
-      return
-    }
-    spotifyApi.request("GET", "/search", {
-      q: Api.catalogSearchText(artist.name, ""),
-      type: "track",
-      limit: 10
-    }, null, function(status, payload, error) {
-      if (expected !== root.radioSerial) return
-      var page = error ? { items: [] }
-        : Api.normalizeSearchPage(payload, "track", 96)
-      var radio = Api.uniqueRadioTracks(item,
-        Api.tracksForArtist(page.items, artist))
-      if (radio.length > 1) root.playItem(item, radio, "", "Track radio started")
-      else root.fail("Spotify could not find a radio mix for this song")
-    })
+    fail("Track radio is not available yet")
   }
 
   function sendSonosControl(action, value) {
@@ -3392,31 +3492,40 @@ Item {
     playbackPositionTick++
   }
 
+  // Resume candidates: Navidrome has no client-visible play history, so the
+  // "continue where you were" offer is the most recent album window
+  // (getAlbumList2 type=recent). Exact-position resume is the saved-session
+  // restore above; this candidate is the footer's idle Play target.
   function loadResumeCandidate(force) {
     if (resumeCandidateLoading) return
-    if (!authManager.loggedIn && !authManager.tokenIsFresh()) return
+    if (!authManager.loggedIn) return
     if (force !== true && resumeCandidateLoadedAt > 0
         && Date.now() - resumeCandidateLoadedAt < 30000) return
     var expected = dataSerial
     resumeCandidateLoading = true
     resumeCandidateLoadedAt = Date.now()
-    spotifyApi.request("GET", "/me/player/recently-played", { limit: 5 }, null,
-      function(status, payload, error) {
+    subsonicApi.request("getAlbumList2",
+      Subsonic.albumList2Params("recent", 1, 0), function(result) {
         if (expected !== root.dataSerial) return
         root.resumeCandidateLoading = false
-        if (error) return
-        root.resumeCandidate = Api.resumeCandidateFromRecentlyPlayed(payload, 192)
+        if (result && result.ok === true) {
+          var rows = Api.subsonicAlbumListRows(result.data, root.subsonicArt)
+          root.resumeCandidate = rows.length
+            ? { item: rows[0], playedAt: "" } : null
+        } else {
+          root.resumeCandidate = null
+        }
         root.resumeCandidateLoadedAt = Date.now()
-      })
+      }, { priority: "interactive" })
   }
 
-  // Nothing is loaded, so a plain resume has no context to continue. Start the
-  // last play inside its playlist or album through the regular playback path,
-  // which also brings up the local receiver when it has idled out.
+  // Nothing is loaded, so a plain resume has no queue to continue. Start the
+  // most recent album through the regular playback path, which also brings up
+  // the local engine when it has idled out.
   function resumeLastPlayed() {
     var candidate = resumeCandidate
     if (!Api.resumePlaybackAvailable(hasMedia, candidate)) return false
-    playItem(candidate.item, null, candidate.contextUri,
+    playItem(candidate.item, null, "",
       "Resuming " + String(candidate.item.name || ""))
     return true
   }
@@ -3606,11 +3715,9 @@ Item {
   }
 
   function addToQueue(item) {
-    // Protocol v2 add_to_queue carries a SongRef; the remote path keeps the
-    // Web API shape.
-    if (!item || ["track", "episode"].indexOf(item.type) < 0
-        || !Api.backendSongRefV2(item)) {
-      fail("Only tracks and episodes can be added to the queue")
+    // The queue is the engine's; add_to_queue carries one SongRef.
+    if (!item || item.type !== "track" || !Api.backendSongRefV2(item)) {
+      fail("Only songs can be added to the queue")
       return
     }
     if (!useRemotePlayback && backendClient.ready) {
@@ -3625,10 +3732,9 @@ Item {
         })
       return
     }
-    apiAction("POST", "/me/player/queue", {
-      uri: item.uri,
-      device_id: controlDeviceId() || undefined
-    }, null, "Added to queue", function(ok) { if (ok) root.loadQueue() })
+    // With no local engine there is nothing to append to; the Web API queue
+    // path died with the Spotify transport.
+    fail("Playback on this computer is not ready, so the queue cannot take songs yet")
   }
 
   function startEngine() {
@@ -3712,6 +3818,9 @@ Item {
     clearPendingPlayback()
     deviceProbeTimer.stop()
     spotifyApi.cancelSearch()
+    // Drain any in-flight Subsonic reads/writes: a stale starred or playlist
+    // write must not land after the credentials are gone.
+    subsonicApi.cancelAll()
     daemonManager.clearCredentials()
     authManager.logout()
     clearData()
@@ -3793,14 +3902,17 @@ Item {
     savedUrisRevision++
     savedUrisCheckingRevision++
     savedUrisBusyRevision++
-    recentTracks = []
-    topTracks = []
-    topArtists = []
+    homeRecent = []
+    homeFrequent = []
+    homeNewest = []
+    homeStarred = []
     homeLoaded = false
     homeRequestsPending = 0
+    starred2Loading = false
+    starred2Waiters = []
     discoverSerial++
-    discoverPlaylists = []
-    discoverCandidates = []
+    discoverAlbums = []
+    discoverGenres = []
     discoverLoaded = false
     discoverRequestsPending = 0
     discoverRequestsFailed = 0
@@ -3938,7 +4050,7 @@ Item {
       root.loginFlowActive = false
       root.fail(reason)
     }
-    function onCredentialsCleared() { root.succeed("Signed out of Spotify") }
+    function onCredentialsCleared() { root.succeed("Signed out") }
     function onCredentialsClearFailed(reason) { root.fail(reason) }
   }
 
@@ -4156,7 +4268,7 @@ Item {
     interval: 200
     repeat: true
     onTriggered: {
-      if (root.backend.ready && root.pendingPlaybackBody) {
+      if (root.backend.ready && root.pendingPlaybackLoad) {
         stop()
         root.localSocketWaitAttempts = 0
         root.sendLocalSocketPlayback(root.pendingPlaybackSerial)
@@ -4166,9 +4278,9 @@ Item {
       if (root.localSocketWaitAttempts >= 25) {
         stop()
         root.localSocketWaitAttempts = 0
-        if (root.pendingPlaybackBody) {
-          root.succeed(Api.localSocketFallbackMessage())
-          deviceProbeTimer.restart()
+        if (root.pendingPlaybackLoad) {
+          root.clearPendingPlayback()
+          root.fail("The local player did not become ready in time. Check Settings, then try again")
         }
       }
     }
@@ -4294,7 +4406,7 @@ Item {
     onLifecycleChanged: root.ensureBackendServerConfigured()
     onErrorCodeChanged: {
       if (errorCode === "audio_key_unavailable")
-        root.fail(errorMessage || "Spotify could not play this track on this computer")
+        root.fail(errorMessage || "This track could not be played on this computer")
       else if (backendClient.credentialFailure) {
         // Typed credential-class state from the engine: terminal, so the
         // pending playback push stops and the UI explains the actual failure.

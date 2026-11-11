@@ -467,8 +467,8 @@ Item {
       ? String(state.searchType) : "track"
     libraryType = ["tracks", "albums", "artists", "shows", "episodes", "audiobooks"]
       .indexOf(String(state.libraryType || "")) >= 0 ? String(state.libraryType) : "tracks"
-    homeType = ["recent", "tracks", "artists"].indexOf(String(state.homeType || "")) >= 0
-      ? String(state.homeType) : "recent"
+    homeType = ["recent", "frequent", "newest", "starred"].indexOf(
+      String(state.homeType || "")) >= 0 ? String(state.homeType) : "recent"
     libraryFilter = String(state.libraryFilter || "")
     librarySort = String(state.librarySort || "default")
     playlistFilter = String(state.playlistFilter || "")
@@ -1028,7 +1028,9 @@ Item {
       if (["show", "audiobook"].indexOf(kind) < 0
           || (service.detailItems && service.detailItems.length > 0))
         actions.push("detail-play")
-      actions.push("detail-save", "detail-more")
+      if (["track", "album", "artist"].indexOf(kind) >= 0)
+        actions.push("detail-save")
+      actions.push("detail-more")
     }
     if (artistCatalog) {
       actions.push("list-albums", "list-songs")
@@ -2581,8 +2583,7 @@ Item {
 
       ContextMenuButton {
         contextAction: "ctx-queue"
-        visible: root.contextItem
-          && ["track", "episode"].indexOf(root.contextItem.type) >= 0
+        visible: root.contextItem && root.contextItem.type === "track"
         text: "Add to queue"
         iconText: "󰐕"
         onClicked: {
@@ -2593,8 +2594,7 @@ Item {
 
       ContextMenuButton {
         contextAction: "ctx-playlist"
-        visible: root.contextItem
-          && ["track", "episode"].indexOf(root.contextItem.type) >= 0
+        visible: root.contextItem && root.contextItem.type === "track"
         text: "Add to playlist…"
         iconText: "󱁐"
         onClicked: {
@@ -2656,7 +2656,7 @@ Item {
       ContextMenuButton {
         contextAction: "ctx-library"
         visible: root.contextItem && !!root.contextItem.uri
-          && root.contextItem.type !== "chapter"
+          && ["track", "album", "artist"].indexOf(root.contextItem.type) >= 0
         text: root.service && root.service.isSaved(root.contextItem)
           ? "Remove from library" : "Save to library"
         iconText: root.service && root.service.isSaved(root.contextItem) ? "󰓎" : "󰋑"
@@ -4581,8 +4581,9 @@ Item {
           Repeater {
             model: [
               { type: "recent", label: "Recently played", icon: "󰋚" },
-              { type: "tracks", label: "Top songs", icon: "󰎈" },
-              { type: "artists", label: "Top artists", icon: "󰠃" }
+              { type: "frequent", label: "Frequently played", icon: "󰎈" },
+              { type: "newest", label: "Newest albums", icon: "󰚝" },
+              { type: "starred", label: "Starred", icon: "󰋑" }
             ]
             Button {
               required property var modelData
@@ -4616,9 +4617,9 @@ Item {
           restoredContentY: root.scrollFor("home:" + root.homeType)
           stateKey: "home:" + root.homeType
           emptyMessage: root.service && root.service.homeLoading
-            ? "Loading your listening history…"
+            ? "Loading your library windows…"
             : (root.homeFilter.trim() ? "No matches in " + root.activeSearchScope.label + "."
-              : "No listening history is available yet.")
+              : "Nothing here yet.")
           onActivated: function(item, items, uri) {
             root.activateMedia(item, items, uri)
           }
@@ -4644,7 +4645,7 @@ Item {
       MediaCollection {
         anchors.fill: parent
         service: root.service
-        sourceItems: root.service ? root.service.discoverPlaylists : []
+        sourceItems: root.service ? root.service.discoverAlbums : []
         filterText: root.discoverFilter
         showFilter: false
         showQueue: false
@@ -4656,10 +4657,10 @@ Item {
         restoredContentY: root.scrollFor("discover")
         stateKey: "discover"
         emptyMessage: root.service && root.service.discoverLoading
-          ? "Finding playlists picked for you…"
+          ? "Finding albums from your library…"
           : (root.discoverFilter.trim() ? "No matches in Discover."
             : (root.service && root.service.discoverMessage
-            ? root.service.discoverMessage : "No discovery playlists are available yet."))
+            ? root.service.discoverMessage : "No albums were found yet."))
         onActivated: function(item, items, uri) {
           root.activateMedia(item, items, uri)
         }
@@ -4852,6 +4853,9 @@ Item {
                 KeyHint { region: "page"; action: "detail-play" }
               }
               Button {
+                visible: root.service && root.service.detailItem
+                  && ["track", "album", "artist"].indexOf(
+                    root.service.detailItem.type) >= 0
                 text: root.service && root.service.isSaved(root.service.detailItem)
                   ? "Saved" : "Save"
                 iconText: root.service && root.service.isSaved(root.service.detailItem)
@@ -5333,10 +5337,7 @@ Item {
               { type: "track", label: "Songs" },
               { type: "artist", label: "Artists" },
               { type: "album", label: "Albums" },
-              { type: "playlist", label: "Playlists" },
-              { type: "show", label: "Podcasts" },
-              { type: "episode", label: "Episodes" },
-              { type: "audiobook", label: "Books" }
+              { type: "playlist", label: "Playlists" }
             ]
 
             Button {

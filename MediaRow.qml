@@ -29,12 +29,15 @@ BorderSurface {
 
   readonly property bool durationActionVisible: itemData
     && itemData.kind === "item" && Number(itemData.durationMs) > 0
+  // Subsonic starred actions apply to songs, albums, and artists; a row is
+  // starable when it carries a usable id (playlists have no server star).
   readonly property bool saveActionVisible: showSave && !saved && itemData
-    && !!itemData.uri && itemData.type !== "chapter"
+    && !!itemData.id
+    && ["track", "album", "artist"].indexOf(itemData.type) >= 0
   readonly property bool playlistActionVisible: showPlaylist && itemData
-    && ["track", "episode"].indexOf(itemData.type) >= 0
+    && itemData.type === "track"
   readonly property bool queueActionVisible: showQueue && itemData
-    && ["track", "episode"].indexOf(itemData.type) >= 0
+    && itemData.type === "track"
   readonly property bool playActionVisible: showPlay && itemData
     && ["show", "audiobook"].indexOf(itemData.type) < 0
   readonly property int fullActionCount: (durationActionVisible ? 1 : 0)

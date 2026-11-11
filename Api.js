@@ -1,5 +1,7 @@
 .pragma library
 
+.import "Subsonic.js" as Subsonic
+
 var API_BASE = "https://api.spotify.com/v1"
 var TOKEN_URL = "https://accounts.spotify.com/api/token"
 var AUTH_URL = "https://accounts.spotify.com/authorize"
@@ -22,15 +24,7 @@ var SCOPES = [
   "user-modify-playback-state"
 ]
 
-var SEARCH_TYPES = ["track", "artist", "album", "playlist", "show", "episode", "audiobook"]
-var DISCOVERY_SEARCHES = [
-  "Discover Weekly",
-  "Release Radar",
-  "daylist",
-  "Daily Mix",
-  "New Music Friday",
-  "Fresh Finds"
-]
+var SEARCH_TYPES = ["track", "artist", "album", "playlist"]
 
 // spotifyd's software mixer maps its normalized volume over a 60 dB
 // logarithmic range. Convert that control to a cubic slider over the same
@@ -358,10 +352,6 @@ function playlistItemsEmptyMessage(playlist, itemCount, error, status, userId) {
   if (playlistItemsHiddenByApi(200, owned, collaborative, knownUser))
     return playlistItemsHiddenMessage()
   return "This playlist has no visible items."
-}
-
-function localSocketFallbackMessage() {
-  return "The local player was not ready, so this track is starting through Spotify."
 }
 
 // While a player surface is open, keep this computer registered as a Spotify
@@ -712,7 +702,358 @@ function playbackLoadBodyV2(item, sourceItems, contextUri, resumeMs) {
   return fields
 }
 
-// Popups drawn inside the panel (shortcut help, menus, pickers) sit over the
+// --------------------------------------------------------------------------
+// Canonical Subsonic rows
+//
+// One row shape for every Subsonic-backed surface (home, library, search,
+// detail, playlists, queue). The view layer (MediaRow, MediaByline,
+// MediaCollection, the panel views) renders these without caring which
+// endpoint produced them. No Spotify-only field survives: there is no
+// Spotify uri, no externalUrl, no snapshot semantics. `uri` is an app-local
+// identity token (`navidrome:<type>:<id>`) so the view plumbing that
+// previously compared Spotify uris (context menus, playlist identity,
+// occurrence matching) keeps a stable unique key without leaking any
+// Spotify vocabulary into playback — Service builds v2 load bodies from
+// `id` alone and never reads row uris.
+//
+// `art` carries the pinned artwork context {serverUrl, username, password,
+// salt}; the same salt for the whole session keeps getCoverArt URLs stable
+// across row rebuilds, so revisiting a view triggers no artwork traffic.
+// Views still gate every load behind the artwork master switch; building the
+// URL itself moves no bytes.
+
+function subsonicArtContext(serverUrl, username, password, salt) {
+  return {
+    serverUrl: String(serverUrl || ""),
+    username: String(username || ""),
+    password: String(password || ""),
+    salt: String(salt || "")
+  }
+}
+
+function subsonicArtUrl(art, coverArt, size) {
+  if (!art || !art.serverUrl || !art.username || !art.salt) return ""
+  var id = String(coverArt || "")
+  if (!id) return ""
+  var built = Subsonic.coverArtUrl(art.serverUrl, id, size,
+    { u: art.username, p: art.password, salt: art.salt })
+  return built || ""
+}
+
+function navidromeUri(type, id) {
+  return "navidrome:" + String(type || "track") + ":" + String(id || "")
+}
+
+// Song row (kind "item"). `node` is a Subsonic.normalizeSong result; parent
+// lets an album context stand in when the song carries no albumId.
+function subsonicSongRow(node, art, parent) {
+  if (!node || !node.id) return null
+  var artists = []
+  if (node.artistId || node.artist) {
+    var artist = subsonicArtistRow({
+      id: node.artistId || "",
+      name: node.artist || "",
+      coverArt: node.coverArt,
+      starred: node.starred
+    }, art)
+    if (artist) artists.push(artist)
+  }
+  var albumRow = null
+  if (node.albumId || node.album) {
+    albumRow = subsonicAlbumRow({
+      id: node.albumId || "",
+      name: node.album || "",
+      artist: node.artist || "",
+      artistId: node.artistId || "",
+      coverArt: node.coverArt,
+      year: node.year,
+      starred: node.starred
+    }, art) || parent
+  } else if (parent && parent.type === "album") {
+    albumRow = parent
+  }
+  return {
+    kind: "item",
+    type: "track",
+    id: String(node.id),
+    uri: navidromeUri("track", node.id),
+    name: String(node.title || "Untitled"),
+    subtitle: String(node.artist || ""),
+    album: String(node.album || ""),
+    artists: artists,
+    albumItem: albumRow && albumRow.name ? albumRow : null,
+    parentContext: parent && parent.type === "album" ? parent : null,
+    imageUrl: subsonicArtUrl(art, node.coverArt, 128),
+    coverArt: String(node.coverArt || ""),
+    durationMs: Math.max(0, Math.floor(Number(node.duration) || 0)) * 1000,
+    duration: Math.max(0, Math.floor(Number(node.duration) || 0)),
+    trackNumber: Math.max(0, Math.floor(Number(node.track) || 0)),
+    discNumber: 1,
+    year: node.year || null,
+    genre: String(node.genre || ""),
+    playlistPosition: undefined,
+    starred: node.starred === true
+  }
+}
+
+// Album row (kind "context"). artist/artistId may be filled later (getAlbum).
+function subsonicAlbumRow(node, art) {
+  if (!node || !node.id) return null
+  var details = []
+  var artistName = String(node.artist || "")
+  if (artistName) details.push(artistName)
+  var year = Math.floor(Number(node.year) || 0)
+  if (year > 0) details.push(String(year))
+  var artists = []
+  if (artistName) {
+    var artist = subsonicArtistRow({
+      id: node.artistId || "",
+      name: artistName,
+      coverArt: node.coverArt,
+      starred: node.starred
+    }, art)
+    if (artist) artists.push(artist)
+  }
+  return {
+    kind: "context",
+    type: "album",
+    id: String(node.id),
+    uri: navidromeUri("album", node.id),
+    name: String(node.name || "Untitled"),
+    subtitle: details.join(" · "),
+    description: "",
+    artists: artists,
+    imageUrl: subsonicArtUrl(art, node.coverArt, 192),
+    coverArt: String(node.coverArt || ""),
+    total: Math.max(0, Math.floor(Number(node.songCount) || 0)),
+    songCount: Math.max(0, Math.floor(Number(node.songCount) || 0)),
+    duration: Math.max(0, Math.floor(Number(node.duration) || 0)),
+    year: year > 0 ? year : null,
+    genre: String(node.genre || ""),
+    releaseType: "",
+    releaseDate: year > 0 ? String(year) : "",
+    ownerId: "",
+    ownerName: "",
+    collaborative: false,
+    public: false,
+    snapshotId: "",
+    starred: node.starred === true,
+    played: typeof node.played === "string" ? node.played : null
+  }
+}
+
+// Artist row (kind "context"). Also used inline as a song's `artists` entry.
+function subsonicArtistRow(node, art) {
+  if (!node || !node.id || !node.name) return null
+  return {
+    kind: "context",
+    type: "artist",
+    id: String(node.id),
+    uri: navidromeUri("artist", node.id),
+    name: String(node.name),
+    subtitle: "Artist",
+    description: "",
+    artists: [],
+    imageUrl: subsonicArtUrl(art, node.coverArt, 192),
+    coverArt: String(node.coverArt || ""),
+    total: Math.max(0, Math.floor(Number(node.albumCount) || 0)),
+    albumCount: Math.max(0, Math.floor(Number(node.albumCount) || 0)),
+    starred: node.starred === true
+  }
+}
+
+// Playlist row (kind "context"). owner is the Navidrome username; it feeds
+// playlistOwned()/editablePlaylists() through ownerId, matching the Web API
+// key the consumers already read.
+function subsonicPlaylistRow(node, art) {
+  if (!node || !node.id) return null
+  var owner = String(node.owner || "")
+  return {
+    kind: "context",
+    type: "playlist",
+    id: String(node.id),
+    uri: navidromeUri("playlist", node.id),
+    name: String(node.name || "Untitled"),
+    subtitle: owner || "Playlist",
+    description: String(node.comment || ""),
+    artists: [],
+    imageUrl: subsonicArtUrl(art, node.coverArt, 192),
+    coverArt: String(node.coverArt || ""),
+    total: Math.max(0, Math.floor(Number(node.songCount) || 0)),
+    songCount: Math.max(0, Math.floor(Number(node.songCount) || 0)),
+    duration: Math.max(0, Math.floor(Number(node.duration) || 0)),
+    releaseType: "",
+    releaseDate: "",
+    ownerId: owner,
+    ownerName: owner,
+    collaborative: false,
+    public: node.public === true,
+    snapshotId: "",
+    created: String(node.created || ""),
+    changed: String(node.changed || ""),
+    starred: node.starred === true
+  }
+}
+
+// A protocol-v2 SongRef (the backend's get_saved_queue answer) mapped back to
+// a display row so the queue view shows the same shape as every other list.
+// Artists degrade to name-only entries — no ids ride a SongRef.
+function subsonicSongRefRow(song) {
+  if (!song || typeof song !== "object" || !song.id) return null
+  var names = []
+  var source = arrayValues(song.artists)
+  for (var i = 0; i < source.length; i++) {
+    var entry = source[i]
+    if (!entry) continue
+    var name = String(typeof entry === "object" ? entry.name : entry).trim()
+    if (name && names.indexOf(name) < 0) names.push(name)
+  }
+  var durationMs = Math.max(0, Math.floor(Number(song.duration_ms) || 0))
+  return {
+    kind: "item",
+    type: "track",
+    id: String(song.id),
+    uri: navidromeUri("track", song.id),
+    name: String(song.title || "Untitled"),
+    subtitle: names.join(", "),
+    album: String(song.album || ""),
+    artists: names.map(function(name) {
+      return {
+        kind: "context", type: "artist", id: "", uri: "", name: name,
+        subtitle: "Artist", description: "", artists: [], imageUrl: "",
+        coverArt: "", total: 0, albumCount: 0, starred: false
+      }
+    }),
+    albumItem: null,
+    parentContext: null,
+    imageUrl: String(song.cover_art || ""),
+    coverArt: "",
+    durationMs: durationMs,
+    duration: Math.ceil(durationMs / 1000),
+    trackNumber: Math.max(0, Math.floor(Number(song.track) || 0)),
+    discNumber: 1,
+    year: null,
+    genre: "",
+    playlistPosition: undefined,
+    starred: false
+  }
+}
+
+// ---- Subsonic windows -------------------------------------------------------
+
+// getAlbumList2 → canonical album rows.
+function subsonicAlbumListRows(data, art) {
+  var albums = Subsonic.parseAlbumList(data)
+  var rows = []
+  for (var i = 0; i < albums.length; i++) {
+    var row = subsonicAlbumRow(albums[i], art)
+    if (row) rows.push(row)
+  }
+  return rows
+}
+
+// getStarred2 → the combined starred view: songs first (the "saved tracks"
+// surface), then albums and artists (the saved-albums/saved-artists specs).
+function subsonicStarredRows(data, art) {
+  var starred = Subsonic.parseStarred2(data)
+  var songs = []
+  for (var i = 0; i < starred.songs.length; i++) {
+    var row = subsonicSongRow(starred.songs[i], art)
+    if (row) songs.push(row)
+  }
+  var albums = []
+  for (var j = 0; j < starred.albums.length; j++) {
+    var album = subsonicAlbumRow(starred.albums[j], art)
+    if (album) albums.push(album)
+  }
+  var artists = []
+  for (var k = 0; k < starred.artists.length; k++) {
+    var artist = subsonicArtistRow(starred.artists[k], art)
+    if (artist) artists.push(artist)
+  }
+  return { songs: songs, albums: albums, artists: artists }
+}
+
+// A saved state key for any canonical row. Uri was the Web API key; ids are
+// the Subsonic key, namespaced by type because Subsonic ids are opaque.
+function savedKeyFor(item) {
+  if (!item || typeof item !== "object") return ""
+  var id = String(item.id === undefined || item.id === null ? "" : item.id).trim()
+  if (!id) return ""
+  return String(item.type || "track") + ":" + id
+}
+
+// Search3 → the searchGroups page shape every existing search consumer
+// reads: one page per SEARCH_TYPES key, `next` carrying the next window
+// offset (as a string, "" when the window came back short), `total` the
+// returned count. Subsonic search3 covers artists/albums/songs only; the
+// playlist page is filled by the controller from getPlaylists, and the
+// podcast-family pages stay empty because the library has no such content.
+function subsonicSearchPage(items, nextOffset, windowSize) {
+  var limit = Math.max(0, Math.floor(Number(windowSize) || 0))
+  return {
+    items: items,
+    next: limit > 0 && items.length >= limit && nextOffset > 0
+      ? String(nextOffset) : "",
+    total: items.length
+  }
+}
+
+// results is Subsonic.parseSearch3 output; type is the API type the user
+// asked for ("track" | "artist" | "album"); offset is the window the page
+// was requested at, so `next` points at the following window.
+function subsonicSearchGroups(results, type, art, windowSize, offset) {
+  var parsed = results && typeof results === "object"
+    ? results : { artists: [], albums: [], songs: [] }
+  var groups = searchGroups({}, 128)
+  var wanted = normalizedSearchType(type)
+  var nextOffset = Math.max(0, Math.floor(Number(offset) || 0))
+    + Math.max(1, Math.floor(Number(windowSize) || 1))
+  if (wanted === "artist") {
+    var artists = []
+    for (var i = 0; i < parsed.artists.length; i++) {
+      var artist = subsonicArtistRow(parsed.artists[i], art)
+      if (artist) artists.push(artist)
+    }
+    groups.artist = subsonicSearchPage(artists, nextOffset, windowSize)
+  } else if (wanted === "album") {
+    var albums = []
+    for (var j = 0; j < parsed.albums.length; j++) {
+      var album = subsonicAlbumRow(parsed.albums[j], art)
+      if (album) albums.push(album)
+    }
+    groups.album = subsonicSearchPage(albums, nextOffset, windowSize)
+  } else {
+    var songs = []
+    for (var k = 0; k < parsed.songs.length; k++) {
+      var song = subsonicSongRow(parsed.songs[k], art)
+      if (song) songs.push(song)
+    }
+    groups.track = subsonicSearchPage(songs, nextOffset, windowSize)
+  }
+  return groups
+}
+
+// The per-type search3 window: which count/offset pair advances, and the
+// bounded page size. Unknown types fall back to songs.
+function search3WindowType(type) {
+  var value = String(type || "track")
+  if (value === "artist") return "artist"
+  if (value === "album") return "album"
+  return "song"
+}
+
+function search3WindowParams(type, offset) {
+  var category = search3WindowType(type)
+  var count = 20
+  var params = {}
+  params[category + "Count"] = count
+  var skip = Math.max(0, Math.floor(Number(offset) || 0))
+  if (skip > 0) params[category + "Offset"] = skip
+  return params
+}
+
+
 // panel's own content with no compositor blur of their own. Glass themes set
 // the popup colour to a low alpha meant for separate blurred windows, which
 // leaves these unreadable. Keep the hue, floor the alpha.
@@ -735,32 +1076,9 @@ function barSlotWidth(fixed, cap, fitted, minimum) {
 }
 
 // The desktop app keeps the last play loaded in its footer, so Play always has
-// somewhere to go. Spotify's play endpoint only resumes while the receiver
-// still holds a context, which spotifyd loses once it idles out or restarts.
-// Pick the most recent play, with the playlist or album it came from, so an
-// idle receiver can continue there instead of leaving Play dead.
-function resumeCandidateFromRecentlyPlayed(payload, imageWidth) {
-  var source = payload || {}
-  var values = Array.isArray(source.items) ? source.items : []
-  for (var i = 0; i < values.length; i++) {
-    var entry = values[i]
-    if (!entry || typeof entry !== "object") continue
-    var item = normalizeTrack(entry, imageWidth || 192)
-    if (!item || !item.uri) continue
-    var context = entry.context && typeof entry.context === "object"
-      ? entry.context : null
-    var contextUri = context && context.uri ? String(context.uri) : ""
-    return {
-      item: item,
-      // The play endpoint accepts album and playlist contexts. Artist and
-      // collection contexts fall back to the single track.
-      contextUri: /^spotify:(album|playlist):/.test(contextUri) ? contextUri : "",
-      playedAt: String(entry.played_at || "")
-    }
-  }
-  return null
-}
-
+// somewhere to go. With Navidrome there is no recently-played endpoint to
+// consult; Service offers the most recent album window instead, so an idle
+// engine can continue there instead of leaving Play dead.
 function resumePlaybackAvailable(hasMedia, candidate) {
   return hasMedia !== true && !!candidate && !!candidate.item
     && !!candidate.item.uri
@@ -1151,11 +1469,30 @@ function sessionWithoutLyricsInstall(session) {
 
 var SESSION_STATE_LIMIT = 16000
 
+// getCoverArt URLs carry token-auth credentials (u/t/s). Rows hold them only
+// in memory; anything that reaches persisted session state is scrubbed of
+// imageUrl first so no credential-bearing URL is ever written to disk.
+function stripImageUrls(value, depth) {
+  var level = Math.floor(Number(depth) || 0)
+  if (level > 8) return null
+  if (value === null || value === undefined) return null
+  if (typeof value !== "object") return value
+  var out = Array.isArray(value) ? [] : ({})
+  for (var key in value) {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) continue
+    if (key === "imageUrl") continue
+    var child = stripImageUrls(value[key], level + 1)
+    if (child !== null) out[key] = child
+  }
+  return out
+}
+
 function normalizedSessionState(value) {
   var session = value
   if (typeof session === "string") session = parseJson(session, ({}))
   if (!session || typeof session !== "object" || Array.isArray(session)) session = ({})
-  return JSON.stringify(session).length <= SESSION_STATE_LIMIT ? session : ({})
+  var scrubbed = stripImageUrls(session, 0)
+  return JSON.stringify(scrubbed).length <= SESSION_STATE_LIMIT ? scrubbed : ({})
 }
 
 function sessionRecord(sessionState, searchHistory) {
@@ -1482,11 +1819,12 @@ function searchScope(tab, detailItem, selectedPlaylist, homeType, libraryType) {
   } else if (area === "home") {
     var homeLabels = {
       recent: "Recently played",
-      tracks: "Top songs",
-      artists: "Top artists"
+      frequent: "Frequently played",
+      newest: "Newest albums",
+      starred: "Starred"
     }
     var selectedHome = String(homeType || "recent")
-    label = homeLabels[selectedHome] || "For you"
+    label = homeLabels[selectedHome] || "Home"
     key = "home:" + selectedHome
   } else if (area === "discover") {
     label = "Discover"
@@ -1519,19 +1857,6 @@ function searchScope(tab, detailItem, selectedPlaylist, homeType, libraryType) {
 
 function sanitizeSearchTerm(value) {
   return String(value || "").replace(/["\\]/g, " ").replace(/\s+/g, " ").trim()
-}
-
-function catalogSearchText(artistName, term) {
-  var artist = sanitizeSearchTerm(artistName)
-  var query = sanitizeSearchTerm(term)
-  var filter = artist ? "artist:\"" + artist + "\"" : ""
-  return query && filter ? query + " " + filter : (query || filter)
-}
-
-function artistPlaylistSearchText(artistName, term) {
-  var artist = sanitizeSearchTerm(artistName)
-  var query = sanitizeSearchTerm(term)
-  return query && artist ? query + " " + artist : (query || artist)
 }
 
 function mediaRowShouldCompact(titleWidth, availableWidth, actionCount) {
@@ -1587,31 +1912,6 @@ function sectionedMediaRows(sections, columnCount) {
   return rows
 }
 
-function tracksForArtist(items, artist) {
-  var rows = arrayValues(items)
-  var target = artist || {}
-  var targetId = String(target.id || "")
-  var targetName = String(target.name || "").toLowerCase()
-  var result = []
-  for (var i = 0; i < rows.length; i++) {
-    var track = rows[i]
-    if (!track || track.type !== "track") continue
-    var performers = arrayValues(track.artists)
-    var matched = false
-    for (var a = 0; a < performers.length; a++) {
-      var performer = performers[a] || {}
-      if ((targetId && String(performer.id || "") === targetId)
-          || (!targetId && targetName
-            && String(performer.name || "").toLowerCase() === targetName)) {
-        matched = true
-        break
-      }
-    }
-    if (matched) result.push(track)
-  }
-  return result
-}
-
 function comparablePlaylistTitle(value) {
   return String(value || "").toLowerCase()
     .replace(/[’‘`]/g, "'")
@@ -1619,122 +1919,15 @@ function comparablePlaylistTitle(value) {
     .replace(/\s+/g, " ").trim()
 }
 
-function findThisIsPlaylist(items, artistName) {
-  var expected = comparablePlaylistTitle("This Is " + String(artistName || ""))
-  if (!expected || !String(artistName || "").trim()) return null
-  var rows = Array.isArray(items) ? items : []
-  var best = null
-  var bestScore = -1
-  for (var i = 0; i < rows.length; i++) {
-    var item = rows[i]
-    if (!item || item.type !== "playlist" || !item.id
-        || comparablePlaylistTitle(item.name) !== expected) continue
-    var ownerId = String(item.ownerId || "").toLowerCase()
-    var ownerName = String(item.ownerName || "").toLowerCase()
-    var score = ownerId === "spotify" || ownerName === "spotify" ? 2 : 0
-    if (item.imageUrl) score++
-    if (score > bestScore) {
-      best = item
-      bestScore = score
-    }
-  }
-  return best
-}
-
-function trackRadioPlaylists(items, trackName) {
-  var expected = comparablePlaylistTitle(String(trackName || "") + " Radio")
-  if (!expected || !String(trackName || "").trim()) return []
-  var rows = Array.isArray(items) ? items : []
-  var result = []
-  var seen = ({})
-  for (var i = 0; i < rows.length; i++) {
-    var item = rows[i]
-    if (!item || item.type !== "playlist" || !item.id || !item.uri
-        || comparablePlaylistTitle(item.name) !== expected) continue
-    var ownerId = String(item.ownerId || "").toLowerCase()
-    var ownerName = String(item.ownerName || "").toLowerCase()
-    var key = String(item.uri || item.id)
-    if ((ownerId !== "spotify" && ownerName !== "spotify") || seen[key]) continue
-    seen[key] = true
-    result.push(item)
-  }
-  return result
-}
-
-function radioSeedMatches(candidate, seed) {
-  var item = candidate || {}
-  var target = seed || {}
-  var itemId = String(item.id || "")
-  var targetId = String(target.id || "")
-  var itemUri = String(item.uri || "")
-  var targetUri = String(target.uri || "")
-  if ((itemId && targetId && itemId === targetId)
-      || (itemUri && targetUri && itemUri === targetUri)) return true
-  if (comparablePlaylistTitle(item.name) !== comparablePlaylistTitle(target.name))
-    return false
-
-  var itemArtists = arrayValues(item.artists)
-  var targetArtists = arrayValues(target.artists)
-  for (var i = 0; i < itemArtists.length; i++) {
-    var itemArtist = itemArtists[i] || {}
-    var itemArtistId = String(itemArtist.id || "")
-    var itemArtistName = comparablePlaylistTitle(itemArtist.name)
-    for (var j = 0; j < targetArtists.length; j++) {
-      var targetArtist = targetArtists[j] || {}
-      var targetArtistId = String(targetArtist.id || "")
-      var targetArtistName = comparablePlaylistTitle(targetArtist.name)
-      if ((itemArtistId && targetArtistId && itemArtistId === targetArtistId)
-          || (itemArtistName && targetArtistName && itemArtistName === targetArtistName))
-        return true
-    }
-  }
-  return false
-}
-
-function discoveryPlaylistRank(item) {
-  if (!item || item.type !== "playlist" || !item.id) return -1
-  var ownerId = String(item.ownerId || "").toLowerCase()
-  var ownerName = String(item.ownerName || "").toLowerCase()
-  if (ownerId !== "spotify" && ownerName !== "spotify") return -1
-  var title = comparablePlaylistTitle(item.name)
-  if (title === "discover weekly") return 0
-  if (title === "release radar") return 1
-  if (title === "daylist") return 2
-  if (title === "daily mix") return 9
-  var daily = title.match(/^daily mix ([0-9]+)$/)
-  if (daily) return 10 + Math.max(0, Number(daily[1]) || 0)
-  if (title === "new music friday") return 30
-  if (title.indexOf("new music friday ") === 0) return 31
-  if (title === "fresh finds") return 40
-  if (title.indexOf("fresh finds ") === 0) return 41
-  return -1
-}
-
-function discoveryPlaylists(items, maximum) {
-  var rows = Array.isArray(items) ? items : []
-  var ranked = []
-  var seen = ({})
-  for (var i = 0; i < rows.length; i++) {
-    var item = rows[i]
-    var rank = discoveryPlaylistRank(item)
-    var key = String((item && (item.uri || item.id)) || "")
-    if (rank < 0 || !key || seen[key]) continue
-    seen[key] = true
-    ranked.push({ item: item, rank: rank, index: i })
-  }
-  ranked.sort(function(left, right) {
-    if (left.rank !== right.rank) return left.rank - right.rank
-    var leftName = String(left.item.name || "").toLowerCase()
-    var rightName = String(right.item.name || "").toLowerCase()
-    if (leftName < rightName) return -1
-    if (leftName > rightName) return 1
-    return left.index - right.index
-  })
-  var limit = Math.max(1, Number(maximum) || 24)
-  var result = []
-  for (var j = 0; j < ranked.length && result.length < limit; j++)
-    result.push(ranked[j].item)
-  return result
+// Playlist search has no server verb in Subsonic (search3 covers artists,
+// albums, and songs), so the controller filters the loaded playlist list by
+// name. Matching ignores punctuation and case, the way the old Spotify
+// title comparisons did.
+function playlistMatchesTerm(playlist, term) {
+  var expected = comparablePlaylistTitle(term)
+  if (!expected) return true
+  return comparablePlaylistTitle(playlist && playlist.name) === expected
+    || comparablePlaylistTitle(playlist && playlist.name).indexOf(expected) >= 0
 }
 
 function albumKind(item) {
@@ -1745,15 +1938,14 @@ function albumKind(item) {
   return type === "album" ? "Album" : "Release"
 }
 
-function playlistItemUris(items) {
+function playlistItemIds(items) {
   var rows = Array.isArray(items) ? items : []
-  var uris = []
+  var ids = []
   for (var i = 0; i < rows.length; i++) {
     var item = rows[i] || {}
-    if (item.uri && ["track", "episode"].indexOf(String(item.type || "")) >= 0)
-      uris.push(String(item.uri))
+    if (item.id && String(item.type || "") === "track") ids.push(String(item.id))
   }
-  return uris
+  return ids
 }
 
 // Playlist objects are replaced when their snapshots refresh. Resolve the
@@ -2207,9 +2399,12 @@ function touchHistory(values, term, maximum) {
 
 var PLAYBACK_URI_LIMIT = 100
 
+// Subsonic playback is a complete song list in visible order: the engine's
+// queue is built from the rows the user sees, so a filter or a non-default
+// sort must always play that displayed order. Context headers (album,
+// playlist, artist) carry the full list behind them instead of a server
+// context, so they never force the "original" order.
 function playbackUsesVisibleOrder(contextUri, filterText, sortKey) {
-  var context = String(contextUri || "")
-  if (!/^spotify:(album|playlist):/.test(context)) return false
   return String(filterText || "").trim() !== ""
     || String(sortKey || "default") !== "default"
 }
@@ -2222,12 +2417,14 @@ function playbackContextForView(contextUri, filterText, sortKey) {
 function visibleOrderPlaybackMessage(itemCount) {
   var count = Math.max(0, Math.floor(Number(itemCount) || 0))
   return count > PLAYBACK_URI_LIMIT
-    ? "Playing the displayed order for 100 items; Spotify limits custom playback to 100"
+    ? "Playing the displayed order for " + PLAYBACK_URI_LIMIT + " items"
     : "Playing the displayed order"
 }
 
+// Context offset for the v2 load builder. Subsonic rows play the visible
+// list in order, so the only position that matters is where the clicked row
+// sits in that list (matched by row identity first, then by uri key).
 function playbackContextOffsetPosition(item, sourceItems, contextUri) {
-  var context = String(contextUri || "")
   var values = Array.isArray(sourceItems) ? sourceItems : []
   var itemUri = String((item && item.uri) || "")
   var visibleIndex = -1
@@ -2237,113 +2434,7 @@ function playbackContextOffsetPosition(item, sourceItems, contextUri) {
       break
     }
   }
-
-  if (/^spotify:playlist:/.test(context)) {
-    var rawPosition = item ? item.playlistPosition : undefined
-    var playlistPosition = Number(rawPosition)
-    if (rawPosition !== null && rawPosition !== undefined
-        && isFinite(playlistPosition) && playlistPosition >= 0)
-      return Math.floor(playlistPosition)
-    return visibleIndex
-  }
-
-  if (!/^spotify:album:/.test(context)) return -1
-  var trackNumber = Math.floor(Number((item && item.trackNumber) || 0))
-  var discNumber = Math.max(1,
-    Math.floor(Number((item && item.discNumber) || 1)))
-  if (trackNumber <= 0) return visibleIndex
-  if (discNumber === 1) return trackNumber - 1
-
-  // Album track numbers restart on each disc. Derive the absolute context
-  // offset from the greatest track number seen on every preceding disc.
-  var tracksPerDisc = ({})
-  for (var row = 0; row < values.length; row++) {
-    var candidate = values[row] || {}
-    var candidateDisc = Math.max(1,
-      Math.floor(Number(candidate.discNumber) || 1))
-    var candidateTrack = Math.floor(Number(candidate.trackNumber) || 0)
-    if (candidateTrack > 0)
-      tracksPerDisc[candidateDisc] = Math.max(
-        Number(tracksPerDisc[candidateDisc]) || 0, candidateTrack)
-  }
-  var position = trackNumber - 1
-  for (var disc = 1; disc < discNumber; disc++) {
-    if (!tracksPerDisc[disc]) return -1
-    position += tracksPerDisc[disc]
-  }
-  return position
-}
-
-function playbackBody(item, sourceItems, contextUri) {
-  if (!item || !item.uri) return null
-  // Spotify's playback endpoint accepts only album, artist, and playlist
-  // contexts. Podcast episodes and audiobook chapters are sent as items.
-  if (["album", "artist", "playlist"].indexOf(item.type) >= 0)
-    return { context_uri: String(item.uri) }
-  if (item.kind === "context") return null
-
-  var itemUri = String(item.uri)
-  var sourceContext = String(contextUri || "")
-  if (/^spotify:(album|playlist):/.test(sourceContext)) {
-    // Some librespot-based receivers accept the context but ignore a URI
-    // offset and restart its first track. Prefer Spotify's numeric offset.
-    var contextPosition = playbackContextOffsetPosition(item, sourceItems,
-      sourceContext)
-    return contextPosition >= 0
-      ? { context_uri: sourceContext, offset: { position: contextPosition } }
-      : { context_uri: sourceContext, offset: { uri: itemUri } }
-  }
-
-  // A lone URI creates a one-track Spotify playback context. That makes Next
-  // reach the end immediately, so carry the visible list into playback. Start
-  // at the clicked row and wrap once; Spotify accepts at most 100 URIs.
-  var values = Array.isArray(sourceItems) ? sourceItems : []
-  var start = -1
-  // Prefer the exact row object so a playlist containing the same track more
-  // than once starts from the occurrence the user actually selected.
-  for (var i = 0; i < values.length; i++) {
-    if (values[i] === item) {
-      start = i
-      break
-    }
-  }
-  if (start < 0 && item.playlistPosition !== undefined) {
-    var wantedPosition = Number(item.playlistPosition)
-    for (var positionIndex = 0; positionIndex < values.length; positionIndex++) {
-      var positioned = values[positionIndex]
-      if (positioned && Number(positioned.playlistPosition) === wantedPosition
-          && String(positioned.uri || "") === itemUri) {
-        start = positionIndex
-        break
-      }
-    }
-  }
-  if (start < 0) {
-    for (var uriIndex = 0; uriIndex < values.length; uriIndex++) {
-      if (values[uriIndex] && String(values[uriIndex].uri || "") === itemUri) {
-        start = uriIndex
-        break
-      }
-    }
-  }
-  if (start < 0) {
-    var single = { uris: [itemUri] }
-    if (Number(item.resumeMs) > 0) single.position_ms = Math.floor(Number(item.resumeMs))
-    return single
-  }
-
-  var uris = []
-  for (var step = 0; step < values.length
-      && uris.length < PLAYBACK_URI_LIMIT; step++) {
-    var candidate = values[(start + step) % values.length]
-    if (!candidate || candidate.kind !== "item") continue
-    var uri = String(candidate.uri || "")
-    if (!uri) continue
-    uris.push(uri)
-  }
-  var body = { uris: uris.length ? uris : [itemUri] }
-  if (Number(item.resumeMs) > 0) body.position_ms = Math.floor(Number(item.resumeMs))
-  return body
+  return visibleIndex
 }
 
 function millisecondsToClock(milliseconds) {
@@ -2351,23 +2442,6 @@ function millisecondsToClock(milliseconds) {
   var minutes = Math.floor(seconds / 60)
   var remainder = seconds % 60
   return minutes + ":" + (remainder < 10 ? "0" : "") + remainder
-}
-
-function uniqueRadioTracks(seed, extras) {
-  var item = seed || null
-  if (!item) return []
-  var radio = [item]
-  var seen = ({})
-  seen[String(item.uri || "")] = true
-  var values = Array.isArray(extras) ? extras : []
-  for (var i = 0; i < values.length; i++) {
-    var track = values[i]
-    var uri = String((track && track.uri) || "")
-    if (!uri || seen[uri]) continue
-    seen[uri] = true
-    radio.push(track)
-  }
-  return radio
 }
 
 function mergeUnique(existing, incoming) {

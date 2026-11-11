@@ -2,6 +2,7 @@ import QtQuick
 import QtTest
 
 import "../Api.js" as Api
+import "../Subsonic.js" as Subsonic
 
 TestCase {
   name: "SpotifyApiLogic"
@@ -157,14 +158,14 @@ TestCase {
     compare(Api.normalizeVolumePercent(120), 100)
   }
 
-  function test_catalogSearchText_scopesResultsToArtist() {
+  function test_searchTextBuilders_normalizeForPlainQueries() {
     compare(Api.sanitizeSearchTerm("AC/DC \"Live\""), "AC/DC Live")
-    compare(Api.catalogSearchText("Miles Davis", "blue in green"),
-      "blue in green artist:\"Miles Davis\"")
-    compare(Api.catalogSearchText("AC/DC \"Live\"", ""),
-      "artist:\"AC/DC Live\"")
-    compare(Api.artistPlaylistSearchText("Miles Davis", "blue in green"),
-      "blue in green Miles Davis")
+    compare(Api.playlistMatchesTerm({ name: "Abbey Road Live!" },
+      "abbey road"), true)
+    compare(Api.playlistMatchesTerm({ name: "Miles Davis Best" }, "miles davis"),
+      true)
+    compare(Api.playlistMatchesTerm({ name: "Other" }, "miles"), false)
+    compare(Api.playlistMatchesTerm({ name: "Anything" }, ""), true)
   }
 
   function test_volumeAndSeekHelpers_clampMuteAndRemember() {
@@ -209,7 +210,7 @@ TestCase {
 
   function test_searchTypeLoading_normalizesAndCachesEachCategory() {
     compare(Api.normalizedSearchType("album"), "album")
-    compare(Api.normalizedSearchType("episode"), "episode")
+    compare(Api.normalizedSearchType("episode"), "track")
     compare(Api.normalizedSearchType("unknown"), "track")
     compare(Api.normalizedSearchType(""), "track")
     verify(Api.searchNeedsLoad("miles", "", false))
@@ -249,7 +250,6 @@ TestCase {
         return name === "Retry-After" ? "10" : ""
       }
     }), "10")
-    verify(Api.localSocketFallbackMessage().indexOf("local player") >= 0)
   }
 
   function test_rateLimitRetryMs_data() {
@@ -554,8 +554,10 @@ TestCase {
     compare(playlist.label, "Night drive")
     compare(playlist.mode, "filter")
 
-    compare(Api.searchScope("home", null, null, "artists", "tracks").label,
-      "Top artists")
+    compare(Api.searchScope("home", null, null, "frequent", "albums").label,
+      "Frequently played")
+    compare(Api.searchScope("home", null, null, "starred", "albums").label,
+      "Starred")
     compare(Api.searchScope("library", null, null, "recent", "albums").label,
       "Saved albums")
     verify(!Api.searchScope("search", null, null, "recent", "tracks").available)
@@ -579,106 +581,6 @@ TestCase {
     compare(Api.previousContentTab("home", "library"), "")
     compare(Api.rememberContentTab("setup"), "")
     compare(Api.rememberContentTab("playlists"), "playlists")
-  }
-
-  function test_tracksForArtist_filtersBroadSearchByStableArtistId() {
-    var rows = Api.tracksForArtist([
-      { id: "solo", type: "track", artists: [{ id: "target", name: "Artist" }] },
-      { id: "feature", type: "track", artists: [
-        { id: "guest", name: "Guest" }, { id: "target", name: "Artist" }
-      ] },
-      { id: "tribute", type: "track", artists: [{ id: "other", name: "Artist" }] },
-      { id: "album", type: "album", artists: [{ id: "target", name: "Artist" }] }
-    ], { id: "target", name: "Artist" })
-
-    compare(rows.length, 2)
-    compare(rows[0].id, "solo")
-    compare(rows[1].id, "feature")
-  }
-
-  function test_findThisIsPlaylist_requiresExactTitleAndPrefersSpotify() {
-    var result = Api.findThisIsPlaylist([
-      { id: "lookalike", type: "playlist", name: "This Is Nearly Björk", ownerName: "Spotify" },
-      { id: "fan", type: "playlist", name: "THIS IS BJÖRK!", ownerName: "A listener" },
-      { id: "official", type: "playlist", name: "This Is Björk", ownerId: "spotify" }
-    ], "Björk")
-
-    verify(result !== null)
-    compare(result.id, "official")
-    compare(Api.findThisIsPlaylist([
-      { id: "wrong", type: "playlist", name: "Best of Björk", ownerName: "Spotify" }
-    ], "Björk"), null)
-  }
-
-  function test_trackRadioPlaylists_onlyKeepsExactSpotifyContexts() {
-    var result = Api.trackRadioPlaylists([
-      { id: "official", uri: "spotify:playlist:official", type: "playlist",
-        name: "Dreams - 2004 Remaster Radio", ownerId: "spotify" },
-      { id: "copy", uri: "spotify:playlist:copy", type: "playlist",
-        name: "Dreams - 2004 Remaster Radio", ownerName: "A listener" },
-      { id: "other", uri: "spotify:playlist:other", type: "playlist",
-        name: "Sunset Dreams - 2004 Remaster Radio", ownerName: "Spotify" }
-    ], "Dreams - 2004 Remaster")
-
-    compare(result.length, 1)
-    compare(result[0].id, "official")
-  }
-
-  function test_radioSeedMatches_acceptsRelinkedTrackFromSameArtist() {
-    verify(Api.radioSeedMatches({
-      id: "market-version", uri: "spotify:track:market-version",
-      name: "Love The Way You Lie",
-      artists: [{ id: "eminem", name: "Eminem" }, { id: "rihanna", name: "Rihanna" }]
-    }, {
-      id: "original", uri: "spotify:track:original",
-      name: "Love The Way You Lie",
-      artists: [{ id: "eminem", name: "Eminem" }]
-    }))
-    verify(!Api.radioSeedMatches({
-      id: "cover", name: "Love The Way You Lie",
-      artists: [{ id: "cover-band", name: "Cover Band" }]
-    }, {
-      id: "original", name: "Love The Way You Lie",
-      artists: [{ id: "eminem", name: "Eminem" }]
-    }))
-  }
-
-  function test_uniqueRadioTracks_keepsSeedFirstAndDropsDuplicateUris() {
-    var seed = { uri: "spotify:track:seed", name: "Seed" }
-    var radio = Api.uniqueRadioTracks(seed, [
-      { uri: "spotify:track:seed", name: "Duplicate seed" },
-      { uri: "spotify:track:two", name: "Two" },
-      { uri: "", name: "Missing" },
-      { uri: "spotify:track:two", name: "Two again" },
-      { uri: "spotify:track:three", name: "Three" }
-    ])
-    compare(radio.length, 3)
-    compare(radio[0], seed)
-    compare(radio[1].name, "Two")
-    compare(radio[2].name, "Three")
-  }
-
-  function test_discoveryPlaylists_keepsOfficialRelevantResultsInUsefulOrder() {
-    var rows = Api.discoveryPlaylists([
-      { id: "fan", type: "playlist", name: "Discover Weekly", ownerName: "A listener" },
-      { id: "fresh", uri: "spotify:playlist:fresh", type: "playlist",
-        name: "Fresh Finds Indie", ownerName: "Spotify" },
-      { id: "mix", uri: "spotify:playlist:mix", type: "playlist",
-        name: "Daily Mix 2", ownerId: "spotify" },
-      { id: "radar", uri: "spotify:playlist:radar", type: "playlist",
-        name: "Release Radar", ownerName: "Spotify" },
-      { id: "weekly", uri: "spotify:playlist:weekly", type: "playlist",
-        name: "Discover Weekly", ownerName: "Spotify" },
-      { id: "weekly", uri: "spotify:playlist:weekly", type: "playlist",
-        name: "Discover Weekly", ownerName: "Spotify" },
-      { id: "unrelated", type: "playlist", name: "Party Hits", ownerName: "Spotify" }
-    ])
-
-    compare(rows.length, 4)
-    compare(rows[0].id, "weekly")
-    compare(rows[1].id, "radar")
-    compare(rows[2].id, "mix")
-    compare(rows[3].id, "fresh")
   }
 
   function test_scopes_followLeastPrivilege() {
@@ -768,19 +670,14 @@ TestCase {
       tracks: { items: [{ id: "t", uri: "spotify:track:t", type: "track", name: "Track" }], total: 1 },
       artists: { items: [{ id: "a", uri: "spotify:artist:a", type: "artist", name: "Artist" }], total: 1 },
       albums: { items: [{ id: "b", uri: "spotify:album:b", type: "album", name: "Album" }], total: 1 },
-      playlists: { items: [{ id: "p", uri: "spotify:playlist:p", type: "playlist", name: "Playlist" }], total: 1 },
-      shows: { items: [{ id: "s", uri: "spotify:show:s", type: "show", name: "Show" }], total: 1 },
-      episodes: { items: [{ id: "e", uri: "spotify:episode:e", type: "episode", name: "Episode" }], total: 1 },
-      audiobooks: { items: [{ id: "book", uri: "spotify:audiobook:book", type: "audiobook", name: "Book" }], total: 1 }
+      playlists: { items: [{ id: "p", uri: "spotify:playlist:p", type: "playlist", name: "Playlist" }], total: 1 }
     })
 
     compare(groups.track.items[0].type, "track")
     compare(groups.artist.items[0].type, "artist")
     compare(groups.album.items[0].type, "album")
     compare(groups.playlist.items[0].type, "playlist")
-    compare(groups.show.items[0].type, "show")
-    compare(groups.episode.items[0].type, "episode")
-    compare(groups.audiobook.items[0].type, "audiobook")
+    compare(groups.show, undefined)
   }
 
   function test_normalizeContext_labelsAlbumsAndEps() {
@@ -800,17 +697,14 @@ TestCase {
     compare(ep.subtitle, "Artist · EP / Single · 2026")
   }
 
-  function test_playlistItemUris_keepsOrderAndDuplicates() {
-    var uris = Api.playlistItemUris([
-      { type: "track", uri: "spotify:track:one" },
-      { type: "track", uri: "spotify:track:one" },
-      { type: "album", uri: "spotify:album:nope" },
-      { type: "episode", uri: "spotify:episode:two" },
-      { type: "track", uri: "" }
+  function test_playlistItemIds_keepsOrderAndDuplicates() {
+    var ids = Api.playlistItemIds([
+      { type: "track", id: "one" },
+      { type: "track", id: "one" },
+      { type: "album", id: "nope" },
+      { type: "track", id: "" }
     ])
-    compare(JSON.stringify(uris), JSON.stringify([
-      "spotify:track:one", "spotify:track:one", "spotify:episode:two"
-    ]))
+    compare(JSON.stringify(ids), JSON.stringify(["one", "one"]))
   }
 
   function test_playlistBackingItems_matchesStableIdsOnly() {
@@ -984,99 +878,28 @@ TestCase {
       "https://attacker.example/items?offset=50"))
   }
 
-  function test_playbackBodies() {
-    compare(JSON.stringify(Api.playbackBody({
-      kind: "context", type: "playlist", uri: "spotify:playlist:abc"
-    })), JSON.stringify({ context_uri: "spotify:playlist:abc" }))
-    compare(JSON.stringify(Api.playbackBody({
-      kind: "item", type: "track", uri: "spotify:track:def"
-    })), JSON.stringify({ uris: ["spotify:track:def"] }))
-
-    var rows = [
-      { kind: "item", uri: "spotify:track:a" },
-      { kind: "item", uri: "spotify:track:b" },
-      { kind: "context", uri: "spotify:album:ignored" },
-      { kind: "item", uri: "spotify:track:c" }
-    ]
-    compare(JSON.stringify(Api.playbackBody(rows[1], rows, "")), JSON.stringify({
-      uris: ["spotify:track:b", "spotify:track:c", "spotify:track:a"]
-    }))
-    rows[1].playlistPosition = 7
-    compare(JSON.stringify(Api.playbackBody(rows[1], rows, "spotify:playlist:list")),
-      JSON.stringify({
-        context_uri: "spotify:playlist:list",
-        offset: { position: 7 }
-      }))
-
-    var epRows = [
-      { kind: "item", uri: "spotify:track:first", discNumber: 1, trackNumber: 1 },
-      { kind: "item", uri: "spotify:track:second", discNumber: 1, trackNumber: 2 },
-      { kind: "item", uri: "spotify:track:third", discNumber: 1, trackNumber: 3 }
-    ]
-    compare(JSON.stringify(Api.playbackBody(epRows[2], epRows,
-      "spotify:album:ep")), JSON.stringify({
-        context_uri: "spotify:album:ep",
-        offset: { position: 2 }
-      }))
-
-    var multiDiscRows = [
-      { kind: "item", uri: "spotify:track:d1t1", discNumber: 1, trackNumber: 1 },
-      { kind: "item", uri: "spotify:track:d1t2", discNumber: 1, trackNumber: 2 },
-      { kind: "item", uri: "spotify:track:d2t1", discNumber: 2, trackNumber: 1 }
-    ]
-    compare(JSON.stringify(Api.playbackBody(multiDiscRows[2], multiDiscRows,
-      "spotify:album:multi")), JSON.stringify({
-        context_uri: "spotify:album:multi",
-        offset: { position: 2 }
-      }))
-    compare(Api.playbackBody(null), null)
-    compare(Api.playbackBody({
-      kind: "context", type: "show", uri: "spotify:show:podcast"
-    }), null)
-    compare(JSON.stringify(Api.playbackBody({
-      kind: "item", type: "episode", uri: "spotify:episode:one", resumeMs: 9000
-    }, [], "spotify:show:podcast")), JSON.stringify({
-      uris: ["spotify:episode:one"], position_ms: 9000
-    }))
-  }
-
-  function test_playbackContext_followsTheDisplayedOrderOnlyWhenCustomized() {
-    var playlist = "spotify:playlist:list"
-    var album = "spotify:album:record"
-    compare(Api.playbackContextForView(playlist, "", "default"), playlist)
-    compare(Api.playbackContextForView(playlist, "miles", "default"), "")
-    compare(Api.playbackContextForView(playlist, "", "name"), "")
-    compare(Api.playbackContextForView(album, "", "date"), "")
-    compare(Api.playbackContextForView("spotify:show:podcast", "", "name"),
-      "spotify:show:podcast")
-    verify(Api.playbackUsesVisibleOrder(playlist, "miles", "default"))
-    verify(!Api.playbackUsesVisibleOrder(playlist, "", "default"))
-    compare(Api.visibleOrderPlaybackMessage(12), "Playing the displayed order")
-    verify(Api.visibleOrderPlaybackMessage(114).indexOf("100 items") >= 0)
-    compare(Api.PLAYBACK_URI_LIMIT, 100)
-  }
-
-  function test_visibleOrderPlayback_preservesOccurrencesAndCapsLongLists() {
+  function test_playbackLoadBodyV2_preservesOccurrencesAndCapsLongLists() {
+    // A playlist containing the same song twice must queue the occurrence
+    // the user clicked, matched by row identity.
     var duplicateRows = [
-      { kind: "item", uri: "spotify:track:duplicate", playlistPosition: 0 },
-      { kind: "item", uri: "spotify:track:middle", playlistPosition: 1 },
-      { kind: "item", uri: "spotify:track:duplicate", playlistPosition: 2 },
-      { kind: "item", uri: "spotify:track:last", playlistPosition: 3 }
+      { kind: "item", id: "duplicate", uri: "navidrome:track:duplicate" },
+      { kind: "item", id: "middle", uri: "navidrome:track:middle" },
+      { kind: "item", id: "duplicate", uri: "navidrome:track:duplicate" },
+      { kind: "item", id: "last", uri: "navidrome:track:last" }
     ]
-    compare(JSON.stringify(Api.playbackBody(duplicateRows[2], duplicateRows, "")),
-      JSON.stringify({ uris: ["spotify:track:duplicate", "spotify:track:last",
-        "spotify:track:duplicate", "spotify:track:middle"] }))
+    var body = Api.playbackLoadBodyV2(duplicateRows[2], duplicateRows, "")
+    compare(body.songs[0].id, "duplicate")
+    compare(body.songs[1].id, "last")
 
     var longRows = []
     for (var i = 0; i < 114; i++)
-      longRows.push({ kind: "item", uri: "spotify:track:" + i,
-        playlistPosition: i })
-    var body = Api.playbackBody(longRows[110], longRows, "")
-    compare(body.uris.length, Api.PLAYBACK_URI_LIMIT)
-    compare(body.uris[0], "spotify:track:110")
-    compare(body.uris[3], "spotify:track:113")
-    compare(body.uris[4], "spotify:track:0")
-    compare(body.uris[99], "spotify:track:95")
+      longRows.push({ kind: "item", id: String(i) })
+    var long = Api.playbackLoadBodyV2(longRows[110], longRows, "")
+    compare(long.songs.length, Api.PLAYBACK_URI_LIMIT)
+    compare(long.songs[0].id, "110")
+    compare(long.songs[3].id, "113")
+    compare(long.songs[4].id, "0")
+    compare(long.songs[99].id, "95")
   }
 
   function test_playbackPreservesActiveDeviceAndFallsBackToLocal() {
@@ -1948,63 +1771,200 @@ TestCase {
     compare(Api.barSlotWidth(false, "240", "180", "32"), 180)
   }
 
-  function test_resumeCandidateFromRecentlyPlayed_keepsPlaylistContext() {
-    var candidate = Api.resumeCandidateFromRecentlyPlayed({
-      items: [{
-        played_at: "2026-09-05T09:00:00Z",
-        context: { type: "playlist", uri: "spotify:playlist:abc" },
-        track: {
-          id: "t1", uri: "spotify:track:t1", name: "Blue in Green",
-          type: "track", artists: [{ name: "Miles Davis" }],
-          album: { name: "Kind of Blue", images: [] }
-        }
-      }]
-    }, 96)
-    compare(candidate.item.uri, "spotify:track:t1")
-    compare(candidate.item.name, "Blue in Green")
-    compare(candidate.item.subtitle, "Miles Davis")
-    compare(candidate.contextUri, "spotify:playlist:abc")
-    compare(candidate.playedAt, "2026-09-05T09:00:00Z")
-  }
-
-  function test_resumeCandidateFromRecentlyPlayed_dropsUnplayableContexts() {
-    var artist = Api.resumeCandidateFromRecentlyPlayed({
-      items: [{
-        context: { type: "artist", uri: "spotify:artist:x" },
-        track: { id: "t2", uri: "spotify:track:t2", name: "So What", type: "track" }
-      }]
-    }, 96)
-    compare(artist.item.uri, "spotify:track:t2")
-    compare(artist.contextUri, "")
-    var collection = Api.resumeCandidateFromRecentlyPlayed({
-      items: [{
-        context: { type: "collection", uri: "spotify:user:me:collection" },
-        track: { id: "t3", uri: "spotify:track:t3", name: "Freddie", type: "track" }
-      }]
-    }, 96)
-    compare(collection.contextUri, "")
-  }
-
-  function test_resumeCandidateFromRecentlyPlayed_skipsBrokenEntries() {
-    compare(Api.resumeCandidateFromRecentlyPlayed(null, 96), null)
-    compare(Api.resumeCandidateFromRecentlyPlayed({ items: [] }, 96), null)
-    var candidate = Api.resumeCandidateFromRecentlyPlayed({
-      items: [
-        null,
-        { track: { name: "No uri", type: "track" } },
-        { track: { id: "t4", uri: "spotify:track:t4", name: "Ok", type: "track" } }
-      ]
-    }, 96)
-    compare(candidate.item.uri, "spotify:track:t4")
-  }
-
   function test_resumePlaybackAvailable_needsIdleReceiverAndCandidate() {
-    var candidate = { item: { uri: "spotify:track:t1", name: "x" } }
+    var candidate = { item: { uri: "navidrome:album:rec", name: "x" } }
     compare(Api.resumePlaybackAvailable(false, candidate), true)
     compare(Api.resumePlaybackAvailable(true, candidate), false)
     compare(Api.resumePlaybackAvailable(false, null), false)
     compare(Api.resumePlaybackAvailable(false, { item: null }), false)
     compare(Api.resumePlaybackAvailable(false, { item: { uri: "" } }), false)
+  }
+
+  function test_playbackVisibleOrder_followsFiltersAndSorts() {
+    // Subsonic playback is always the displayed list; a filter or a
+    // non-default sort is exactly the display the user asked for.
+    verify(Api.playbackUsesVisibleOrder("", "miles", "default"))
+    verify(Api.playbackUsesVisibleOrder("", "", "name"))
+    verify(!Api.playbackUsesVisibleOrder("", "", "default"))
+    compare(Api.playbackContextForView("", "", "default"), "")
+    compare(Api.playbackContextForView("", "miles", "default"), "")
+    compare(Api.visibleOrderPlaybackMessage(12), "Playing the displayed order")
+    verify(Api.visibleOrderPlaybackMessage(114).indexOf("100 items") >= 0)
+    compare(Api.PLAYBACK_URI_LIMIT, 100)
+  }
+
+  // ---- canonical Subsonic rows -------------------------------------------------
+
+  function test_subsonicSongRow_carriesTheViewContract() {
+    var art = Api.subsonicArtContext("https://nav.example", "user",
+      "secret", "salt123")
+    var row = Api.subsonicSongRow(Subsonic.normalizeSong({
+      id: "tr-1", title: "Blue in Green", artist: "Miles Davis",
+      artistId: "ar-1", album: "Kind of Blue", albumId: "al-1",
+      duration: 337, track: 3, year: 1959, coverArt: "al-1", starred: true
+    }), art)
+    compare(row.kind, "item")
+    compare(row.type, "track")
+    compare(row.id, "tr-1")
+    compare(row.uri, "navidrome:track:tr-1")
+    compare(row.name, "Blue in Green")
+    compare(row.subtitle, "Miles Davis")
+    compare(row.album, "Kind of Blue")
+    compare(row.artists.length, 1)
+    compare(row.artists[0].kind, "context")
+    compare(row.artists[0].type, "artist")
+    compare(row.artists[0].id, "ar-1")
+    compare(row.albumItem.type, "album")
+    compare(row.albumItem.id, "al-1")
+    compare(row.durationMs, 337000)
+    compare(row.duration, 337)
+    compare(row.trackNumber, 3)
+    verify(row.starred)
+    // The artwork URL is a pinned-salt getCoverArt request, so it stays
+    // stable across rebuilds and carries no Spotify vocabulary.
+    verify(row.imageUrl.indexOf("https://nav.example/rest/getCoverArt") === 0)
+    verify(row.imageUrl.indexOf("salt123") > 0)
+    verify(Api.subsonicSongRow(null, art) === null)
+
+    var bare = Api.subsonicSongRow(Subsonic.normalizeSong({
+      id: "tr-2", title: "So What"
+    }), art, { kind: "context", type: "album", id: "al-9", name: "Parent" })
+    compare(bare.subtitle, "")
+    compare(bare.albumItem.id, "al-9")
+    verify(bare.imageUrl === "")
+  }
+
+  function test_subsonicCollectionRows_shapeContexts() {
+    var art = Api.subsonicArtContext("https://nav.example", "user",
+      "secret", "salt123")
+    var album = Api.subsonicAlbumRow(Subsonic.normalizeAlbum({
+      id: "al-1", name: "Kind of Blue", artist: "Miles Davis",
+      artistId: "ar-1", songCount: 5, duration: 1400, year: 1959,
+      coverArt: "al-1", starred: true
+    }), art)
+    compare(album.kind, "context")
+    compare(album.type, "album")
+    compare(album.uri, "navidrome:album:al-1")
+    compare(album.subtitle, "Miles Davis · 1959")
+    compare(album.total, 5)
+    compare(album.artists[0].id, "ar-1")
+    verify(album.starred)
+
+    var artist = Api.subsonicArtistRow(Subsonic.normalizeArtist({
+      id: "ar-1", name: "Miles Davis", albumCount: 12
+    }), art)
+    compare(artist.type, "artist")
+    compare(artist.total, 12)
+    verify(Api.subsonicArtistRow({ id: "x" }, art) === null)
+
+    var playlist = Api.subsonicPlaylistRow(Subsonic.normalizePlaylist({
+      id: "pl-1", name: "Night drive", owner: "tray", songCount: 9,
+      duration: 2000, public: true, comment: "notes"
+    }), art)
+    compare(playlist.type, "playlist")
+    compare(playlist.subtitle, "tray")
+    compare(playlist.ownerId, "tray")
+    compare(playlist.total, 9)
+    verify(playlist.public)
+    verify(!playlist.collaborative)
+
+    // A SongRef (backend get_saved_queue answer) maps back to a row.
+    var refRow = Api.subsonicSongRefRow({
+      id: "tr-7", title: "So What", artists: ["Miles Davis"],
+      album: "Kind of Blue", duration_ms: 54000
+    })
+    compare(refRow.type, "track")
+    compare(refRow.subtitle, "Miles Davis")
+    compare(refRow.durationMs, 54000)
+    verify(Api.subsonicSongRefRow({ title: "no id" }) === null)
+  }
+
+  function test_subsonicSearchGroups_fillOnlyTheAskedWindow() {
+    var art = Api.subsonicArtContext("https://nav.example", "user",
+      "secret", "salt123")
+    var songs = []
+    for (var i = 0; i < 20; i++)
+      songs.push(Subsonic.normalizeSong({ id: "tr-" + i, title: "Song " + i }))
+    var parsed = {
+      artists: [Subsonic.normalizeArtist({ id: "ar-1", name: "Miles Davis" })],
+      albums: [],
+      songs: songs
+    }
+    var trackGroups = Api.subsonicSearchGroups(parsed, "track", art, 20, 0)
+    compare(trackGroups.track.items.length, 20)
+    compare(trackGroups.track.next, "20")
+    compare(trackGroups.track.total, 20)
+    compare(trackGroups.artist.items.length, 0)
+    verify(trackGroups.show === undefined)
+
+    var shortWindow = Api.subsonicSearchGroups(
+      { artists: [], albums: [], songs: [] }, "track", art, 20, 0)
+    compare(shortWindow.track.next, "")
+    compare(shortWindow.track.items.length, 0)
+
+    compare(Api.search3WindowType("album"), "album")
+    compare(Api.search3WindowType("artist"), "artist")
+    compare(Api.search3WindowType("episode"), "song")
+    compare(Api.search3WindowParams("track", 0).songCount, 20)
+    compare(Api.search3WindowParams("album", 40).albumOffset, 40)
+  }
+
+  function test_savedKeyFor_namespacesByType() {
+    compare(Api.savedKeyFor({ id: "42", type: "track" }), "track:42")
+    compare(Api.savedKeyFor({ id: "42", type: "album" }), "album:42")
+    compare(Api.savedKeyFor({ id: "42" }), "track:42")
+    compare(Api.savedKeyFor({ type: "track" }), "")
+    compare(Api.savedKeyFor(null), "")
+  }
+
+  function test_starredRows_splitByKind() {
+    var art = Api.subsonicArtContext("https://nav.example", "user",
+      "secret", "salt123")
+    var rows = Api.subsonicStarredRows({
+      starred2: {
+        song: [{ id: "tr-1", title: "A", duration: 100 }],
+        album: [{ id: "al-1", name: "B" }],
+        artist: [{ id: "ar-1", name: "C" }]
+      }
+    }, art)
+    compare(rows.songs.length, 1)
+    compare(rows.songs[0].type, "track")
+    compare(rows.albums.length, 1)
+    compare(rows.albums[0].type, "album")
+    compare(rows.artists.length, 1)
+    compare(rows.artists[0].type, "artist")
+    verify(Api.subsonicStarredRows(null, art).songs.length === 0)
+  }
+
+  function test_subsonicAlbumListRows_parseTheWindow() {
+    var art = Api.subsonicArtContext("https://nav.example", "user",
+      "secret", "salt123")
+    var rows = Api.subsonicAlbumListRows({
+      albumList2: { album: [
+        { id: "al-1", name: "One", songCount: 2 },
+        { name: "no id" },
+        { id: "al-2", name: "Two", songCount: 3 }
+      ] }
+    }, art)
+    compare(rows.length, 2)
+    compare(rows[0].id, "al-1")
+    compare(rows[1].id, "al-2")
+    verify(Subsonic.albumList2Params("recent", 30, 0) !== null)
+    compare(Subsonic.albumList2Params("bogus", 30, 0), null)
+  }
+
+  function test_stripImageUrls_scrubsCredentialUrlsFromSessionState() {
+    var state = {
+      detailItem: { name: "Album", imageUrl: "https://nav/rest/getCoverArt?u=u&t=t" },
+      nested: [{ imageUrl: "x", keep: 1 }],
+      scrollPositions: { "home:recent": 42 }
+    }
+    var scrubbed = Api.normalizedSessionState(state)
+    verify(scrubbed.detailItem.imageUrl === undefined)
+    verify(scrubbed.detailItem.name === "Album")
+    verify(scrubbed.nested[0].imageUrl === undefined)
+    compare(scrubbed.nested[0].keep, 1)
+    compare(scrubbed.scrollPositions["home:recent"], 42)
   }
 
   function test_idleMediaText_prefersLiveThenLastPlayedThenLabel() {

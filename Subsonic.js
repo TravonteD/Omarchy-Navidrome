@@ -601,6 +601,18 @@ function parseGenres(data) {
     })
 }
 
+// getStarred2 returns the user's starred songs, albums, and artists in one
+// response; each group normalizes through the shared node shapes and an absent
+// group parses empty, never an error.
+function parseStarred2(data) {
+  var node = data && typeof data === "object" ? data.starred2 : null
+  return {
+    songs: listOf(node, "song", normalizeSong),
+    albums: listOf(node, "album", normalizeAlbum),
+    artists: listOf(node, "artist", normalizeArtist)
+  }
+}
+
 // ------ playlists --------------------------------------------------------------
 
 function parsePlaylists(data) {
