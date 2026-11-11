@@ -69,7 +69,7 @@ export app_secret_log
 cp "$source_root/tests/integration/AppSmoke.qml" "$test_root/app/shell.qml"
 if [[ -z ${WAYLAND_DISPLAY:-} ]]; then
   # Service/authentication tests still use real Quickshell without a compositor.
-  sed -i '/Plugin.Panel {/d; /Plugin.BarWidget {/d; /panel.primaryNavigationItems()/,+1d; /PANEL_PAGE_BOOT_BEGIN/,/PANEL_PAGE_BOOT_END/d; /PANEL_CONNECT_BOOT_BEGIN/,/PANEL_CONNECT_BOOT_END/d' "$test_root/app/shell.qml"
+  sed -i '/Plugin.Panel {/d; /Plugin.BarWidget {/d; /panel.primaryNavigationItems()/,+1d; /PANEL_PAGE_BOOT_BEGIN/,/PANEL_PAGE_BOOT_END/d; /PANEL_CONNECT_BOOT_BEGIN/,/PANEL_CONNECT_BOOT_END/d; /BAR_WIDGET_BOOT_BEGIN/,/BAR_WIDGET_BOOT_END/d' "$test_root/app/shell.qml"
   app_platform=offscreen
 else
   app_platform=wayland

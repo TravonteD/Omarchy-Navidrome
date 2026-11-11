@@ -58,6 +58,9 @@ BarWidget {
     accent: Commons.Color.accent
   }
   readonly property bool opened: popupOpen
+  // The mini-player popup is a layer-shell Window, not an Item child, so
+  // hosts (and the smoke harness) reach its content through this handle.
+  readonly property alias miniPopup: popup
   readonly property var miniShortcutRows: service && service.showLyrics
     ? allMiniShortcutRows
     : allMiniShortcutRows.filter(function(row) { return row.keys !== "Ctrl+Shift+L" })
@@ -233,11 +236,21 @@ BarWidget {
 
   function toggleConfiguredPlayerShortcut() {
     var target = shortcutPlayer()
-    if (target === "Full player") return toggleFullPlayerShortcut()
     if (target === "Mini player") return toggleMiniPlayerShortcut()
-    if (!bar || typeof bar.run !== "function") return "unavailable"
-    bar.run("omarchy launch spotify")
-    return "launched"
+    // "Omarchy Music app" was the Spotify-era launcher target. Post-port
+    // there is no external music app or `omarchy launch` id left behind
+    // (`omarchy launch spotify` installs Spotify), so the default target is
+    // this plugin's own full player.
+    return toggleFullPlayerShortcut()
+  }
+
+  function openSetupPanel() {
+    // The guided connection form lives in the full panel's login gateway.
+    // A credentials-less login() only re-reads the keyring and shows no UI,
+    // so the widget's Set-up affordance must hand over to the panel: the
+    // gateway opens the login page when unauthenticated and the Settings
+    // page when playback still needs setup.
+    openFullPanel({ tab: "setup" })
   }
 
   function openFullPanel(payload) {
@@ -378,9 +391,8 @@ BarWidget {
       close()
     }
     else if (action === "volume") toggleMute()
-    else if (action === "setup") {
-      if (service && !service.loginBusy) service.login()
-    } else if (action === "setup-cancel") {
+    else if (action === "setup") openSetupPanel()
+    else if (action === "setup-cancel") {
       if (service) service.cancelLogin()
     } else if (action === "open") openFullPanel()
   }
@@ -748,7 +760,7 @@ BarWidget {
       Column {
         width: parent.width
         spacing: Style.space(8)
-          && root.service && !root.service.accountConnected
+        visible: root.service && !root.service.accountConnected
 
         Text {
           width: parent.width
@@ -794,7 +806,7 @@ BarWidget {
             foreground: root.foreground
             hasCursor: root.miniCursorActive && root.miniCursor === "setup"
             enabled: root.service && !root.service.loginBusy
-            onClicked: if (root.service) root.service.login()
+            onClicked: root.openSetupPanel()
             onHovered: function(on) { if (on) root.setMiniCursor("setup") }
           }
 
@@ -1096,7 +1108,7 @@ BarWidget {
       Column {
         width: parent.width
         spacing: Style.space(3)
-          && (!root.service || root.service.accountConnected)
+        visible: (!root.service || root.service.accountConnected)
           && root.service && root.service.lengthSeconds > 0
 
         CursorSurface {
@@ -1161,7 +1173,7 @@ BarWidget {
       Row {
         anchors.horizontalCenter: parent.horizontalCenter
         spacing: Style.space(5)
-          && (!root.service || root.service.accountConnected)
+        visible: !root.service || root.service.accountConnected
 
         TransportButton {
           glyphText: "󰒟"
@@ -1241,7 +1253,7 @@ BarWidget {
         id: miniVolumeCursor
         width: parent.width
         height: miniVolumeRow.implicitHeight + Style.space(2)
-          && (!root.service || root.service.accountConnected)
+        visible: (!root.service || root.service.accountConnected)
           && root.service && root.service.hasPlayer
         hasCursor: root.miniCursorActive && root.miniCursor === "volume"
         foreground: root.foreground

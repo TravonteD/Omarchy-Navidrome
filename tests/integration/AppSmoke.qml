@@ -7,6 +7,62 @@ ShellRoot {
   Plugin.Panel { id: panel; service: navidromeService; width: 1280; height: 800 }
   Plugin.BarWidget { id: widget }
 
+  // A stand-in host bar with exactly the surface BarWidget drives. The
+  // harness cannot use the real bar host, so the widget scenario injects
+  // this one to exercise the click wiring: serviceFor hands over the real
+  // service, and summon/hide/run record what the widget asked the host to
+  // do instead of moving real windows.
+  QtObject {
+    id: fakeShell
+
+    property var bar: fakeBar
+
+    function serviceFor(id) {
+      return id === "quickshell.navidrome" ? navidromeService : null
+    }
+    function isPluginOpen(id) { return false }
+    function hide(id) { fakeBar.hideCalls.push(id) }
+    function summon(id, payload) {
+      fakeBar.summonCalls.push({ id: id, payload: payload })
+      return true
+    }
+    function toggle(id, payload) {
+      fakeBar.summonCalls.push({ id: id, payload: payload })
+      return true
+    }
+  }
+
+  QtObject {
+    id: fakeBar
+
+    property var shell: fakeShell
+    property bool vertical: false
+    property int barSize: 48
+    property string fontFamily: ""
+    property color foreground: "#000000"
+    property color barForeground: "#000000"
+    property color background: "#000000"
+    property color urgent: "#000000"
+    property bool foregroundAnimationEnabled: true
+    property string position: "top"
+    property var activePopout: null
+    property var clickTargets: null
+    property var runCalls: []
+    property var summonCalls: []
+    property var hideCalls: []
+
+    function run(command) { runCalls.push(command) }
+    function summonBarWidget(id) { return true }
+    function hideBarWidget(id) { return true }
+    function isBarWidgetOpen(id) { return false }
+    function requestPopout(key) {}
+    function releasePopout(key) {}
+    function notePopoutCard(card) {}
+    function popoutCardFor(key) { return null }
+    function barSizeFor(screenName) { return 48 }
+    function targetBelongsToWindow(target, window) { return true }
+  }
+
   // A raw XHR stand-in with exactly the surface SubsonicApi drives
   // (tst_subsonic_api.qml uses the same shape). The connect-form scenario
   // completes each request by hand, so the whole guided flow — probe
@@ -107,6 +163,14 @@ ShellRoot {
       for (var p = 0; p < pageTabs.length; p++) panel.currentTab = pageTabs[p]
       panel.currentTab = "home"
       // PANEL_PAGE_BOOT_END
+      // BAR_WIDGET_BOOT_BEGIN — the harness strips this block when no
+      // compositor exists: the bar-widget scenario below opens the real
+      // mini-player popup surface, which needs a windowing compositor. It
+      // runs first, in the signed-out state the dead-button bug was
+      // reported in, and hands over to the connect scenario afterwards.
+      barWidgetScenario.start()
+      return
+      // BAR_WIDGET_BOOT_END
       // PANEL_CONNECT_BOOT_BEGIN — the harness strips this block when no
       // compositor exists; the guided-connection scenario below needs the
       // real panel tree, so it takes over the pass signal from here.
@@ -116,6 +180,192 @@ ShellRoot {
       // PANEL_CONNECT_BOOT_END
       console.log("APP_SMOKE_PASS")
       Qt.quit()
+    }
+  }
+
+  // The bar-widget audit scenario: every interactive element on the widget
+  // surface is driven through its real handler while signed out, with the
+  // fake host bar recording what the widget asks for. This is the mechanical
+  // reproduction of "the button on the widget still doesn't work".
+  Timer {
+    id: barWidgetScenario
+    interval: 20
+    repeat: true
+    running: false
+    property int step: 0
+    property int attempts: 0
+
+    function fail(message) {
+      running = false
+      throw new Error(message)
+    }
+
+    // Buttons here are shell Ui controls whose only identifying state is
+    // their label; walk the widget tree (including hidden popup content and
+    // the popup's window contentItem) until the labeled one turns up.
+    function childItems(item) {
+      if (!item) return []
+      var list = (item.children || []).slice()
+      if (item.contentItem) list = list.concat(item.contentItem.children || [])
+      return list
+    }
+
+    function findLabeled(item, label) {
+      if (!item) return null
+      // Only controls are interesting: a Text label also carries `.text`
+      // but cannot be activated.
+      if (item.text === label && typeof item.clicked === "function")
+        return item
+      var kids = childItems(item)
+      for (var i = 0; kids && i < kids.length; i++) {
+        var found = findLabeled(kids[i], label)
+        if (found) return found
+      }
+      return null
+    }
+
+    // The popup is a layer-shell Window: its `contentItem` is a list of the
+    // content roots rather than one Item (a QVariantList — index it, it is
+    // not a JS Array).
+    function popupRoots() {
+      var mp = widget.miniPopup
+      if (!mp || !mp.contentItem) return []
+      var ci = mp.contentItem
+      if (ci.length === undefined) return [ci]
+      var list = []
+      for (var i = 0; i < ci.length; i++) list.push(ci[i])
+      return list
+    }
+
+    function findPopupLabeled(label) {
+      var roots = popupRoots()
+      for (var i = 0; i < roots.length; i++) {
+        var found = findLabeled(roots[i], label)
+        if (found) return found
+      }
+      return null
+    }
+
+    function lastPayload() {
+      var call = fakeBar.summonCalls[fakeBar.summonCalls.length - 1]
+      if (!call) return null
+      try { return JSON.parse(call.payload) } catch (e) { return null }
+    }
+
+    onTriggered: {
+      if (step === 0) {
+        // Same settled-state wait as the connect scenario, but asserted in
+        // the signed-out direction: no stored credentials yet.
+        if (navidromeService.sessionPending
+            || !navidromeService.daemon.requirementsChecked) {
+          if (++attempts > 200)
+            fail("The smoke plugin dir never initialized")
+          return
+        }
+        if (navidromeService.accountConnected)
+          fail("The widget scenario must run before any connection exists")
+        // Attach the stand-in bar: the widget resolves its service through
+        // it exactly like it does against the real host.
+        widget.bar = fakeBar
+        if (widget.service !== navidromeService)
+          fail("The widget did not resolve the service through the fake bar")
+        if (typeof widget.openSetupPanel !== "function")
+          fail("The signed-out setup handover is missing")
+        var actions = widget.miniKeyboardActions
+        if (actions.indexOf("setup") < 0 || actions.indexOf("open") < 0)
+          fail("The signed-out keyboard actions were "
+            + JSON.stringify(actions))
+        if (widget.popupOpen) fail("The mini-player started open")
+        step = 1
+        return
+      }
+
+      if (step === 1) {
+        // The main bar button, signed out: a left click must open the
+        // mini-player popup (its setup column is the login affordance).
+        widget.toggle()
+        step = 2
+        return
+      }
+
+      if (step === 2) {
+        if (!widget.popupOpen)
+          fail("The bar button's open path did not open the mini-player popup")
+        // The popup surface builds its content on first open; the signed-out
+        // state must show the setup column inside it. The popup is a
+        // layer-shell Window, so its content hangs off the contentItem.
+        var setup = findLabeled(widget, "Set up and continue")
+          || findPopupLabeled("Set up and continue")
+        if (!setup) {
+          if (++attempts > 100)
+            fail("The mini-player setup button is missing")
+          return
+        }
+        var open = findLabeled(widget, "Open") || findPopupLabeled("Open")
+        if (!open) fail("The mini-player Open button is missing")
+        if (!setup.visible) fail("The setup column was hidden while signed out")
+        if (!setup.enabled) fail("The setup button was disabled while signed out")
+        attempts = 0
+        step = 3
+        return
+      }
+
+      if (step === 3) {
+        // The reported dead button, signed out: click the widget's own
+        // Set-up affordance. It must hand over to the full panel's login
+        // gateway, not silently re-read an empty keyring.
+        var setup = findLabeled(widget, "Set up and continue")
+          || findPopupLabeled("Set up and continue")
+        if (!setup) fail("The setup button disappeared before the click")
+        setup.clicked()
+        step = 4
+        return
+      }
+
+      if (step === 4) {
+        if (widget.popupOpen)
+          fail("The setup handover left the mini-player open")
+        if (fakeBar.hideCalls.indexOf("quickshell.navidrome") < 0)
+          fail("The setup handover did not dismiss the popup first")
+        var payload = lastPayload()
+        if (!payload || payload.tab !== "setup")
+          fail("Clicking Set up did not summon the panel with the setup tab: "
+            + JSON.stringify(payload))
+        if (fakeBar.runCalls.length !== 0)
+          fail("The setup handover ran a shell command: "
+            + JSON.stringify(fakeBar.runCalls))
+        step = 5
+        return
+      }
+
+      if (step === 5) {
+        // The configured-player shortcut's default target ("Omarchy Music
+        // app") must open this plugin's own player, never an external
+        // launcher command.
+        var result = widget.toggleConfiguredPlayerShortcut()
+        if (result !== "opened")
+          fail("The configured-player shortcut returned " + result)
+        var payload = lastPayload()
+        if (!payload || payload.shortcutLatch !== true)
+          fail("The configured-player shortcut did not latch the panel: "
+            + JSON.stringify(payload))
+        step = 6
+        return
+      }
+
+      if (step === 6) {
+        if (widget.popupOpen)
+          fail("The configured-player shortcut left the mini-player open")
+        if (fakeBar.runCalls.length !== 0)
+          fail("The configured-player shortcut ran a shell command: "
+            + JSON.stringify(fakeBar.runCalls))
+        // Hand the signed-out state to the guided-connection scenario.
+        fakeBar.summonCalls = []
+        fakeBar.hideCalls = []
+        panel.currentTab = "login"
+        connectScenario.start()
+        running = false
+      }
     }
   }
 
