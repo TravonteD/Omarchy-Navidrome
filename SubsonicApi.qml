@@ -490,7 +490,10 @@ Item {
     function next(index) {
       if (serial !== root.probeSerial) return
       var step = steps[index]
-      probeRequest = request(step, {}, function(result) {
+      // getUser requires the explicit `username` query parameter on top of the
+      // auth identity; without it a real server answers error 10.
+      var stepParams = step === "getUser" ? {username: root.username} : {}
+      probeRequest = request(step, stepParams, function(result) {
         if (serial !== root.probeSerial) return
         if (!result || result.ok !== true) {
           finish(probeFailure(step, result))

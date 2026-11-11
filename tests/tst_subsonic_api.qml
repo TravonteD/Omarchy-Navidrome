@@ -264,6 +264,9 @@ TestCase {
     complete(requests[0], 200, '{"subsonic-response":{"status":"ok"}}')
     compare(requests.length, 2)
     verify(requests[1].url.indexOf("rest/getUser?") > 0)
+    // getUser carries the explicit username parameter; a real server answers
+    // error 10 without it.
+    verify(requests[1].url.indexOf("username=alice") > 0)
     complete(requests[1], 200,
       '{"subsonic-response":{"status":"ok","user":{"username":"alice",'
       + '"streamRole":true}}}')
