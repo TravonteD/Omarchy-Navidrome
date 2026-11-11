@@ -47,6 +47,15 @@ The process provides:
 - Symphonia decodes FLAC, MP3, OGG/Vorbis, M4A/AAC, and WAV locally. Symphonia
   has no Opus decoder, so Opus material relies on server-side transcoding
   (set `format` to `mp3`/`flac`/`wav`/`ogg` to force one).
+- Containers that need seeking to be probed (an MP4/M4A file with its `moov`
+  atom at the end is the common case) cannot be read from the bounded
+  download buffer alone. When the fast path's format probe fails with such an
+  unsupported-feature error, the engine retries the same stream URL once from
+  an HTTP-Range seekable source: a single 256 KiB read-ahead window, a fresh
+  Range GET on every out-of-window seek, and a typed failure when the server
+  does not support Range requests (or rejects them), surfaced as the usual
+  `stream_unavailable` error. The server-side transcode `format` workaround
+  keeps working unchanged.
 
 ## Engine structure
 

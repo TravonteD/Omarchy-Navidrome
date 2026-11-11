@@ -635,6 +635,11 @@ struct FrontTrack {
     /// The downloader died mid-stream; buffered audio still plays while a
     /// bounded retry rebuilds the stream.
     worker_failed: bool,
+    /// The single bounded HTTP-Range fallback was already decided for this
+    /// front (the fast path's format probe failed on a seek-needing
+    /// container). A fallback worker's own failure is terminal, so this
+    /// keeps the fallback to one attempt, never a loop.
+    range_fallback: bool,
     /// submission=false fired once per front when its audio starts. A seek
     /// rebuilds the front and may refresh the hint; that is harmless (it
     /// only updates the now-playing marker, never the play count).
@@ -663,6 +668,10 @@ struct PendingTrack {
     appended_ms: u64,
     eof: bool,
     index: usize,
+    /// This worker is the one bounded HTTP-Range fallback for the song it
+    /// plays (decode-only, no downloader). Its own decode failure is
+    /// terminal.
+    is_fallback: bool,
 }
 
 /// A scheduled bounded stream retry.
@@ -1177,6 +1186,7 @@ impl Pipeline {
             appended_ms: 0,
             eof: false,
             worker_failed: false,
+            range_fallback: false,
             now_playing_sent: false,
             index,
         });
@@ -1255,6 +1265,13 @@ impl Pipeline {
                 if is_front {
                     if let Some(front) = self.front.as_mut() {
                         front.worker_failed = true;
+                        if front.range_fallback {
+                            // The fast path was deliberately abandoned for
+                            // the HTTP-Range fallback; that decode-only
+                            // worker owns the recovery now. A fast retry
+                            // here would displace it, so none is scheduled.
+                            return;
+                        }
                     }
                     self.schedule_stream_retry();
                 } else if let Some(pending) = self.pending.as_mut() {
@@ -1287,14 +1304,157 @@ impl Pipeline {
                 }
             }
             DecodeOutcome::Failed(reason) => {
+                if self.try_range_fallback(seq, &reason) {
+                    // The single bounded HTTP-Range fallback is loading the
+                    // same stream URL from a seekable source; recovery is in
+                    // flight, so this failure is not terminal yet.
+                    return;
+                }
                 // A container the decoder cannot read will not fix itself; a
                 // server-side transcode format usually resolves it.
                 log::error!("stream decode failed: {reason}");
+                let message = if reason.contains("range requests") {
+                    // Only the range fallback path produces this text; say
+                    // what actually failed instead of a generic message.
+                    "the server does not support range requests and the stream could not be decoded; try setting a transcode format"
+                } else {
+                    "the stream could not be decoded"
+                };
                 let _ = self.events.send(PlaybackEvent::Error {
                     code: "stream_unavailable".into(),
-                    message: "the stream could not be decoded".into(),
+                    message: message.into(),
                 });
                 self.stop_playback(StopCause::Failed);
+            }
+        }
+    }
+
+    /// The one bounded fallback for a seek-needing container: the
+    /// bounded-buffer fast path downloaded successfully but symphonia's
+    /// format probe failed because the container needs seeking (an MP4 with
+    /// the `moov` atom at the end is the common case). The same stream URL
+    /// is decoded once more, from an HTTP-Range seekable source, as a
+    /// decode-only pending continuation at the same resume position. A
+    /// fallback worker's own failure is terminal, so this never loops.
+    ///
+    /// Returns true when a fallback was scheduled.
+    fn try_range_fallback(&mut self, seq: u64, reason: &str) -> bool {
+        if !stream::probe_failure_needs_range(reason) {
+            return false;
+        }
+
+        // A pending worker (preload or mid-stream continuation) that failed
+        // its probe before appending any audio is replaced in place.
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.worker.seq == seq)
+        {
+            let pending = self.pending.take().expect("pending checked above");
+            if !pending.is_fallback && pending.appended_ms == 0 {
+                let song = pending.song.clone();
+                let track = pending.track.clone();
+                let resume_ms = pending.worker_offset_ms;
+                let index = pending.index;
+                pending.worker.abort();
+                if self.spawn_range_fallback(&song, &track, resume_ms, index) {
+                    return true;
+                }
+            } else {
+                self.pending = Some(pending);
+            }
+            return false;
+        }
+
+        // The front failed its probe. The fallback becomes the pending
+        // continuation at the front's resume position; any already-playable
+        // buffered audio keeps draining and the boundary hands off, exactly
+        // like a mid-stream retry.
+        if self
+            .front
+            .as_ref()
+            .is_some_and(|front| front.worker.seq == seq)
+        {
+            // Never displace an existing continuation or preload: with a
+            // pending already in flight this stays terminal (bounded).
+            if self.pending.is_some() {
+                return false;
+            }
+            let (song, track, resume_ms, index) = {
+                let front = self.front.as_ref().expect("front checked above");
+                (
+                    front.song.clone(),
+                    front.track.clone(),
+                    front.worker_offset_ms + front.appended_ms,
+                    front.index,
+                )
+            };
+            {
+                let front = self.front.as_mut().expect("front checked above");
+                if front.range_fallback {
+                    return false;
+                }
+                front.range_fallback = true;
+                // The decode thread is done; mark the front drained so the
+                // boundary hands off to the fallback once the buffered audio
+                // is consumed. Its own PcmBuffer is empty (the probe fails
+                // before any PCM is pushed), so aborting loses nothing.
+                front.worker_failed = true;
+                front.worker.abort();
+            }
+            return self.spawn_range_fallback(&song, &track, resume_ms, index);
+        }
+        false
+    }
+
+    /// Spawn the decode-only HTTP-Range fallback worker for one song at
+    /// `resume_ms`, replacing the failed fast path as the pending
+    /// continuation. Returns false when the request could not be built.
+    fn spawn_range_fallback(
+        &mut self,
+        song: &SongRef,
+        track: &Track,
+        resume_ms: u64,
+        index: usize,
+    ) -> bool {
+        let Some(server) = self.server.as_ref() else {
+            return false;
+        };
+        let salt = self.salt.salt();
+        match stream::spawn_range_worker(
+            &self.agent,
+            &server.base_url,
+            &server.auth,
+            salt,
+            &song.id,
+            &self.format,
+            self.max_bit_rate,
+            resume_ms / 1000,
+            self.output.channels,
+            self.output.rate,
+            self.worker_tx.clone(),
+            self.next_worker_seq,
+        ) {
+            Ok(worker) => {
+                self.next_worker_seq += 1;
+                self.pending = Some(PendingTrack {
+                    worker,
+                    song: song.clone(),
+                    track: track.clone(),
+                    worker_offset_ms: resume_ms,
+                    appended_ms: 0,
+                    eof: false,
+                    index,
+                    is_fallback: true,
+                });
+                true
+            }
+            Err(message) => {
+                log::warn!(
+                    "range fallback for song {} could not start: {message}",
+                    song.id
+                );
+                false
             }
         }
     }
@@ -1326,8 +1486,18 @@ impl Pipeline {
     /// buffered audio (the player queue keeps its FIFO order, so no already
     /// buffered samples are lost or duplicated).
     fn spawn_retry_worker(&mut self) {
+        self.retry = None;
+        // The HTTP-Range fallback for this song is already loading the same
+        // resume position; displacing it with a fast retry would lose the
+        // recovery (and leak the decode-only worker).
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.is_fallback)
+        {
+            return;
+        }
         let Some(front) = self.front.as_ref() else {
-            self.retry = None;
             return;
         };
         let resume_at = front.worker_offset_ms + front.appended_ms;
@@ -1364,6 +1534,7 @@ impl Pipeline {
                     appended_ms: 0,
                     eof: false,
                     index,
+                    is_fallback: false,
                 });
             }
             Err(message) => {
@@ -1552,6 +1723,7 @@ impl Pipeline {
                     appended_ms: 0,
                     eof: false,
                     index: next_index,
+                    is_fallback: false,
                 });
             }
             Err(message) => {
@@ -1590,6 +1762,7 @@ impl Pipeline {
                     appended_ms: pending.appended_ms,
                     eof: pending.eof,
                     worker_failed: false,
+                    range_fallback: pending.is_fallback,
                     now_playing_sent: false,
                     index: pending.index,
                 });

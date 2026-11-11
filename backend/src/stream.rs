@@ -7,7 +7,7 @@
 //! log song ids and playback state, never a built URL.
 
 use std::collections::VecDeque;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -49,6 +49,13 @@ pub const MAX_STREAM_ATTEMPTS: u8 = 3;
 pub const RETRY_BACKOFF_MS: u64 = 250;
 /// Allowed `format` values, empty string means "source" (omit the param).
 pub const FORMATS: &[&str] = &["", "mp3", "flac", "wav", "ogg", "opus", "aac"];
+/// Read-ahead window of [`HttpRangeSource`]: one Range GET fetches at most
+/// this many bytes into memory. Sequential reads are served from the window;
+/// a `Seek` outside it issues a new Range GET from the target offset, so the
+/// memory a decode holds stays bounded no matter how far symphonia seeks
+/// through a container (a 256 KiB window comfortably covers the box-header
+/// hops an MP4 walk needs and keeps sequential decode cheap).
+pub const RANGE_WINDOW_BYTES: usize = 256 * 1024;
 
 // ---------------------------------------------------------------------------
 // Salts and token auth
@@ -704,6 +711,276 @@ fn read_body(mut reader: impl Read, buffer: &BoundedBuffer) -> DownloadOutcome {
 }
 
 // ---------------------------------------------------------------------------
+// HTTP-Range seekable media source (fallback for seek-needing containers)
+// ---------------------------------------------------------------------------
+
+/// Typed failure of a Range request. Never carries the URL, a token, a salt,
+/// or any credential material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeSourceError {
+    /// The server answered 4xx.
+    Rejected { status: u16 },
+    /// The server answered 5xx or the request failed at the transport level.
+    Failed,
+    /// The server ignored the `Range` header on a request for a non-zero
+    /// offset: honoring the answer would require downloading (and skipping
+    /// over) everything before the offset, so the source refuses.
+    RangeUnsupported,
+    /// HTTP 416 (or an empty body): the server has nothing at/after this
+    /// offset. For a reader this is end of stream, not a failure.
+    Eof,
+}
+
+/// A `MediaSource` that fetches bytes from `url` with HTTP Range requests.
+///
+/// Memory is bounded to a single read-ahead window (`RANGE_WINDOW_BYTES` by
+/// default): sequential reads are served from the window, and a `Seek`
+/// outside it invalidates the window so the next read issues a fresh Range
+/// GET from the target offset. This is the recovery path for containers that
+/// symphonia cannot probe from a non-seekable stream — an MP4 whose `moov`
+/// atom sits at the end of the file is the common case.
+///
+/// The struct deliberately does not implement `Debug`: it holds the
+/// credential-bearing stream URL, and no log line may ever render it.
+pub struct HttpRangeSource {
+    agent: ureq::Agent,
+    url: String,
+    window_bytes: usize,
+    /// Full length of the resource when the server declared one
+    /// (`Content-Range` total on a 206 answer, `Content-Length` otherwise).
+    total_len: Option<u64>,
+    /// True only when the server both accepted a Range request and sent a
+    /// known length; everything else reports unseekable.
+    seekable: bool,
+    position: u64,
+    window: Vec<u8>,
+    /// Start offset of `window`; `u64::MAX` when there is no valid window.
+    window_start: u64,
+}
+
+impl HttpRangeSource {
+    /// Open the source with one probe request (`Range: bytes=0-…`), which
+    /// also fills the first read-ahead window. Errors are typed and free of
+    /// the URL.
+    pub fn open(agent: &ureq::Agent, url: &str) -> Result<Self, RangeSourceError> {
+        Self::with_window(agent, url, RANGE_WINDOW_BYTES)
+    }
+
+    /// Test hook: a smaller window keeps the window-boundary and seek
+    /// behavior observable without large fixtures.
+    pub fn with_window(
+        agent: &ureq::Agent,
+        url: &str,
+        window_bytes: usize,
+    ) -> Result<Self, RangeSourceError> {
+        debug_assert!(window_bytes > 0);
+        let mut source = Self {
+            agent: agent.clone(),
+            url: url.to_string(),
+            window_bytes,
+            total_len: None,
+            seekable: false,
+            position: 0,
+            window: Vec::new(),
+            window_start: u64::MAX,
+        };
+        source.fetch(0)?;
+        Ok(source)
+    }
+
+    /// Issue one bounded Range GET for `start..start+window_bytes` and fill
+    /// the read-ahead window. The URL is used for the request only and never
+    /// appears in the error.
+    fn fetch(&mut self, start: u64) -> Result<(), RangeSourceError> {
+        let end = start
+            .saturating_add(self.window_bytes as u64)
+            .saturating_sub(1);
+        let response = match self
+            .agent
+            .get(&self.url)
+            .set("Range", &format!("bytes={start}-{end}"))
+            .call()
+        {
+            Ok(response) => response,
+            Err(ureq::Error::Status(status, _)) => {
+                if status == 416 {
+                    // Nothing is served at/after this offset: end of stream
+                    // for a reader, never a credential problem.
+                    return Err(RangeSourceError::Eof);
+                }
+                return Err(if (400..500).contains(&status) {
+                    RangeSourceError::Rejected { status }
+                } else {
+                    RangeSourceError::Failed
+                });
+            }
+            Err(_) => return Err(RangeSourceError::Failed),
+        };
+        let status = response.status();
+        if status == 416 {
+            // Nothing is served at/after this offset: end of stream for a
+            // reader, never a credential problem.
+            return Err(RangeSourceError::Eof);
+        }
+        if (400..500).contains(&status) {
+            return Err(RangeSourceError::Rejected { status });
+        }
+        if !(200..300).contains(&status) {
+            return Err(RangeSourceError::Failed);
+        }
+        let content_length = response
+            .header("Content-Length")
+            .and_then(|value| value.parse::<u64>().ok());
+        let range_accepted = status == 206;
+        let range_total = if range_accepted {
+            response
+                .header("Content-Range")
+                .and_then(parse_content_range_total)
+        } else {
+            None
+        };
+        // Seekable requires both an accepted Range probe and a known length;
+        // a `Content-Length` on a 206 answer describes the window, not the
+        // resource, so only the `Content-Range` total counts there.
+        self.seekable |= range_accepted && content_length.is_some() && range_total.is_some();
+        self.total_len = if range_accepted {
+            range_total
+        } else {
+            content_length
+        };
+        // At a non-zero offset a 200 answer means the server ignored the
+        // Range header; reaching the offset would need an unbounded download.
+        if !range_accepted && start > 0 {
+            return Err(RangeSourceError::RangeUnsupported);
+        }
+        let mut reader = response.into_reader();
+        let window = read_window(&mut reader, self.window_bytes).map_err(|_| {
+            // Transport-level failure mid-window; the URL stays out of it.
+            RangeSourceError::Failed
+        })?;
+        self.window = window;
+        self.window_start = start;
+        Ok(())
+    }
+
+    fn window_covers(&self, position: u64) -> bool {
+        position >= self.window_start && position < self.window_start + self.window.len() as u64
+    }
+}
+
+/// Parse the total from a `Content-Range: bytes a-b/total` header value.
+/// `*` (unknown total) parses to `None`.
+fn parse_content_range_total(value: &str) -> Option<u64> {
+    let total = value.rsplit('/').next()?;
+    if total.trim() == "*" {
+        return None;
+    }
+    total.trim().parse::<u64>().ok()
+}
+
+/// Read at most `window_bytes` bytes into one window buffer.
+fn read_window(reader: &mut impl Read, window_bytes: usize) -> std::io::Result<Vec<u8>> {
+    let mut window = Vec::with_capacity(window_bytes);
+    let mut chunk = [0u8; DOWNLOAD_CHUNK_BYTES];
+    while window.len() < window_bytes {
+        let want = (window_bytes - window.len()).min(chunk.len());
+        match reader.read(&mut chunk[..want]) {
+            Ok(0) => break,
+            Ok(n) => window.extend_from_slice(&chunk[..n]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(window)
+}
+
+impl Read for HttpRangeSource {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        if let Some(total) = self.total_len {
+            if self.position >= total {
+                return Ok(0);
+            }
+        }
+        if !self.window_covers(self.position) {
+            match self.fetch(self.position) {
+                Ok(()) => {}
+                Err(RangeSourceError::Eof) => return Ok(0),
+                Err(RangeSourceError::Rejected { status }) => {
+                    // Status only; never the URL or any credential material.
+                    return Err(std::io::Error::other(format!(
+                        "stream range request was rejected (status {status})"
+                    )));
+                }
+                Err(RangeSourceError::RangeUnsupported) => {
+                    return Err(std::io::Error::other(
+                        "the server does not support range requests for this stream",
+                    ));
+                }
+                Err(RangeSourceError::Failed) => {
+                    return Err(std::io::Error::other("the stream could not be fetched"));
+                }
+            }
+            // An accepted answer with an empty body is end of stream too;
+            // keep serving EOF instead of re-fetching the same offset.
+            if self.window.is_empty() {
+                return Ok(0);
+            }
+        }
+        let offset_in_window = (self.position - self.window_start) as usize;
+        let available = &self.window[offset_in_window..];
+        let count = available.len().min(out.len());
+        out[..count].copy_from_slice(&available[..count]);
+        self.position += u64::try_from(count).unwrap_or(u64::MAX);
+        Ok(count)
+    }
+}
+
+impl Seek for HttpRangeSource {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        let target: i128 = match position {
+            SeekFrom::Start(offset) => i128::from(offset),
+            SeekFrom::Current(delta) => i128::from(self.position) + i128::from(delta),
+            SeekFrom::End(delta) => {
+                let total = self.total_len.ok_or_else(|| {
+                    std::io::Error::other(
+                        "stream length is unknown; seeking from the end is unsupported",
+                    )
+                })?;
+                i128::from(total) + i128::from(delta)
+            }
+        };
+        if target < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "seek before the start of the stream",
+            ));
+        }
+        self.position = target as u64;
+        // Keep the window when the target is inside it (a backward hop within
+        // the read-ahead costs no request); otherwise the next read issues a
+        // fresh Range GET from the new offset.
+        if !self.window_covers(self.position) {
+            self.window_start = u64::MAX;
+            self.window.clear();
+        }
+        Ok(self.position)
+    }
+}
+
+impl MediaSource for HttpRangeSource {
+    fn is_seekable(&self) -> bool {
+        self.seekable
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        self.total_len
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Stream workers (download + decode threads)
 // ---------------------------------------------------------------------------
 
@@ -726,14 +1003,18 @@ pub enum WorkerEvent {
 /// does not stop the threads; call [`WorkerHandle::abort`] to release them.
 pub struct WorkerHandle {
     pub seq: u64,
-    pub buffer: Arc<BoundedBuffer>,
+    /// The bounded download buffer, absent for a decode-only worker (the
+    /// HTTP-Range fallback reads the stream directly and has no downloader).
+    pub buffer: Option<Arc<BoundedBuffer>>,
     pub pcm: Arc<PcmBuffer>,
 }
 
 impl WorkerHandle {
     /// Unblock and end both worker threads.
     pub fn abort(&self) {
-        self.buffer.abort();
+        if let Some(buffer) = &self.buffer {
+            buffer.abort();
+        }
         self.pcm.abort();
     }
 }
@@ -811,7 +1092,72 @@ pub fn spawn_worker(
     };
 
     let _ = decoder;
-    Ok(WorkerHandle { seq, buffer, pcm })
+    Ok(WorkerHandle {
+        seq,
+        buffer: Some(buffer),
+        pcm,
+    })
+}
+
+/// Spawn one track's decode-only worker reading from an HTTP-Range seekable
+/// source. This is the single bounded fallback when the bounded-buffer fast
+/// path fails its format probe because the container needs seeking (an MP4
+/// with the `moov` atom at the end is the common case). There is no
+/// downloader: the source fetches windows itself. The URL is built here with
+/// the given fresh salt and is never logged.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_range_worker(
+    agent: &ureq::Agent,
+    base_url: &str,
+    auth: &AuthPair,
+    salt: String,
+    song_id: &str,
+    format: &str,
+    max_bit_rate: u16,
+    offset_secs: u64,
+    device_channels: u16,
+    device_rate: u32,
+    events: std::sync::mpsc::Sender<WorkerEvent>,
+    seq: u64,
+) -> Result<WorkerHandle, String> {
+    let url = build_stream_url(
+        base_url,
+        auth,
+        &salt,
+        song_id,
+        format,
+        max_bit_rate,
+        offset_secs,
+    )?;
+
+    let pcm = Arc::new(PcmBuffer::new(pcm_capacity_frames(
+        device_rate,
+        device_channels,
+    )));
+    let decode_pcm = Arc::clone(&pcm);
+    let decode_events = events.clone();
+    let owned_song_id = song_id.to_string();
+    let agent = agent.clone();
+    let decoder = std::thread::Builder::new()
+        .name(format!("stream-range-decode-{seq}"))
+        .spawn(move || {
+            let outcome = decode_stream_from_url(
+                &agent,
+                &url,
+                &decode_pcm,
+                device_channels,
+                device_rate,
+                &owned_song_id,
+            );
+            let _ = decode_events.send(WorkerEvent::DecodeDone { seq, outcome });
+        })
+        .map_err(|error| format!("failed to spawn the range decode thread: {error}"))?;
+    let _ = decoder;
+    Ok(WorkerHandle {
+        seq,
+        buffer: None,
+        pcm,
+    })
 }
 
 /// Bounded decode queue capacity: about one second of device-shaped PCM.
@@ -871,8 +1217,9 @@ impl MediaSource for RawStreamSource {
     }
 }
 
-/// Pull raw bytes, decode them with symphonia, convert to the output
-/// device's channel layout and sample rate, and push bounded PCM chunks.
+/// Pull raw bytes from the bounded buffer, decode them with symphonia,
+/// convert to the output device's channel layout and sample rate, and push
+/// bounded PCM chunks.
 fn decode_stream(
     buffer: &Arc<BoundedBuffer>,
     pcm: &Arc<PcmBuffer>,
@@ -886,6 +1233,68 @@ fn decode_stream(
         offset: 0,
     };
     let mss = MediaSourceStream::new(Box::new(source), Default::default());
+    decode_media_source(mss, pcm, device_channels, device_rate, song_id)
+}
+
+/// Decode the same stream URL from an HTTP-Range seekable source. Used as
+/// the one bounded fallback when the bounded-buffer fast path cannot probe
+/// the format (a seek-needing container such as MP4 with `moov` at the end).
+/// Failure reasons are honest and never name the URL.
+fn decode_stream_from_url(
+    agent: &ureq::Agent,
+    url: &str,
+    pcm: &Arc<PcmBuffer>,
+    device_channels: u16,
+    device_rate: u32,
+    song_id: &str,
+) -> DecodeOutcome {
+    let source = match HttpRangeSource::open(agent, url) {
+        Ok(source) => source,
+        Err(RangeSourceError::Rejected { .. }) => {
+            return DecodeOutcome::Failed(
+                "the server rejected the range request for this stream".to_string(),
+            );
+        }
+        Err(RangeSourceError::RangeUnsupported) => {
+            return DecodeOutcome::Failed(
+                "the server does not support range requests, so this stream cannot be decoded in place"
+                    .to_string(),
+            );
+        }
+        Err(_) => {
+            return DecodeOutcome::Failed(
+                "the stream could not be fetched with range requests".to_string(),
+            );
+        }
+    };
+    let mss = MediaSourceStream::new(Box::new(source), Default::default());
+    decode_media_source(mss, pcm, device_channels, device_rate, song_id)
+}
+
+/// Whether a failed decode attempt should be retried once from the
+/// HTTP-Range seekable source. Deliberately textual: symphonia reports
+/// container/feature limits as `Error::Unsupported`, which formats as
+/// "unsupported feature: …" — exactly the `isomp4: missing moov atom`
+/// failure of an MP4 whose `moov` atom sits at the end of the file and
+/// cannot be reached in a non-seekable stream. Only probe failures qualify;
+/// a decoder-init or mid-stream failure (including genuinely unsupported
+/// codecs) does not fix itself by seeking. Matching the error text keeps
+/// this independent of symphonia's internal error variants, which are not a
+/// stability contract.
+pub fn probe_failure_needs_range(reason: &str) -> bool {
+    reason.starts_with("stream format probe failed: ") && reason.contains("unsupported")
+}
+
+/// Probe and decode an already-opened media source into the bounded PCM
+/// buffer. Shared by the bounded-buffer fast path and the HTTP-Range
+/// fallback.
+fn decode_media_source(
+    mss: MediaSourceStream,
+    pcm: &Arc<PcmBuffer>,
+    device_channels: u16,
+    device_rate: u32,
+    song_id: &str,
+) -> DecodeOutcome {
     let hint = Hint::new();
     let probed = match get_probe().format(
         &hint,
@@ -1075,6 +1484,7 @@ pub fn stream_retry_allowed(failures: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const TEST_SALT: &str = "abcdef12";
 
@@ -1456,5 +1866,432 @@ mod tests {
         assert_eq!(retry_backoff_ms(3), 750);
         assert!(!stream_retry_allowed(MAX_STREAM_ATTEMPTS));
         assert!(stream_retry_allowed(MAX_STREAM_ATTEMPTS - 1));
+    }
+
+    // -- HTTP-Range seekable source -----------------------------------------
+    //
+    // A tiny in-test HTTP server serving a canned byte blob: one connection
+    // per request, `Connection: close`, and one of four selectable behaviors.
+    // It lets the Range source be exercised end to end without a real
+    // Navidrome server.
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ServerMode {
+        /// Honors Range with 206 + Content-Range + Content-Length.
+        Ranges,
+        /// Ignores Range: always 200 + Content-Length with the full body.
+        NoRange,
+        /// Honors Range but sends neither Content-Length nor Content-Range
+        /// (close-delimited body): length unknown, unseekable.
+        NoLength,
+        /// Rejects every request with 403.
+        Reject4xx,
+    }
+
+    fn spawn_test_http_server(blob: Vec<u8>, mode: ServerMode) -> (String, Arc<AtomicUsize>) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let blob = Arc::new(blob);
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        // The accept loop lives until the test process ends; a blocked
+        // accept thread is harmless there.
+        let _ = std::thread::Builder::new()
+            .name("test-http".to_string())
+            .spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { continue };
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let blob = Arc::clone(&blob);
+                    let _ = std::thread::Builder::new()
+                        .name("test-http-conn".to_string())
+                        .spawn(move || serve_one(stream, &blob, mode));
+                }
+            });
+        (format!("http://127.0.0.1:{port}/rest/stream"), requests)
+    }
+
+    fn serve_one(mut stream: std::net::TcpStream, blob: &[u8], mode: ServerMode) {
+        use std::io::Write;
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            match stream.read(&mut byte) {
+                Ok(1) => {
+                    head.push(byte[0]);
+                    if head.ends_with(b"\r\n\r\n") || head.len() > 16 * 1024 {
+                        break;
+                    }
+                }
+                _ => return,
+            }
+        }
+        let head = String::from_utf8_lossy(&head);
+        let range = header_value(&head, "range");
+        let write =
+            |stream: &mut std::net::TcpStream, status: &str, headers: &[String], body: &[u8]| {
+                let mut head = format!("HTTP/1.1 {status}\r\n");
+                for header in headers {
+                    head.push_str(header);
+                    head.push_str("\r\n");
+                }
+                head.push_str("Connection: close\r\n\r\n");
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body);
+                let _ = stream.flush();
+            };
+        match mode {
+            ServerMode::Reject4xx => write(&mut stream, "403 Forbidden", &[], b""),
+            ServerMode::NoRange => write(
+                &mut stream,
+                "200 OK",
+                &[format!("Content-Length: {}", blob.len())],
+                blob,
+            ),
+            ServerMode::Ranges | ServerMode::NoLength => match range.and_then(parse_range) {
+                Some((start, end_hint)) => {
+                    let last = blob.len() as u64 - 1;
+                    if start > last {
+                        let headers = if mode == ServerMode::Ranges {
+                            vec![
+                                format!("Content-Range: bytes */{}", blob.len()),
+                                "Content-Length: 0".to_string(),
+                            ]
+                        } else {
+                            Vec::new()
+                        };
+                        write(&mut stream, "416 Range Not Satisfiable", &headers, b"");
+                    } else {
+                        let end = end_hint.map_or(last, |hint| hint.min(last));
+                        let slice = &blob[start as usize..=(end as usize)];
+                        // NoLength sends neither Content-Length nor
+                        // Content-Range: a close-delimited window with a
+                        // fully unknown length.
+                        let headers = if mode == ServerMode::Ranges {
+                            vec![
+                                format!("Content-Range: bytes {start}-{end}/{}", blob.len()),
+                                format!("Content-Length: {}", slice.len()),
+                            ]
+                        } else {
+                            Vec::new()
+                        };
+                        write(&mut stream, "206 Partial Content", &headers, slice);
+                    }
+                }
+                // No (or unparsable) Range header: the full body.
+                None if mode == ServerMode::Ranges => write(
+                    &mut stream,
+                    "200 OK",
+                    &[format!("Content-Length: {}", blob.len())],
+                    blob,
+                ),
+                None => write(&mut stream, "200 OK", &[], blob),
+            },
+        }
+    }
+
+    fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+        head.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+    }
+
+    /// Parse a single `bytes=a-b` / `bytes=a-` range specification.
+    fn parse_range(value: &str) -> Option<(u64, Option<u64>)> {
+        let spec = value.strip_prefix("bytes=")?.split(',').next()?.trim();
+        let (start, end) = spec.split_once('-')?;
+        let start = start.trim().parse::<u64>().ok()?;
+        let end = match end.trim() {
+            "" => None,
+            end => Some(end.trim().parse::<u64>().ok()?),
+        };
+        Some((start, end))
+    }
+
+    const WINDOW: usize = 1024;
+
+    fn test_blob(len: usize) -> Vec<u8> {
+        (0..len as u64).map(|index| (index % 251) as u8).collect()
+    }
+
+    fn counter(requests: &Arc<AtomicUsize>) -> usize {
+        requests.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn http_range_source_reads_sequentially_across_the_window() {
+        let blob = test_blob(5000);
+        let (url, requests) = spawn_test_http_server(blob.clone(), ServerMode::Ranges);
+        let mut source = HttpRangeSource::with_window(&stream_agent(), &url, WINDOW).unwrap();
+        // Content-Length + accepted Range probe → seekable with a length.
+        assert!(source.is_seekable());
+        assert_eq!(source.byte_len(), Some(5000));
+        // The open probe already fetched the first window.
+        assert_eq!(counter(&requests), 1);
+        let mut out = Vec::new();
+        source.read_to_end(&mut out).unwrap();
+        assert_eq!(out, blob);
+        // One windowed fetch per 1024 bytes: the probe plus four more.
+        assert_eq!(counter(&requests), 5);
+    }
+
+    #[test]
+    fn http_range_source_seeks_start_current_and_end() {
+        let blob = test_blob(5000);
+        let (url, requests) = spawn_test_http_server(blob.clone(), ServerMode::Ranges);
+        let mut source = HttpRangeSource::with_window(&stream_agent(), &url, WINDOW).unwrap();
+        // Drain exactly the first window so a new one is definitely needed.
+        let mut out = vec![0u8; WINDOW];
+        source.read_exact(&mut out).unwrap();
+        assert_eq!(out, &blob[..WINDOW]);
+        // Seek(Start) outside the window: one fresh Range GET.
+        assert_eq!(source.seek(SeekFrom::Start(3000)).unwrap(), 3000);
+        let mut out = vec![0u8; 100];
+        source.read_exact(&mut out).unwrap();
+        assert_eq!(out, &blob[3000..3100]);
+        // Seek(Current) backwards out of the window: another fetch.
+        source.seek(SeekFrom::Current(-150)).unwrap();
+        let mut out = vec![0u8; 10];
+        source.read_exact(&mut out).unwrap();
+        assert_eq!(out, &blob[2950..2960]);
+        // Seek(End) against the server-declared total.
+        assert_eq!(source.seek(SeekFrom::End(-100)).unwrap(), 4900);
+        let mut out = vec![0u8; 50];
+        source.read_exact(&mut out).unwrap();
+        assert_eq!(out, &blob[4900..4950]);
+        assert_eq!(counter(&requests), 4);
+    }
+
+    #[test]
+    fn http_range_source_reuses_the_window_after_a_within_window_seek() {
+        let blob = test_blob(5000);
+        let (url, requests) = spawn_test_http_server(blob.clone(), ServerMode::Ranges);
+        let mut source = HttpRangeSource::with_window(&stream_agent(), &url, WINDOW).unwrap();
+        let mut out = vec![0u8; 500];
+        source.read_exact(&mut out).unwrap();
+        assert_eq!(out, &blob[..500]);
+        // A backward seek inside the read-ahead window costs no request.
+        source.seek(SeekFrom::Start(10)).unwrap();
+        let mut out = vec![0u8; 5];
+        source.read_exact(&mut out).unwrap();
+        assert_eq!(out, &blob[10..15]);
+        assert_eq!(counter(&requests), 1);
+    }
+
+    #[test]
+    fn http_range_source_reports_eof_at_and_past_the_end() {
+        let blob = test_blob(5000);
+        let (url, requests) = spawn_test_http_server(blob, ServerMode::Ranges);
+        let mut source = HttpRangeSource::with_window(&stream_agent(), &url, WINDOW).unwrap();
+        assert_eq!(source.seek(SeekFrom::End(0)).unwrap(), 5000);
+        let mut buf = [0u8; 16];
+        assert_eq!(source.read(&mut buf).unwrap(), 0);
+        assert_eq!(counter(&requests), 1);
+        // Seeking past the end reads as EOF without another request.
+        source.seek(SeekFrom::Start(6000)).unwrap();
+        assert_eq!(source.read(&mut buf).unwrap(), 0);
+        assert_eq!(counter(&requests), 1);
+    }
+
+    #[test]
+    fn http_range_source_maps_416_to_end_of_stream_without_a_known_length() {
+        let blob = test_blob(3000);
+        let (url, requests) = spawn_test_http_server(blob.clone(), ServerMode::NoLength);
+        let mut source = HttpRangeSource::with_window(&stream_agent(), &url, WINDOW).unwrap();
+        // No Content-Length and no Content-Range: unknown length, unseekable.
+        assert!(!source.is_seekable());
+        assert_eq!(source.byte_len(), None);
+        // Sequential reads still work (close-delimited windows).
+        let mut out = Vec::new();
+        source.read_to_end(&mut out).unwrap();
+        assert_eq!(out, blob);
+        // Past the last byte the server answers 416; the source reads EOF.
+        let before = counter(&requests);
+        source.seek(SeekFrom::Start(5000)).unwrap();
+        let mut buf = [0u8; 16];
+        assert_eq!(source.read(&mut buf).unwrap(), 0);
+        assert_eq!(counter(&requests), before + 1);
+    }
+
+    #[test]
+    fn http_range_source_needs_a_known_length_to_seek_from_the_end() {
+        let blob = test_blob(3000);
+        let (url, _requests) = spawn_test_http_server(blob, ServerMode::NoLength);
+        let mut source = HttpRangeSource::with_window(&stream_agent(), &url, WINDOW).unwrap();
+        let error = source.seek(SeekFrom::End(0)).unwrap_err();
+        assert!(error.to_string().contains("unknown"));
+        // Seeking before the start of the stream stays an error.
+        source.seek(SeekFrom::Start(100)).unwrap();
+        assert!(source.seek(SeekFrom::Current(-200)).is_err());
+    }
+
+    #[test]
+    fn http_range_source_survives_a_server_that_ignores_range() {
+        let blob = test_blob(5000);
+        let (url, _requests) = spawn_test_http_server(blob.clone(), ServerMode::NoRange);
+        let mut source = HttpRangeSource::with_window(&stream_agent(), &url, WINDOW).unwrap();
+        // The probe answer is a plain 200: unseekable, but the length is
+        // known from Content-Length.
+        assert!(!source.is_seekable());
+        assert_eq!(source.byte_len(), Some(5000));
+        let mut out = vec![0u8; 100];
+        source.read_exact(&mut out).unwrap();
+        assert_eq!(out, &blob[..100]);
+        // A seek to a non-zero offset needs a Range request the server will
+        // ignore; the source refuses instead of downloading unboundedly.
+        source.seek(SeekFrom::Start(2000)).unwrap();
+        let error = source.read(&mut [0u8; 16]).unwrap_err();
+        assert!(error.to_string().contains("range requests"));
+        // No URL ever leaks into the error text.
+        assert!(!error.to_string().contains("127.0.0.1"));
+        // Seek(End) works positionally against the declared length...
+        assert_eq!(source.seek(SeekFrom::End(-1)).unwrap(), 4999);
+        // ...but reading there fails the same honest way.
+        assert!(source.read(&mut [0u8; 16]).is_err());
+    }
+
+    #[test]
+    fn http_range_source_open_rejects_4xx_without_leaking_the_url() {
+        let (url, _requests) = spawn_test_http_server(test_blob(10), ServerMode::Reject4xx);
+        // Match instead of unwrap_err(): the source must never be Debug,
+        // because its Debug would render the credential-bearing URL.
+        let error = match HttpRangeSource::with_window(&stream_agent(), &url, WINDOW) {
+            Err(error) => error,
+            Ok(_) => panic!("a 403 server must not open a range source"),
+        };
+        assert_eq!(error, RangeSourceError::Rejected { status: 403 });
+        assert!(!format!("{error:?}").contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn content_range_totals_parse_including_the_unknown_star() {
+        assert_eq!(
+            parse_content_range_total("bytes 0-262143/1234567"),
+            Some(1_234_567)
+        );
+        assert_eq!(parse_content_range_total("bytes 0-9/*"), None);
+        assert_eq!(parse_content_range_total("bytes */42"), Some(42));
+        assert_eq!(parse_content_range_total("garbage"), None);
+    }
+
+    #[test]
+    fn the_probe_failure_heuristic_targets_unsupported_probe_failures() {
+        assert!(probe_failure_needs_range(
+            "stream format probe failed: unsupported feature: isomp4: missing moov atom"
+        ));
+        assert!(probe_failure_needs_range(
+            "stream format probe failed: unsupported feature: mp4 is not streamable"
+        ));
+        // Other probe failures and any non-probe failure do not qualify.
+        assert!(!probe_failure_needs_range(
+            "stream format probe failed: end of stream"
+        ));
+        assert!(!probe_failure_needs_range(
+            "stream decoder init failed: unsupported codec type"
+        ));
+        assert!(!probe_failure_needs_range("stream carries no audio track"));
+        assert!(!probe_failure_needs_range(
+            "stream read failed: connection reset"
+        ));
+    }
+
+    /// Real one-second 440 Hz AAC-in-MP4 fixture, generated once with
+    /// ffmpeg (`ffmpeg -f lavfi -i sine=frequency=440:duration=1 -c:a aac
+    /// -b:a 64k tone.m4a`). ffmpeg writes the `moov` atom after `mdat`
+    /// unless `-movflags +faststart` is used, which is exactly the failure
+    /// shape of the unseekable bounded-buffer stream.
+    static M4A_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/sine-440.m4a");
+
+    #[test]
+    fn the_m4a_fixture_stays_small_with_moov_at_the_end() {
+        assert!(M4A_FIXTURE.len() < 100 * 1024);
+        let mdat = M4A_FIXTURE
+            .windows(4)
+            .position(|window| window == b"mdat")
+            .expect("fixture carries an mdat box");
+        let moov = M4A_FIXTURE
+            .windows(4)
+            .position(|window| window == b"moov")
+            .expect("fixture carries a moov box");
+        assert!(moov > mdat, "fixture must keep moov after mdat");
+    }
+
+    #[test]
+    fn the_unseekable_bounded_buffer_probe_fails_on_the_moov_at_end_m4a() {
+        let buffer = Arc::new(BoundedBuffer::new(MAX_BUFFER_CHUNKS));
+        buffer.push(M4A_FIXTURE.to_vec()).unwrap();
+        buffer.close();
+        let pcm = Arc::new(PcmBuffer::new(44_100 * 2));
+        let source = RawStreamSource {
+            buffer: Arc::clone(&buffer),
+            pending: Vec::new(),
+            offset: 0,
+        };
+        let mss = MediaSourceStream::new(Box::new(source), Default::default());
+        let outcome = decode_media_source(mss, &pcm, 2, 44_100, "42");
+        let DecodeOutcome::Failed(reason) = outcome else {
+            panic!("the fast path must fail on a moov-at-end m4a");
+        };
+        assert!(
+            probe_failure_needs_range(&reason),
+            "unexpected probe reason: {reason}"
+        );
+        // No PCM was ever produced by the failed fast path.
+        assert!(pcm.try_pop().is_none());
+    }
+
+    #[test]
+    fn the_range_source_decodes_the_moov_at_end_m4a_end_to_end() {
+        let (url, _requests) = spawn_test_http_server(M4A_FIXTURE.to_vec(), ServerMode::Ranges);
+        let source = HttpRangeSource::open(&stream_agent(), &url).expect("range source opens");
+        assert!(source.is_seekable());
+        assert_eq!(source.byte_len(), Some(M4A_FIXTURE.len() as u64));
+        let pcm = Arc::new(PcmBuffer::new(44_100 * 2));
+        let mss = MediaSourceStream::new(Box::new(source), Default::default());
+        let outcome = decode_media_source(mss, &pcm, 2, 44_100, "42");
+        assert_eq!(outcome, DecodeOutcome::Completed);
+        let mut frames = 0usize;
+        while let Some(chunk) = pcm.try_pop() {
+            frames += chunk.frames;
+        }
+        // A full second of 44.1 kHz audio, resampled to the device rate.
+        assert!(frames > 40_000, "decoded too few frames: {frames}");
+    }
+
+    #[test]
+    fn spawn_range_worker_decodes_the_moov_at_end_m4a_off_thread() {
+        let (url, _requests) = spawn_test_http_server(M4A_FIXTURE.to_vec(), ServerMode::Ranges);
+        let (events, receiver) = std::sync::mpsc::channel();
+        let handle = spawn_range_worker(
+            &stream_agent(),
+            &url,
+            &AuthPair::new("user", "secret1"),
+            FixedSalt("abcdef12".to_string()).salt(),
+            "song 42",
+            "",
+            0,
+            0,
+            2,
+            44_100,
+            events,
+            7,
+        )
+        .unwrap();
+        assert_eq!(handle.seq, 7);
+        // A decode-only worker has no bounded download buffer.
+        assert!(handle.buffer.is_none());
+        match receiver.recv_timeout(Duration::from_secs(10)) {
+            Ok(WorkerEvent::DecodeDone { seq: 7, outcome }) => {
+                assert_eq!(outcome, DecodeOutcome::Completed);
+            }
+            other => panic!("unexpected worker event: {other:?}"),
+        }
+        let mut frames = 0usize;
+        while let Some(chunk) = handle.pcm.try_pop() {
+            frames += chunk.frames;
+        }
+        assert!(frames > 40_000, "decoded too few frames: {frames}");
     }
 }
