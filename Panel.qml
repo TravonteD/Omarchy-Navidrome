@@ -6,6 +6,7 @@ import qs.Commons as Commons
 import qs.Ui
 
 import "Api.js" as Api
+import "Subsonic.js" as Subsonic
 
 Item {
   id: root
@@ -20,6 +21,24 @@ Item {
   property double lastVolumeAdjustAt: 0
   property string currentTab: "home"
   property bool openedForLogin: false
+
+  // Guided connection form on the login page. The gateway's Connect button
+  // reveals it; the drafts and probe state live on the panel root so a
+  // Loader teardown of the login page cannot drop a half-typed entry. The
+  // password draft only ever leaves this object through the credential save
+  // path, and it is never prefilled.
+  property bool connectionFormOpen: false
+  property string draftServerUrl: ""
+  property string draftUsername: ""
+  property string draftPassword: ""
+  property bool connectionFormBusy: false
+  property bool connectionFormProbing: false
+  property bool connectionFormError: false
+  property string connectionFormMessage: ""
+  // The plain-http warning is keyed off the entry itself, regardless of any
+  // display decision — the same contract the stored credential set keeps.
+  readonly property bool draftServerUrlInsecure:
+    connectionFormOpen && Subsonic.isInsecureServerUrl(draftServerUrl)
 
   property double searchClock: Date.now()
   readonly property int searchCooldownSeconds: service
@@ -113,6 +132,12 @@ Item {
   readonly property string fontFamily: Style.font.family
   readonly property bool fullyConnected: service && service.fullyConnected
   readonly property bool accountConnected: service && service.accountConnected
+  // The playback step of the login gateway only reads as done once the
+  // server connection exists too: playback readiness alone says nothing
+  // about the account (a machine can have the backend installed long before
+  // any credentials are entered).
+  readonly property bool playbackStepReady: accountConnected
+    && service && service.daemon.playbackReady
   readonly property bool sessionPending: service && service.sessionPending
   readonly property bool compactHeight: window.height < Style.space(620)
   readonly property bool compactWidth: window.width < Style.space(760)
@@ -315,23 +340,115 @@ Item {
     if (fullyConnected) return "Connected"
     if (accountConnected && !service.daemon.playbackReady)
       return "Set up playback"
-    if (accountConnected) return "Finish playback setup"
-    if (!service.daemon.playbackReady) return "Set up and continue"
+    // Not connected yet: the button opens the guided connection form, so the
+    // label is the same whatever the playback readiness is — the connection
+    // always comes first.
     return "Connect Navidrome"
   }
 
   function connectionHeadline() {
     if (!service) return "Omarchy Navidrome is unavailable"
-    if (service.daemon.setupBusy) return "Setting up playback"
+    if (accountConnected && service.daemon.setupBusy)
+      return "Setting up playback"
     if (fullyConnected) return "You're connected"
     if (accountConnected) return "Account connected"
-    if (!service.daemon.playbackReady) return "One quick setup, then music"
+    // Without a connection the gateway leads with the connection step;
+    // playback copy would invert the two-step order.
     return "Connect your Navidrome server"
   }
 
   function connectionErrorText() {
     if (!service) return "Omarchy Navidrome is unavailable"
     return service.lastError || service.auth.lastError || service.daemon.lastError
+  }
+
+  // ------ guided connection form -------------------------------------------------
+
+  function openConnectionForm() {
+    if (!service || service.auth.loggedIn) return
+    // Prefill the address and username from a partial stored set; the
+    // password is never prefilled.
+    var credentials = service.auth.navidromeCredentials()
+    draftServerUrl = credentials.url
+    draftUsername = credentials.username
+    draftPassword = ""
+    connectionFormError = false
+    connectionFormMessage = ""
+    connectionFormOpen = true
+  }
+
+  function closeConnectionForm() {
+    connectionFormOpen = false
+    connectionFormBusy = false
+    connectionFormProbing = false
+    connectionFormError = false
+    connectionFormMessage = ""
+    draftPassword = ""
+  }
+
+  function cancelConnectionVerification() {
+    // Only the live probe is cancellable; a keyring write that already
+    // started runs to its own verdict.
+    if (!connectionFormProbing) return
+    loginProbe.cancelProbe()
+    connectionFormBusy = false
+    connectionFormProbing = false
+    connectionFormError = false
+    connectionFormMessage = ""
+  }
+
+  function submitConnectionForm() {
+    if (!service || connectionFormBusy) return
+    var entry = service.auth.validateNavidromeEntry(
+      draftServerUrl, draftUsername, draftPassword)
+    if (!entry.ok) {
+      connectionFormError = true
+      connectionFormMessage = entry.error
+      return
+    }
+    // Live probe first: nothing is stored unless the real server answers
+    // ping → getUser → getLicense. Wrong credentials come back as the
+    // probe's typed error, not a retry loop.
+    connectionFormBusy = true
+    connectionFormProbing = true
+    connectionFormError = false
+    connectionFormMessage = "Checking " + entry.url + "…"
+    loginProbe.cancelProbe()
+    loginProbe.serverUrl = entry.url
+    loginProbe.username = entry.username
+    loginProbe.password = entry.password
+    loginProbe.probe(function(result) {
+      connectionFormBusy = false
+      connectionFormProbing = false
+      if (!connectionFormOpen) return
+      if (!result || result.ok !== true) {
+        connectionFormError = true
+        connectionFormMessage = result && result.errorMessage
+          ? result.errorMessage : "Could not reach the server"
+        return
+      }
+      connectionFormMessage = "Server verified. Saving to your keyring…"
+      service.auth.saveNavidromeCredentials(entry.url, entry.username,
+        entry.password, function(ok, error) {
+          connectionFormBusy = false
+          if (!connectionFormOpen) return
+          if (!ok) {
+            connectionFormError = true
+            connectionFormMessage = error
+              || "The credentials could not be saved securely. Try again."
+            // The save applied the in-memory credentials before the keyring
+            // refused the write; a signed-out gateway must not pretend the
+            // connection persisted.
+            if (root.service) root.service.logout()
+            return
+          }
+          closeConnectionForm()
+          // Step two of the guided flow: playback setup (or a straight
+          // finish) runs through the regular login path. When the keyring
+          // save already completed the flow, this is a no-op.
+          if (root.service && !root.fullyConnected) root.service.login()
+        })
+    })
   }
 
   function playbackStatusText() {
@@ -943,6 +1060,10 @@ Item {
     for (var i = 0; i < kids.length; i++)
       findNamedItems(kids[i], name, results)
     return results
+  }
+
+  function pageRoot() {
+    return pageLoader.item
   }
 
   function pageCollection() {
@@ -6065,10 +6186,40 @@ Item {
     }
   }
 
+  // The connection form's own probe transport. It is pointed at the draft
+  // entry per verification, never at the stored credential set, so probing a
+  // not-yet-saved server cannot touch the signed-in client state.
+  SubsonicApi {
+    id: loginProbe
+    objectName: "loginProbeApi"
+    serverUrl: ""
+    username: ""
+    password: ""
+  }
+
   Component {
     id: loginPage
 
     Item {
+      id: loginPageRoot
+
+      function syncConnectionFormFields() {
+        serverUrlField.text = root.draftServerUrl
+        usernameField.text = root.draftUsername
+        passwordField.text = root.draftPassword
+      }
+
+      Component.onCompleted:
+        if (root.connectionFormOpen) syncConnectionFormFields()
+      // The page is torn down and rebuilt by the page loader; reopening it
+      // with the form still open restores the drafts into the fresh fields.
+      Connections {
+        target: root
+        function onConnectionFormOpenChanged() {
+          if (root.connectionFormOpen) loginPageRoot.syncConnectionFormFields()
+        }
+      }
+
       ScrollView {
         id: loginScroll
         anchors.fill: parent
@@ -6210,14 +6361,16 @@ Item {
                 Row {
                   spacing: Style.space(7)
                   Text {
-                    text: root.service && root.service.daemon.playbackReady ? "\uF864" : "\uF503"
-                    color: root.service && root.service.daemon.playbackReady
+                    objectName: "loginPlaybackStepGlyph"
+                    text: root.playbackStepReady ? "\uF864" : "\uF503"
+                    color: root.playbackStepReady
                       ? root.accent : root.muted
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.body
                   }
                   Text {
-                    text: root.service && root.service.daemon.playbackReady
+                    objectName: "loginPlaybackStepLabel"
+                    text: root.playbackStepReady
                       ? "Playback on this computer is ready"
                       : (root.service && root.service.daemon.setupBusy
                         ? "Preparing playback on this computer…"
@@ -6229,34 +6382,127 @@ Item {
                 }
               }
 
+              Column {
+                id: connectionForm
+                objectName: "loginConnectionForm"
+                width: parent.width
+                spacing: Style.space(8)
+                visible: root.connectionFormOpen
+                  && root.service && !root.accountConnected
+
+                TextField {
+                  id: serverUrlField
+                  objectName: "loginServerUrlField"
+                  width: parent.width
+                  placeholderText: "Server address, e.g. https://music.example.com"
+                  foreground: root.foreground
+                  accent: root.accent
+                  enabled: !root.connectionFormBusy
+                  onTextChanged: root.draftServerUrl = text
+                }
+                Text {
+                  width: parent.width
+                  text: "This address uses plain http://. The connection is NOT private — traffic can be read on the network. Use it only on a network you trust."
+                  color: Commons.Color.urgent
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
+                  visible: root.draftServerUrlInsecure
+                }
+                TextField {
+                  id: usernameField
+                  objectName: "loginUsernameField"
+                  width: parent.width
+                  placeholderText: "Username"
+                  foreground: root.foreground
+                  accent: root.accent
+                  enabled: !root.connectionFormBusy
+                  onTextChanged: root.draftUsername = text
+                }
+                TextField {
+                  id: passwordField
+                  objectName: "loginPasswordField"
+                  width: parent.width
+                  placeholderText: "Password"
+                  password: true
+                  foreground: root.foreground
+                  accent: root.accent
+                  enabled: !root.connectionFormBusy
+                  onTextChanged: root.draftPassword = text
+                }
+                Text {
+                  width: parent.width
+                  text: root.connectionFormMessage
+                  color: root.connectionFormError
+                    ? Commons.Color.urgent : root.accent
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  wrapMode: Text.WordWrap
+                  visible: text !== ""
+                }
+              }
+
               Row {
                 width: parent.width
                 spacing: Style.space(7)
 
                 Button {
-                  width: root.service && root.service.loginBusy
+                  id: loginConnectButton
+                  objectName: "loginConnectButton"
+                  width: root.service
+                    && (root.connectionFormOpen
+                      ? !root.connectionFormBusy || root.connectionFormProbing
+                      : root.service.loginBusy)
                     ? Math.max(80, parent.width - cancelLoginButton.width
                       - parent.spacing) : parent.width
-                  text: root.connectionButtonText()
+                  text: root.connectionFormOpen
+                    ? (root.connectionFormBusy
+                      ? "Verifying…" : "Verify and connect")
+                    : root.connectionButtonText()
                   iconText: "󰍂"
                   foreground: root.foreground
-                  selected: root.fullyConnected
-                  enabled: root.service && !root.fullyConnected && !root.service.loginBusy
-                  onClicked: if (root.service) root.service.login()
+                  selected: !root.connectionFormOpen && root.fullyConnected
+                  enabled: root.service
+                    && (root.connectionFormOpen
+                      ? !root.connectionFormBusy && !root.service.loginBusy
+                      : !root.fullyConnected && !root.service.loginBusy)
+                  onClicked: {
+                    if (!root.service) return
+                    if (root.connectionFormOpen) {
+                      root.submitConnectionForm()
+                      return
+                    }
+                    // No stored connection: the button opens the guided
+                    // form instead of a silent keyring re-read.
+                    if (root.accountConnected) root.service.login()
+                    else root.openConnectionForm()
+                  }
                 }
 
                 Button {
                   id: cancelLoginButton
-                  text: "Cancel"
+                  objectName: "loginSecondaryButton"
+                  text: root.connectionFormOpen ? "Back" : "Cancel"
                   foreground: root.foreground
-                  visible: root.service && root.service.loginBusy
-                  onClicked: if (root.service) root.service.cancelLogin()
+                  visible: root.service && (root.connectionFormOpen
+                    ? !root.connectionFormBusy || root.connectionFormProbing
+                    : root.service.loginBusy)
+                  onClicked: {
+                    if (!root.service) return
+                    if (root.connectionFormBusy) {
+                      root.cancelConnectionVerification()
+                      return
+                    }
+                    if (root.connectionFormOpen) root.closeConnectionForm()
+                    else root.service.cancelLogin()
+                  }
                 }
               }
 
               Text {
                 width: parent.width
-                text: !root.service || root.service.daemon.playbackReady
+                text: !root.service || !root.accountConnected
+                  || root.service.daemon.playbackReady
                   || root.service.daemon.setupBusy ? ""
                   : (root.service.daemon.binaryAvailable
                     ? "This prepares private, on-demand playback for your account."
@@ -6369,7 +6615,16 @@ Item {
                 selected: root.fullyConnected
                 visible: !root.fullyConnected
                 enabled: root.service && !root.service.loginBusy
-                onClicked: if (root.service) root.service.login()
+                onClicked: {
+                  if (!root.service) return
+                  if (root.accountConnected) root.service.login()
+                  else {
+                    // Without a connection the guided form is the action;
+                    // the login gateway opens with it.
+                    root.openConnectionForm()
+                    root.chooseTab("login")
+                  }
+                }
               }
               Button {
                 text: "Cancel"
